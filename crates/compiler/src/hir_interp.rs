@@ -5634,7 +5634,12 @@ fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, In
             None => Ok(o),
         },
         CastOp::FpToSi | CastOp::FpToUi => match raw_f64 {
-            Some(x) => Ok(value_from_i64_as(ty, x as i64)),
+            // Saturating, like the compiled tiers: out of range is the nearest bound, NaN zero.
+            Some(x) => Ok(value_from_i64_as(
+                ty,
+                crate::const_fold::saturating_float_to_int(x, ty)
+                    .map_or(x as i64, |v| v as u64 as i64),
+            )),
             None => Ok(o),
         },
         CastOp::SiToFp | CastOp::UiToFp => {

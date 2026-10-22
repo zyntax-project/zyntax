@@ -465,8 +465,10 @@ fn fold_cast(op: CastOp, v: &HirConstant, target_ty: &HirType) -> Option<HirCons
                 HirConstant::F64(x) => *x,
                 _ => return None,
             };
-            // Rust's `as` semantics: saturating cast to integer.
-            Some(int_constant(f as i128, target_ty))
+            Some(int_constant(
+                saturating_float_to_int(f, target_ty)?,
+                target_ty,
+            ))
         }
         SiToFp => {
             let i = as_i128(v)?;
@@ -618,6 +620,27 @@ fn is_signed_ty(ty: &HirType) -> bool {
 
 /// Materialise a wide signed integer back into the right
 /// `HirConstant` variant for `ty`. Wrapping into the target width.
+/// A float converted to an integer type the way every tier converts it: a value outside the
+/// type saturates to its nearest bound and NaN is zero. `None` for a type that is not a scalar
+/// integer.
+pub fn saturating_float_to_int(x: f64, ty: &HirType) -> Option<i128> {
+    let (low, high): (i128, i128) = match ty {
+        HirType::I8 => (i8::MIN.into(), i8::MAX.into()),
+        HirType::I16 => (i16::MIN.into(), i16::MAX.into()),
+        HirType::I32 => (i32::MIN.into(), i32::MAX.into()),
+        HirType::I64 => (i64::MIN.into(), i64::MAX.into()),
+        HirType::U8 => (0, u8::MAX.into()),
+        HirType::U16 => (0, u16::MAX.into()),
+        HirType::U32 => (0, u32::MAX.into()),
+        HirType::U64 => (0, u64::MAX.into()),
+        _ => return None,
+    };
+    if x.is_nan() {
+        return Some(0);
+    }
+    Some((x as i128).clamp(low, high))
+}
+
 fn int_constant(v: i128, ty: &HirType) -> HirConstant {
     match ty {
         HirType::Bool => HirConstant::Bool(v != 0),
@@ -644,6 +667,37 @@ fn touch_hir_callable(_: &HirCallable) {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn float_to_integer_saturates_at_the_width_of_the_target() {
+        use crate::hir::HirType::*;
+        let cases: &[(f64, HirType, i128)] = &[
+            (1e19, I64, i64::MAX as i128),
+            (-1e19, I64, i64::MIN as i128),
+            (f64::INFINITY, I64, i64::MAX as i128),
+            (f64::NEG_INFINITY, I64, i64::MIN as i128),
+            (f64::NAN, I64, 0),
+            (f64::NAN, U8, 0),
+            (4e9, I32, i32::MAX as i128),
+            (-4e9, I32, i32::MIN as i128),
+            (300.0, U8, 255),
+            (-5.0, U8, 0),
+            (-129.0, I8, -128),
+            (2.9, I32, 2),
+            (-2.9, I32, -2),
+            (-0.0, I64, 0),
+            (1e30, U64, u64::MAX as i128),
+            (9.3e18, U64, 9_300_000_000_000_000_000),
+        ];
+        for (x, ty, want) in cases {
+            assert_eq!(
+                saturating_float_to_int(*x, ty),
+                Some(*want),
+                "{x} as {ty:?}"
+            );
+        }
+        assert_eq!(saturating_float_to_int(1.0, &F64), None);
+    }
+
     use super::*;
     use crate::hir::{HirBlock, HirFunctionSignature, HirValue};
     use indexmap::IndexMap;

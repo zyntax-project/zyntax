@@ -19,7 +19,7 @@
 //!                         comparisons, excluding `Div` and `Rem`
 //!                         to avoid changing trap semantics)
 //!   * `Unary`            (Neg / Not / FNeg)
-//!   * `Cast`             (except float-to-integer, which can trap)
+//!   * `Cast`             (float-to-integer saturates, so it cannot trap)
 //!   * `GetElementPtr`    — pure address arithmetic
 //!   * `ExtractValue`     — pure aggregate field read
 //!   * `Select`           — pure ternary
@@ -717,12 +717,8 @@ fn is_safe_to_hoist(inst: &HirInstruction) -> bool {
             BinaryOp::Div | BinaryOp::Rem => false,
             _ => true,
         },
-        // A float-to-integer conversion traps in compiled code when the value is out of range,
-        // so it may not run before the test that guards it.
-        HirInstruction::Cast {
-            op: crate::hir::CastOp::FpToSi | crate::hir::CastOp::FpToUi,
-            ..
-        } => false,
+        // Float-to-integer conversions are total in every tier (out of range saturates, NaN is
+        // zero), so they move like any other cast.
         HirInstruction::Unary { .. } | HirInstruction::Cast { .. } => true,
         HirInstruction::GetElementPtr { .. } | HirInstruction::ExtractValue { .. } => true,
         HirInstruction::Select { .. } => true,
@@ -1189,7 +1185,7 @@ mod tests {
     use zyntax_typed_ast::InternedString;
 
     #[test]
-    fn a_float_to_integer_conversion_is_not_speculated_but_other_casts_are() {
+    fn float_to_integer_conversions_move_because_every_tier_saturates_them() {
         use crate::hir::CastOp;
         let cast = |op, ty| HirInstruction::Cast {
             result: HirId::new(),
@@ -1197,10 +1193,10 @@ mod tests {
             op,
             operand: HirId::new(),
         };
-        // It traps in compiled code when the value is out of range, so it cannot run before
-        // the test that guards it.
-        assert!(!is_safe_to_hoist(&cast(CastOp::FpToSi, HirType::I64)));
-        assert!(!is_safe_to_hoist(&cast(CastOp::FpToUi, HirType::U64)));
+        // Out of range saturates and NaN is zero in the interpreter, Cranelift and LLVM, so a
+        // conversion may run ahead of the test that guards its result.
+        assert!(is_safe_to_hoist(&cast(CastOp::FpToSi, HirType::I64)));
+        assert!(is_safe_to_hoist(&cast(CastOp::FpToUi, HirType::U64)));
         assert!(is_safe_to_hoist(&cast(CastOp::SiToFp, HirType::F64)));
         assert!(is_safe_to_hoist(&cast(CastOp::SExt, HirType::I64)));
     }

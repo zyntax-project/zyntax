@@ -4534,7 +4534,14 @@ impl<'ctx> LLVMBackend<'ctx> {
                 )?
                 .into(),
 
-            // Float to unsigned int
+            // Float to unsigned or signed int, saturating: out of range is the nearest bound and
+            // NaN is zero, as the interpreter and the Cranelift tier convert.
+            FpToUi | FpToSi if operand.is_float_value() && target_ty.is_int_type() => self
+                .saturating_float_to_int(
+                    matches!(op, FpToSi),
+                    operand.into_float_value(),
+                    target_ty.into_int_type(),
+                )?,
             FpToUi => self
                 .builder
                 .build_float_to_unsigned_int(
@@ -4543,8 +4550,6 @@ impl<'ctx> LLVMBackend<'ctx> {
                     "fptoui",
                 )?
                 .into(),
-
-            // Float to signed int
             FpToSi => self
                 .builder
                 .build_float_to_signed_int(
@@ -6073,6 +6078,40 @@ impl<'ctx> LLVMBackend<'ctx> {
             let fn_type = arg_type.fn_type(&[arg_type.into()], false);
             self.module.add_function(name, fn_type, None)
         }))
+    }
+
+    /// `llvm.fptosi.sat` / `llvm.fptoui.sat`: the conversion is total, so it may be moved and
+    /// speculated like any arithmetic.
+    fn saturating_float_to_int(
+        &self,
+        signed: bool,
+        value: inkwell::values::FloatValue<'ctx>,
+        target: IntType<'ctx>,
+    ) -> CompilerResult<BasicValueEnum<'ctx>> {
+        let source = if value.get_type() == self.context.f32_type() {
+            "f32"
+        } else {
+            "f64"
+        };
+        let name = format!(
+            "llvm.fpto{}i.sat.i{}.{}",
+            if signed { 's' } else { 'u' },
+            target.get_bit_width(),
+            source
+        );
+        let function = self.module.get_function(&name).unwrap_or_else(|| {
+            let fn_type = target.fn_type(&[value.get_type().into()], false);
+            self.module.add_function(&name, fn_type, None)
+        });
+        let call = self
+            .builder
+            .build_call(function, &[value.into()], "fptoi_sat")?;
+        match call.try_as_basic_value() {
+            ValueKind::Basic(result) => Ok(result),
+            ValueKind::Instruction(_) => Err(CompilerError::CodeGen(
+                "saturating conversion returned void".to_string(),
+            )),
+        }
     }
 
     /// Helper to get or declare a binary LLVM intrinsic

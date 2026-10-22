@@ -5998,10 +5998,10 @@ impl CraneliftBackend {
                                 crate::hir::CastOp::SExt => builder.ins().sextend(target_ty, val),
                                 crate::hir::CastOp::Trunc => builder.ins().ireduce(target_ty, val),
                                 crate::hir::CastOp::FpToSi => {
-                                    builder.ins().fcvt_to_sint(target_ty, val)
+                                    Self::float_to_int(&mut builder, true, target_ty, val)
                                 }
                                 crate::hir::CastOp::FpToUi => {
-                                    builder.ins().fcvt_to_uint(target_ty, val)
+                                    Self::float_to_int(&mut builder, false, target_ty, val)
                                 }
                                 crate::hir::CastOp::SiToFp => {
                                     builder.ins().fcvt_from_sint(target_ty, val)
@@ -7908,6 +7908,40 @@ impl CraneliftBackend {
         )
     }
 
+    /// A float converted to an integer without trapping: a value outside the type saturates to
+    /// its nearest bound and NaN is zero, as the interpreter and the LLVM tier convert. The
+    /// trapping forms made an out-of-range operand fatal, and made it unsafe to move a
+    /// conversion ahead of the test that guards it.
+    fn float_to_int(
+        builder: &mut FunctionBuilder,
+        signed: bool,
+        target: types::Type,
+        val: Value,
+    ) -> Value {
+        if target.is_vector() || target.bits() >= 32 {
+            return if signed {
+                builder.ins().fcvt_to_sint_sat(target, val)
+            } else {
+                builder.ins().fcvt_to_uint_sat(target, val)
+            };
+        }
+        // 8 and 16 bits: saturate at 32 bits, clamp to the narrow range, then narrow.
+        let bits = target.bits();
+        if signed {
+            let wide = builder.ins().fcvt_to_sint_sat(types::I32, val);
+            let low = builder.ins().iconst(types::I32, -(1i64 << (bits - 1)));
+            let high = builder.ins().iconst(types::I32, (1i64 << (bits - 1)) - 1);
+            let clamped = builder.ins().smax(wide, low);
+            let clamped = builder.ins().smin(clamped, high);
+            builder.ins().ireduce(target, clamped)
+        } else {
+            let wide = builder.ins().fcvt_to_uint_sat(types::I32, val);
+            let high = builder.ins().iconst(types::I32, (1i64 << bits) - 1);
+            let clamped = builder.ins().umin(wide, high);
+            builder.ins().ireduce(target, clamped)
+        }
+    }
+
     /// Coerce a Cranelift value from one type to another (e.g., i64 -> i32, f64 -> f32)
     fn coerce_value(
         builder: &mut FunctionBuilder,
@@ -9771,8 +9805,10 @@ impl CraneliftBackend {
                     crate::hir::CastOp::ZExt => builder.ins().uextend(target_ty, val),
                     crate::hir::CastOp::SExt => builder.ins().sextend(target_ty, val),
                     crate::hir::CastOp::Trunc => builder.ins().ireduce(target_ty, val),
-                    crate::hir::CastOp::FpToUi => builder.ins().fcvt_to_uint(target_ty, val),
-                    crate::hir::CastOp::FpToSi => builder.ins().fcvt_to_sint(target_ty, val),
+                    crate::hir::CastOp::FpToUi => {
+                        Self::float_to_int(builder, false, target_ty, val)
+                    }
+                    crate::hir::CastOp::FpToSi => Self::float_to_int(builder, true, target_ty, val),
                     crate::hir::CastOp::UiToFp => builder.ins().fcvt_from_uint(target_ty, val),
                     crate::hir::CastOp::SiToFp => builder.ins().fcvt_from_sint(target_ty, val),
                     crate::hir::CastOp::FpExt => builder.ins().fpromote(target_ty, val),

@@ -8,8 +8,8 @@
 //!
 //! * every other operand (zero, negative, fractional, NaN, infinite, huge) takes the exact
 //!   `FRem`, so results, signs and negative zeros are unchanged;
-//! * a float-to-integer conversion runs only after its range test, since an out-of-range
-//!   conversion traps in compiled code;
+//! * the dividend is tested against a bound below 2^63 before it is used as an integer, since
+//!   a saturated conversion of a larger value would compare equal to a whole number;
 //! * only sites inside a loop are expanded, so cold code keeps its single instruction.
 
 use crate::hir::*;
@@ -201,7 +201,7 @@ fn expand(f: &mut HirFunction, site: Site, created: &mut Vec<HirId>) -> HirId {
         test(f, BinaryOp::FLt, y, limit);
     }
 
-    // Both operands are now in range, so the conversions cannot trap.
+    // Both operands are in range, so the conversions are exact.
     let whole_x = instruction(f, HirType::I64);
     let back_x = instruction(f, HirType::F64);
     let whole_y = match divisor {
