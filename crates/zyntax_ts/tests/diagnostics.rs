@@ -85,3 +85,19 @@ fn cli_colors_and_json_follow_the_shared_diagnostic_controls() {
     assert_eq!(diagnostic["kind"], "Type");
     assert_eq!(diagnostic["start"], source.find("value").unwrap());
 }
+
+#[test]
+fn every_file_is_checked_under_strict_mode_rules() {
+    for (source, kind) in [
+        ("function yield() {}\n", ErrorKind::Type),
+        ("01;\n", ErrorKind::Syntax),
+        ("08;\n", ErrorKind::Syntax),
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "strict.ts", Default::default()).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+    }
+    let valid =
+        "const a = 0o17 + 0b1 + 1_0 + 0.5;\nconst o = { yield: 1 };\nconsole.log(o.yield, a);\n";
+    zyntax_ts::parse_program(valid, "valid.ts", Default::default()).unwrap();
+}

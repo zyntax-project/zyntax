@@ -403,7 +403,8 @@ pub(crate) fn with_parsed<T, E>(
     lower: impl FnOnce(&js::Program<'_>, &oxc_semantic::Semantic<'_>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
+    // TypeScript checks every file under strict-mode rules.
+    let parsed = Parser::new(&allocator, source, SourceType::ts().with_module(true)).parse();
     if let Some(diagnostic) = parsed.diagnostics.first() {
         return Err(error(Error::from_oxc(ErrorKind::Syntax, diagnostic)));
     }
@@ -411,9 +412,20 @@ pub(crate) fn with_parsed<T, E>(
         .with_check_syntax_error(true)
         .build(&parsed.program);
     if let Some(diagnostic) = semantic.diagnostics.first() {
-        return Err(error(Error::from_oxc(ErrorKind::Type, diagnostic)));
+        // Legacy numeric literals are scanner errors in TypeScript.
+        let kind = if is_legacy_numeric_literal(&diagnostic.message) {
+            ErrorKind::Syntax
+        } else {
+            ErrorKind::Type
+        };
+        return Err(error(Error::from_oxc(kind, diagnostic)));
     }
     lower(&parsed.program, &semantic.semantic)
+}
+
+fn is_legacy_numeric_literal(message: &str) -> bool {
+    message.starts_with("'0'-prefixed octal literals")
+        || message.starts_with("Decimals with leading zeros")
 }
 
 pub(crate) fn lower_parsed(
