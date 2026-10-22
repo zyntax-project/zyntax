@@ -130,9 +130,19 @@ resolution, soundness policy and compiler/frontend/target identity are validated
 before reuse. Missing or invalid entries are rebuilt; an unavailable cache does
 not prevent source checking or execution.
 
-This cache stores checked typed AST in Zyntax snapshots and skips parsing and
-type checking on a hit. Native lowering, optimization, release analysis and
-interpreter-first tiering still run for each process.
+`check` stores checked typed AST and skips parsing and type checking on a hit.
+`run` prepares the linked project as split HIR in the same snapshot cache,
+reusing native lowering, optimization and release facts as well. A checked-only
+entry is upgraded on its first run. Source validation still includes type-only
+dependencies, even though their bodies are absent from the linked project.
+Hosts use `load_project_for_runtime` to install the TS primitives and prepare
+this execution cache, then move its result through `SourceProject::into_parts`
+and the shared compiled-import linker. Initializers run when the project is
+compiled into the runtime, once per runtime. Cached programs still start in the
+interpreter and promote normally; this cache contains no native machine code.
+Unused HIR bodies remain encoded until reached.
+Preparing a missing execution cache currently lowers and optimizes the complete
+linked project before execution.
 
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
 related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use zyntax_embed::{
@@ -11,11 +11,13 @@ use zyntax_typed_ast::{InternedString, TypedDeclaration, TypedProgram};
 use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, lower};
 
 mod snapshot;
-pub use snapshot::{CacheStatus, load_project_cached};
+pub use snapshot::{CacheStatus, load_project_cached, load_project_for_runtime};
 
 /// A filesystem failure or a diagnostic in the source file that caused it.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
+    #[error("{0}")]
+    Native(#[from] zyntax_embed::RuntimeError),
     #[error("{file}: {error}")]
     Io {
         file: PathBuf,
@@ -33,6 +35,13 @@ pub enum ProjectError {
 pub struct SourceProject {
     entry: TypedProgram,
     dependencies: FxHashMap<InternedString, TypedProgram>,
+    lowered: Option<LoweredProject>,
+}
+
+struct LoweredProject {
+    name: InternedString,
+    hir: Arc<zyntax_compiler::bytecode::LazyModule>,
+    files: usize,
 }
 
 impl SourceProject {
@@ -42,7 +51,9 @@ impl SourceProject {
 
     /// Number of distinct files checked, including dependencies used only as types.
     pub fn module_count(&self) -> usize {
-        self.dependencies.len() + 1
+        self.lowered
+            .as_ref()
+            .map_or(self.dependencies.len() + 1, |lowered| lowered.files)
     }
 
     /// Move runtime-reachable bodies into a single-use shared import resolver.
@@ -58,7 +69,33 @@ impl SourceProject {
         let Self {
             entry,
             mut dependencies,
+            lowered,
         } = self;
+        if let Some(LoweredProject { name, hir, .. }) = lowered {
+            let language = Some(InternedString::new_global("typescript"));
+            let span = Default::default();
+            let program = TypedProgram {
+                language,
+                declarations: vec![zyntax_typed_ast::TypedNode::new(
+                    TypedDeclaration::Import(zyntax_typed_ast::TypedImport {
+                        language,
+                        module_path: vec![name],
+                        items: vec![],
+                        span,
+                    }),
+                    zyntax_typed_ast::Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
+                    span,
+                )],
+                ..Default::default()
+            };
+            let name = name.resolve_global().unwrap();
+            let mut imports = FxHashMap::default();
+            imports.insert(
+                name.clone(),
+                CompiledImport::new("typescript", name, entry).with_hir(hir),
+            );
+            return (program, import_resolver(imports));
+        }
         let mut pending = vec![];
         enqueue(&entry, &mut pending);
         let mut imports = FxHashMap::default();
@@ -72,16 +109,19 @@ impl SourceProject {
                 );
             }
         }
-        // The callback API is shared and concurrent; this lock is used only while linking.
-        let imports = Mutex::new(imports);
-        let resolver = Box::new(move |name: &str| {
-            imports
-                .lock()
-                .map_err(|_| "source import resolver is poisoned".to_owned())
-                .map(|mut imports| imports.remove(name))
-        });
-        (entry, resolver)
+        (entry, import_resolver(imports))
     }
+}
+
+fn import_resolver(imports: FxHashMap<String, CompiledImport>) -> CompiledImportResolverCallback {
+    // The callback API is shared and concurrent; this lock is used only while linking.
+    let imports = Mutex::new(imports);
+    Box::new(move |name: &str| {
+        imports
+            .lock()
+            .map_err(|_| "source import resolver is poisoned".to_owned())
+            .map(|mut imports| imports.remove(name))
+    })
 }
 
 /// Check an entry file and its relative imports using canonical filesystem identities.
@@ -112,6 +152,7 @@ fn load_canonical(
     Ok(SourceProject {
         entry: loader.modules.remove(&identity).unwrap(),
         dependencies: loader.modules,
+        lowered: None,
     })
 }
 

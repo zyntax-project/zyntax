@@ -13,14 +13,14 @@ use super::{SNAPSHOT_EXTENSION, Snapshot};
 use super::{SnapshotBuilder, SnapshotError};
 
 /// An import request and the canonical file it resolved to.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SnapshotDependency {
     pub specifier: String,
     pub target: String,
 }
 
 /// A checked source file, including dependencies used only during checking.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SnapshotSource {
     path: String,
     hash: [u8; 32],
@@ -52,7 +52,7 @@ struct CacheKey {
 #[derive(Serialize, Deserialize)]
 pub(super) struct CachedInputs {
     key: CacheKey,
-    sources: Vec<SnapshotSource>,
+    pub(super) sources: Vec<SnapshotSource>,
     pub(super) blobs_hash: [u8; 32],
 }
 
@@ -118,8 +118,14 @@ impl SnapshotCache {
             return None;
         }
         let mut names: FxHashSet<_> = inputs.sources.iter().map(|s| s.path.as_str()).collect();
-        if snapshot.module_names().count() != names.len()
-            || !snapshot.module_names().all(|name| names.remove(name))
+        // A linked project has one lowered entry and records all of its source
+        // dependencies as validation inputs, without duplicating their bodies.
+        let linked_project = snapshot.module_names().count() == 1
+            && snapshot.carries_hir(&self.key.entry)
+            && names.contains(self.key.entry.as_str());
+        if !linked_project
+            && (snapshot.module_names().count() != names.len()
+                || !snapshot.module_names().all(|name| names.remove(name)))
         {
             return None;
         }
@@ -130,9 +136,45 @@ impl SnapshotCache {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn store(
         &self,
-        mut builder: SnapshotBuilder,
+        builder: SnapshotBuilder,
         sources: Vec<SnapshotSource>,
     ) -> Result<PathBuf, SnapshotError> {
+        self.persist(&self.encode(builder, sources)?)
+    }
+
+    /// Prepare a source-validated snapshot for immediate use, without publishing it.
+    /// The encoded bodies are shared with subsequent readers of this value.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare(
+        &self,
+        builder: SnapshotBuilder,
+        sources: Vec<SnapshotSource>,
+    ) -> Result<Snapshot, SnapshotError> {
+        Snapshot::load_owned(self.encode(builder, sources)?)
+    }
+
+    /// Atomically publish a snapshot prepared by this cache. A publication failure
+    /// leaves the prepared value available for execution in the current process.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn publish(&self, snapshot: &Snapshot) -> Result<PathBuf, SnapshotError> {
+        if snapshot
+            .cache
+            .as_ref()
+            .is_none_or(|inputs| inputs.key != self.key)
+        {
+            return Err(SnapshotError::Encode(
+                "snapshot belongs to another cache".into(),
+            ));
+        }
+        self.persist(&snapshot.bytes)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn encode(
+        &self,
+        mut builder: SnapshotBuilder,
+        sources: Vec<SnapshotSource>,
+    ) -> Result<Vec<u8>, SnapshotError> {
         if builder.language != self.key.language {
             return Err(SnapshotError::Encode(
                 "cache language does not match snapshot".into(),
@@ -143,12 +185,16 @@ impl SnapshotCache {
             sources,
             blobs_hash: [0; 32],
         });
-        let bytes = builder.encode()?;
+        builder.encode()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist(&self, bytes: &[u8]) -> Result<PathBuf, SnapshotError> {
         let directory = self.path.parent().unwrap();
         let io = |error: std::io::Error| SnapshotError::Encode(error.to_string());
         std::fs::create_dir_all(directory).map_err(io)?;
         let mut file = tempfile::NamedTempFile::new_in(directory).map_err(io)?;
-        file.write_all(&bytes).map_err(io)?;
+        file.write_all(bytes).map_err(io)?;
         file.flush().map_err(io)?;
         file.persist(&self.path).map_err(|error| io(error.error))?;
         Ok(self.path.clone())
@@ -253,6 +299,31 @@ mod tests {
         let (_, cache) = setup(directory.path());
         assert!(cache.store(SnapshotBuilder::new("other"), vec![]).is_err());
         assert!(!cache.path().exists());
+    }
+
+    #[test]
+    fn prepared_snapshots_can_run_without_publication_and_cannot_cross_cache_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let (entry, cache) = setup(directory.path());
+        let prepared = cache
+            .prepare(
+                builder(&entry),
+                vec![SnapshotSource::new(&entry, b"source", vec![])],
+            )
+            .unwrap();
+        assert!(!cache.path().exists());
+        assert!(prepared.module(&entry).unwrap().is_some());
+        let other = SnapshotCache::new(
+            directory.path().join("other"),
+            "test",
+            &entry,
+            "different-build",
+            "strict",
+        );
+        assert!(other.publish(&prepared).is_err());
+        assert!(!other.path().exists());
+        cache.publish(&prepared).unwrap();
+        assert!(cache.load(|_, _| None).is_some());
     }
 
     #[test]

@@ -4,6 +4,9 @@ use std::process::Command;
 use serde_json::Value;
 use zyntax_ts::{CacheStatus, ErrorKind, Options, ProjectError, Soundness, load_project_cached};
 
+// Tier callbacks are process-wide; in-process runtime fixtures run serially.
+static RUNTIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn write(root: &Path, file: &str, source: &str) {
     let path = root.join(file);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -233,6 +236,168 @@ fn soundness_options_and_unavailable_cache_never_bypass_checking() {
 }
 
 #[test]
+fn checked_cache_upgrades_to_one_lowered_project_and_validates_all_sources() {
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_embed::{Snapshot, TieredConfig, TieredRuntime};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(root, "types.ts", "export type Scalar=number;");
+    write(root, "lib.ts", "export function id<T>(x:T):T{return x;}");
+    write(
+        root,
+        "entry.ts",
+        "import type {Scalar} from './types'; import {id} from './lib'; export function keep<T>(x:T):T{return id(x);} const n:Scalar=2; console.log(keep(n));",
+    );
+    assert_eq!(load(root).unwrap().1, CacheStatus::Stored);
+    let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+    let prepare = |runtime: &mut TieredRuntime| {
+        zyntax_ts::load_project_for_runtime(
+            root.join("entry.ts"),
+            Options::default(),
+            root.join("cache"),
+            runtime,
+        )
+    };
+    let (project, status) = prepare(&mut runtime).unwrap();
+    assert_eq!(status, CacheStatus::Stored);
+    assert_eq!(project.module_count(), 3);
+    assert_eq!(runtime.statistics().baseline_functions, 0);
+    assert_eq!(runtime.statistics().optimized_functions, 0);
+    let entry = root.join("entry.ts").canonicalize().unwrap();
+    let snapshot = Snapshot::load_owned(std::fs::read(cached_file(root)).unwrap()).unwrap();
+    assert_eq!(snapshot.module_names().count(), 1);
+    assert_eq!(snapshot.cached_sources().unwrap().len(), 3);
+    assert!(snapshot.carries_hir(entry.to_str().unwrap()));
+    let import = snapshot.module(entry.to_str().unwrap()).unwrap().unwrap();
+    assert!(import.program().checker_interface.is_some());
+    assert!(
+        import
+            .program()
+            .declarations
+            .iter()
+            .all(|d| !matches!(&d.node,
+        zyntax_typed_ast::TypedDeclaration::Function(f) if f.body.is_some()))
+    );
+    let name = zyntax_ts::ModuleId::new(entry.to_str().unwrap())
+        .function_name("keep")
+        .resolve_global()
+        .unwrap();
+    assert!(
+        !import
+            .hir()
+            .unwrap()
+            .by_name(&name)
+            .unwrap()
+            .signature
+            .type_params
+            .is_empty()
+    );
+    assert_eq!(prepare(&mut runtime).unwrap().1, CacheStatus::Hit);
+    assert_eq!(load(root).unwrap().1, CacheStatus::Hit);
+    write(root, "types.ts", "export type Scalar=boolean;");
+    let ProjectError::Diagnostic { error, .. } = prepare(&mut runtime).err().unwrap() else {
+        panic!()
+    };
+    assert_eq!(error.kind, ErrorKind::Type);
+    write(root, "types.ts", "export type Scalar=number;");
+    assert_eq!(prepare(&mut runtime).unwrap().1, CacheStatus::Hit);
+    write(
+        root,
+        "lib.ts",
+        "export function id<T>(x:T):T{console.log('changed');return x;}",
+    );
+    assert_eq!(prepare(&mut runtime).unwrap().1, CacheStatus::Stored);
+    assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 1);
+    let snapshot = std::sync::Arc::new(
+        Snapshot::load_owned(std::fs::read(cached_file(root)).unwrap()).unwrap(),
+    );
+    runtime
+        .install_snapshot(std::sync::Arc::clone(&snapshot))
+        .unwrap();
+    let interface = snapshot
+        .module_interface(entry.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let client_id = zyntax_ts::ModuleId::new("cached-client");
+    let client = zyntax_ts::parse_module_with_dependencies(
+        "import {keep} from 'saved'; export function client():boolean{return keep(true);}",
+        "client.ts",
+        client_id,
+        Options::default(),
+        &[zyntax_ts::ModuleDependency {
+            specifier: "saved",
+            program: interface.program(),
+        }],
+    )
+    .unwrap();
+    let name = client_id.function_name("client").resolve_global().unwrap();
+    runtime.declare_entry_points([name.as_str()]);
+    runtime.enter_only_through_entry_points();
+    runtime.compile_typed_program(client).unwrap();
+    assert_eq!(
+        runtime.call_raw(&name, &[]).unwrap(),
+        zyntax_embed::ZyntaxValue::Bool(true)
+    );
+    runtime
+        .optimize_function(
+            &name,
+            zyntax_compiler::tiered_backend::OptimizationTier::Baseline,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.call_raw(&name, &[]).unwrap(),
+        zyntax_embed::ZyntaxValue::Bool(true)
+    );
+    runtime.stop();
+}
+
+#[test]
+fn an_unwritable_lowered_cache_still_returns_executable_hir() {
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(
+        root,
+        "entry.ts",
+        "export function answer():number{return 42;}",
+    );
+    write(root, "not-a-directory", "file");
+    let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+    let (project, status) = zyntax_ts::load_project_for_runtime(
+        root.join("entry.ts"),
+        Options::default(),
+        root.join("not-a-directory/cache"),
+        &mut runtime,
+    )
+    .unwrap();
+    assert_eq!(status, CacheStatus::Unavailable);
+    let answer = zyntax_ts::ModuleId::new(
+        root.join("entry.ts")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .function_name("answer")
+    .resolve_global()
+    .unwrap();
+    let (program, resolver) = project.into_parts();
+    runtime.add_compiled_import_resolver(resolver);
+    runtime.declare_entry_points([answer.as_str()]);
+    runtime.enter_only_through_entry_points();
+    runtime.compile_typed_program(program).unwrap();
+    assert_eq!(runtime.statistics().baseline_functions, 0);
+    assert_eq!(
+        runtime.call_raw(&answer, &[]).unwrap(),
+        ZyntaxValue::Float(42.0)
+    );
+    runtime.stop();
+}
+
+#[test]
 fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -301,7 +466,8 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
 
 #[test]
 fn warm_snapshots_preserve_native_layouts_release_sites_and_real_promotions() {
-    use zyntax_compiler::hir::{HirCallable, HirInstruction, HirType, Intrinsic};
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_compiler::hir::{HirCallable, HirInstruction, HirTerminator, HirType, Intrinsic};
     use zyntax_compiler::tiered_backend::{OptimizationTier, TieredConfig};
     use zyntax_embed::{TieredRuntime, ZyntaxValue};
 
@@ -321,7 +487,21 @@ fn warm_snapshots_preserve_native_layouts_release_sites_and_real_promotions() {
         export function score(n:number):number{const p:Read=make(n);const q=keep(p);
         const xs=numbers(q.x);const ys=alias(xs);ys[1]=ys[1]+3;return pick(xs,0)+p.x;}",
     );
-    assert_eq!(load(root).unwrap().1, CacheStatus::Stored);
+    let mut preparation = TieredRuntime::new(TieredConfig::default()).unwrap();
+    assert_eq!(
+        zyntax_ts::load_project_for_runtime(
+            root.join("entry.ts"),
+            Options::default(),
+            root.join("cache"),
+            &mut preparation
+        )
+        .unwrap()
+        .1,
+        CacheStatus::Stored
+    );
+    assert_eq!(preparation.statistics().baseline_functions, 0);
+    assert_eq!(preparation.statistics().optimized_functions, 0);
+    preparation.stop();
     let score = zyntax_ts::ModuleId::new(
         root.join("entry.ts")
             .canonicalize()
@@ -349,28 +529,58 @@ fn warm_snapshots_preserve_native_layouts_release_sites_and_real_promotions() {
         runtime.declare_entry_points([score.as_str()]);
         runtime.enter_only_through_entry_points();
         if inspect {
-            let mut hir = runtime.lower_to_hir(program).unwrap();
-            zyntax_compiler::drop_insert::run_module(&mut hir);
-            let body = hir
-                .functions
-                .values()
-                .find(|f| f.name.resolve_global().as_deref() == Some(&score))
-                .unwrap();
+            let snapshot =
+                zyntax_embed::Snapshot::load_owned(std::fs::read(cached_file(root)).unwrap())
+                    .unwrap();
+            let entry = root.join("entry.ts").canonicalize().unwrap();
+            let import = snapshot.module(entry.to_str().unwrap()).unwrap().unwrap();
+            let hir = import.hir().unwrap();
+            let signature = hir.by_name(&score).unwrap();
+            assert!(signature.attributes.optimized);
+            assert!(signature.blocks.is_empty());
+            let body = hir.function(signature.id).unwrap();
             let instructions: Vec<_> = body.blocks.values().flat_map(|b| &b.instructions).collect();
             assert!(instructions.iter().any(|i|matches!(i,HirInstruction::GetElementPtr{ty:HirType::Ptr(t),..} if **t==HirType::F64)));
-            assert_eq!(
-                instructions
-                    .iter()
-                    .filter(|i| matches!(
-                        i,
-                        HirInstruction::Call {
-                            callee: HirCallable::Intrinsic(Intrinsic::Free),
-                            ..
-                        }
-                    ))
-                    .count(),
-                3
-            );
+            let mut paths = vec![(body.entry_block, 0, 0)];
+            let mut returns = 0;
+            while let Some((id, releases, depth)) = paths.pop() {
+                assert!(depth < body.blocks.len(), "unexpected cycle in score");
+                let block = &body.blocks[&id];
+                let releases = releases
+                    + block
+                        .instructions
+                        .iter()
+                        .filter(|i| {
+                            matches!(
+                                i,
+                                HirInstruction::Call {
+                                    callee: HirCallable::Intrinsic(Intrinsic::Free),
+                                    ..
+                                }
+                            )
+                        })
+                        .count();
+                match block.terminator {
+                    HirTerminator::Branch { target } => paths.push((target, releases, depth + 1)),
+                    HirTerminator::CondBranch {
+                        true_target,
+                        false_target,
+                        ..
+                    } => {
+                        paths.push((true_target, releases, depth + 1));
+                        paths.push((false_target, releases, depth + 1));
+                    }
+                    HirTerminator::Return { .. } => {
+                        assert_eq!(
+                            releases, 3,
+                            "object, array header and array buffer released once per path"
+                        );
+                        returns += 1;
+                    }
+                    _ => panic!("unexpected score terminator"),
+                }
+            }
+            assert!(returns > 0);
             runtime.stop();
             continue;
         }

@@ -55,14 +55,47 @@ fn run() -> ExitCode {
     let Some(file) = file else {
         return usage();
     };
+    if llvm && command == "run" {
+        #[cfg(feature = "llvm-backend")]
+        {
+            config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;
+        }
+        #[cfg(not(feature = "llvm-backend"))]
+        {
+            eprintln!("zynode was built without llvm-backend");
+            return ExitCode::from(2);
+        }
+    }
+    let mut runtime = if command == "run" {
+        match TieredRuntime::new(config) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                eprintln!("zynode: {error}");
+                return ExitCode::from(4);
+            }
+        }
+    } else {
+        None
+    };
+    let using_cache = cache_dir.is_some();
     let loaded = match cache_dir {
         Some(directory) => {
-            zyntax_ts::load_project_cached(&file, options, directory).map(|(project, _)| project)
+            if let Some(runtime) = runtime.as_mut() {
+                zyntax_ts::load_project_for_runtime(&file, options, directory, runtime)
+                    .map(|(project, _)| project)
+            } else {
+                zyntax_ts::load_project_cached(&file, options, directory)
+                    .map(|(project, _)| project)
+            }
         }
         None => zyntax_ts::load_project(&file, options),
     };
     let project = match loaded {
         Ok(project) => project,
+        Err(ProjectError::Native(error)) => {
+            eprintln!("zynode: {error}");
+            return ExitCode::from(4);
+        }
         Err(ProjectError::Io { file, error }) => {
             eprintln!("{}: {error}", file.display());
             return ExitCode::from(2);
@@ -98,25 +131,13 @@ fn run() -> ExitCode {
     if command == "check" {
         return ExitCode::SUCCESS;
     }
-    if llvm {
-        #[cfg(feature = "llvm-backend")]
-        {
-            config.tier2_backend = zyntax_compiler::tiered_backend::Tier2Backend::LLVM;
-        }
-        #[cfg(not(feature = "llvm-backend"))]
-        {
-            eprintln!("zynode was built without llvm-backend");
-            return ExitCode::from(2);
-        }
-    }
-    let mut runtime = match TieredRuntime::new(config) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("zynode: {e}");
-            return ExitCode::from(4);
-        }
+    let mut runtime = runtime.expect("run command has a runtime");
+    let registered = if using_cache {
+        Ok(())
+    } else {
+        zyntax_ts::register_runtime(&mut runtime)
     };
-    let result = zyntax_ts::register_runtime(&mut runtime).and_then(|()| {
+    let result = registered.and_then(|()| {
         let (program, resolver) = project.into_parts();
         runtime.add_compiled_import_resolver(resolver);
         runtime.enter_only_through_entry_points();

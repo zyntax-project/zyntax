@@ -14,6 +14,7 @@ use zyntax_embed::{Snapshot, SnapshotBuilder};
 struct Counting;
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -82,6 +83,7 @@ fn library(functions: usize, values: usize) -> HirModule {
 
 #[test]
 fn snapshot_bodies_are_borrowed() {
+    let _measure = MEASURE.lock().unwrap();
     let bytes = SnapshotBuilder::new("demo")
         .module_lowered(
             "lib",
@@ -108,4 +110,33 @@ fn snapshot_bodies_are_borrowed() {
     let f0 = hir.by_name("f0").expect("f0").id;
     let body = hir.function(f0).expect("the body decodes");
     assert_eq!(body.values.len(), 256);
+}
+
+#[test]
+fn a_single_owned_module_moves_its_encoded_bodies() {
+    let _measure = MEASURE.lock().unwrap();
+    let bytes = SnapshotBuilder::new("demo")
+        .module_lowered(
+            "lib",
+            zyntax_typed_ast::TypedProgram::default(),
+            &library(64, 256),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+    let image_len = bytes.len();
+    let (modules, allocated) =
+        allocated_by(|| Snapshot::load_owned(bytes).unwrap().into_modules().unwrap());
+    assert!(
+        allocated < image_len / 8,
+        "consuming allocated {allocated} bytes for an image of {image_len}: encoded bodies were copied"
+    );
+    let hir = modules[0].hir().unwrap();
+    assert_eq!(
+        hir.function(hir.by_name("f0").unwrap().id)
+            .unwrap()
+            .values
+            .len(),
+        256
+    );
 }

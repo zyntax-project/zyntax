@@ -78,6 +78,14 @@ pub(crate) fn lower_typed_program(
     mut program: TypedProgram,
     inputs: Inputs<'_>,
 ) -> RuntimeResult<Lowered> {
+    lower_typed_program_in_place(&mut program, inputs)
+}
+
+/// Retain the resolved declarations when packaging their executable HIR.
+pub(crate) fn lower_typed_program_in_place(
+    program: &mut TypedProgram,
+    inputs: Inputs<'_>,
+) -> RuntimeResult<Lowered> {
     use zyntax_typed_ast::TypedDeclaration;
     use zyntax_typed_ast::type_registry::*;
 
@@ -94,7 +102,7 @@ pub(crate) fn lower_typed_program(
     };
     // Stateful handlers need their state struct, ctor and implicit
     // `self` synthesized before the registry snapshot.
-    crate::runtime::synthesize_handler_state(&mut program);
+    crate::runtime::synthesize_handler_state(program);
 
     // Rebuild type registry from declarations
     for decl_node in &program.declarations {
@@ -171,14 +179,14 @@ pub(crate) fn lower_typed_program(
     // anything resolves against it. Modules that arrive already lowered
     // are collected for the lowering to link against.
     let mut prelowered = inputs.prelowered;
-    crate::host_import::expand_host_imports(&mut program, &mut type_registry, inputs.host_modules)?;
+    crate::host_import::expand_host_imports(program, &mut type_registry, inputs.host_modules)?;
     crate::import_chain::process_imports_for_traits(
         inputs.grammars,
         inputs.plugin_signatures,
         inputs.import_resolvers,
         inputs.compiled_import_resolvers,
         inputs.snapshot_modules,
-        &mut program,
+        program,
         &mut type_registry,
         &mut prelowered,
         inputs.selective,
@@ -187,17 +195,17 @@ pub(crate) fn lower_typed_program(
     lap("imports", &mut at);
 
     crate::import_chain::process_extern_declarations_mut(&program, &mut type_registry)?;
-    crate::import_chain::resolve_unresolved_types(&mut program, &type_registry);
+    crate::import_chain::resolve_unresolved_types(program, &type_registry);
     program.type_registry = type_registry;
     lap("externs+resolve", &mut at);
     let exact_struct_types = exact_struct_types(&program.type_registry);
 
-    zyntax_compiler::register_impl_blocks(&mut program)
+    zyntax_compiler::register_impl_blocks(program)
         .map_err(|e| RuntimeError::Execution(format!("Failed to register impl blocks: {:?}", e)))?;
-    zyntax_compiler::generate_abstract_trait_impls(&mut program).map_err(|e| {
+    zyntax_compiler::generate_abstract_trait_impls(program).map_err(|e| {
         RuntimeError::Execution(format!("Failed to generate abstract trait impls: {:?}", e))
     })?;
-    zyntax_compiler::register_impl_blocks(&mut program).map_err(|e| {
+    zyntax_compiler::register_impl_blocks(program).map_err(|e| {
         RuntimeError::Execution(format!("Failed to register generated impl blocks: {:?}", e))
     })?;
     lap("impl blocks", &mut at);
@@ -231,10 +239,10 @@ pub(crate) fn lower_typed_program(
         ..LoweringConfig::default()
     };
 
-    zyntax_compiler::module_init::prepare(&mut program);
+    zyntax_compiler::module_init::prepare(program);
 
     if inputs.pattern_rewrites || declares_effects(&program) {
-        rewrite_patterns(&mut program, &type_registry)?;
+        rewrite_patterns(program, &type_registry)?;
     }
     lap("pattern engine", &mut at);
 
@@ -247,7 +255,7 @@ pub(crate) fn lower_typed_program(
     lowering_ctx.set_builtin_registry(inputs.builtin_registry);
 
     let mut module = lowering_ctx
-        .lower_program(&mut program)
+        .lower_program(program)
         .map_err(|e| RuntimeError::Execution(format!("Lowering error: {:?}", e)))?;
 
     lowering_ctx.display_diagnostics(&program);

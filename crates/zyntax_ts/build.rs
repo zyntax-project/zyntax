@@ -12,9 +12,15 @@ fn main() {
         root.join("Cargo.lock"),
         root.join("crates/zyntax_ts/build.rs"),
     ];
-    // These crates own the checked AST, checker policy and snapshot encoding.
-    for name in ["zyntax_ts", "typed_ast", "zyntax_embed"] {
-        let dir = root.join("crates").join(name);
+    // Checked types, snapshot encoding and the native primitive ABI affect reuse.
+    for path in [
+        "crates/zyntax_ts",
+        "crates/typed_ast",
+        "crates/zyntax_embed",
+        "plugins/zrtl_io",
+        "plugins/zrtl_string",
+    ] {
+        let dir = root.join(path);
         files.push(dir.join("Cargo.toml"));
         let src = dir.join("src");
         println!("cargo:rerun-if-changed={}", src.display());

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use zyntax_compiler::bytecode::{
     Format, deserialize_module, deserialize_module_lazy, serialize_module,
 };
-use zyntax_compiler::hir::{HirCallable, HirInstruction, HirModule};
+use zyntax_compiler::hir::{HirCallable, HirId, HirInstruction, HirModule};
 use zyntax_compiler::lowering::{AstLowering, LoweringConfig, LoweringContext};
 use zyntax_typed_ast::{
     AstArena, BinaryOp, CallingConvention, InternedString, Mutability, PrimitiveType, Span, Type,
@@ -177,6 +177,39 @@ fn client() -> TypedProgram {
         function(twice, params, None, Some(InternedString::new_global("lib"))),
         function(main, vec![], Some(body), None),
     ])
+}
+
+#[test]
+fn a_host_entry_can_be_reached_only_from_a_split_snapshot() {
+    let mut module = library();
+    let mut unused = module.functions.values().next().unwrap().clone();
+    unused.id = HirId::new();
+    unused.name = InternedString::new_global("unused");
+    module.functions.insert(unused.id, unused);
+    let bytes = serialize_module(&module, Format::Split).unwrap();
+    let source = Arc::new(deserialize_module_lazy(bytes).unwrap());
+    let id = source.by_name("twice").unwrap().id;
+    for deferred in [false, true] {
+        let module = lower(
+            "client",
+            &mut program(vec![]),
+            LoweringConfig {
+                prelowered: vec![Arc::clone(&source)],
+                entry_names: vec!["twice".into()],
+                closed: true,
+                defer_prelowered_bodies: deferred,
+                ..Default::default()
+            },
+        );
+        let body = module.functions.get(&id).expect("host root is adopted");
+        assert_eq!(body.blocks.is_empty(), deferred);
+        assert!(
+            module
+                .functions
+                .values()
+                .all(|f| f.name.resolve_global().as_deref() != Some("unused"))
+        );
+    }
 }
 
 #[test]

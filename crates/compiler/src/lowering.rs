@@ -889,6 +889,15 @@ impl LoweringContext {
             targets
         };
         let mut pending: Vec<crate::hir::HirId> = Vec::new();
+        // Host entry points can name a snapshot body without any local caller.
+        if let Some(wanted) = &self.wanted {
+            pending.extend(
+                wanted
+                    .iter()
+                    .filter_map(|name| self.prelowered.functions.get(name))
+                    .copied(),
+            );
+        }
         for (id, function) in &self.module.functions {
             // An extern declaration can be replaced later by a body under
             // the same id (a frontend hook declared by the linked library,

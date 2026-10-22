@@ -1889,6 +1889,59 @@ impl TieredRuntime {
         Ok(hir_module)
     }
 
+    /// Resolve and lower a reusable project snapshot under this runtime's native
+    /// policy. Returns body-free declarations alongside optimized HIR, moving
+    /// imported bodies through the linker once. This does not execute initializers
+    /// or generate native code. Generic templates remain available to later callers.
+    pub fn prepare_typed_program_snapshot(
+        &self,
+        name: &str,
+        mut program: zyntax_typed_ast::TypedProgram,
+    ) -> RuntimeResult<(zyntax_typed_ast::TypedProgram, HirModule)> {
+        let lowered = crate::lower::lower_typed_program_in_place(
+            &mut program,
+            crate::lower::Inputs {
+                grammars: &self.grammars,
+                plugin_signatures: &self.plugin_signatures,
+                import_resolvers: &self.import_resolvers,
+                compiled_import_resolvers: &self.compiled_import_resolvers,
+                host_modules: &self.host_modules,
+                snapshot_modules: &self.snapshot_modules,
+                builtins: self.builtin_aliases.clone(),
+                builtin_registry: self.snapshot_builtin_registry(),
+                entry_names: Vec::new(),
+                closed: false,
+                prelowered: Vec::new(),
+                defer_prelowered_bodies: false,
+                keep_generic_templates: true,
+                linked: Arc::default(),
+                selective: false,
+                pattern_rewrites: self.pattern_rewrites,
+                error_flag_global: self.error_flag_global,
+            },
+        )?;
+        // The linked HIR holds dependency bodies and initializer order.
+        program
+            .declarations
+            .retain(|decl| !matches!(decl.node, zyntax_typed_ast::TypedDeclaration::Import(_)));
+        crate::snapshot::strip_bodies(&mut program);
+        let mut module = lowered.module;
+        apply_krio_async_lowering(&mut module)?;
+        apply_krio_effect_lowering(&mut module)?;
+        apply_krio_fiber_lowering(&mut module);
+        let flag = self
+            .error_flag_global
+            .and_then(|name| name.resolve_global());
+        crate::snapshot::optimize_for_snapshot(
+            name,
+            &mut module,
+            self.automatic_release,
+            flag.as_deref(),
+        )
+        .map_err(|error| RuntimeError::Execution(error.to_string()))?;
+        Ok((program, module))
+    }
+
     /// Reload a pre-parsed typed program against the running module —
     /// the typed-program twin of [`Self::reload_module_source`].
     pub fn reload_typed_program(

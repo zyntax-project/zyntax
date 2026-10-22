@@ -420,6 +420,11 @@ impl Snapshot {
         self.modules.iter().map(|m| m.name.as_str())
     }
 
+    /// Checked inputs recorded by a persistent source-project cache.
+    pub fn cached_sources(&self) -> Option<&[SnapshotSource]> {
+        self.cache.as_ref().map(|cache| cache.sources.as_slice())
+    }
+
     /// Check lowered modules against this compiler and its current target.
     /// Reads only directory metadata, leaving typed declarations and HIR encoded.
     pub fn validate_compatibility(&self) -> Result<(), SnapshotError> {
@@ -717,6 +722,28 @@ impl Snapshot {
     /// Consume the snapshot, moving decoded modules rather than cloning their bodies.
     pub fn into_modules(mut self) -> Result<Vec<CompiledImport>, SnapshotError> {
         self.validate_compatibility()?;
+        if self.modules.len() == 1
+            && matches!(self.bytes, std::borrow::Cow::Owned(_))
+            && self.decoded[0].get().is_none()
+            && self.decoded_hir[0].get().is_none()
+            && let Some(lowered) = &self.modules[0].lowered
+        {
+            let entry = &self.modules[0];
+            let import = CompiledImport::decode(entry.artifact.slice(self.blobs(), &entry.name)?)?;
+            lowered.hir.slice(self.blobs(), &entry.name)?;
+            let start = self.blobs_at + lowered.hir.at as usize;
+            let length = lowered.hir.len as usize;
+            let std::borrow::Cow::Owned(mut bytes) = std::mem::take(&mut self.bytes) else {
+                unreachable!()
+            };
+            // Reuse the project's owned image for its split HIR, without
+            // allocating another copy of all the encoded function bodies.
+            bytes.copy_within(start..start + length, 0);
+            bytes.truncate(length);
+            let hir = zyntax_compiler::bytecode::deserialize_module_lazy(bytes)
+                .map_err(|error| SnapshotError::Decode(error.to_string()))?;
+            return Ok(vec![import.with_hir(Arc::new(hir))]);
+        }
         let mut modules = Vec::with_capacity(self.modules.len());
         for index in 0..self.modules.len() {
             modules.push(match self.decoded[index].take() {
@@ -828,6 +855,16 @@ pub fn lower_for_snapshot_releasing(
         reason: e.to_string(),
     })?;
     let mut module = lowered.module;
+    optimize_for_snapshot(name, &mut module, automatic_release, error_flag_global)?;
+    Ok(module)
+}
+
+pub(crate) fn optimize_for_snapshot(
+    name: &str,
+    module: &mut HirModule,
+    automatic_release: bool,
+    error_flag_global: Option<&str>,
+) -> Result<(), SnapshotError> {
     if !module.effects.is_empty() || !module.handlers.is_empty() {
         return Err(SnapshotError::Effectful {
             module: name.to_string(),
@@ -841,25 +878,25 @@ pub fn lower_for_snapshot_releasing(
             !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
         })
         .collect();
-    let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(&mut module);
-    zyntax_compiler::run_native_only_opts(&mut module);
+    let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(module);
+    zyntax_compiler::run_native_only_opts(module);
     // The bodies as every program adopts them, then the facts of those
     // bodies: a program that links the module reads them rather than
     // computing them over the library again.
-    zyntax_compiler::const_boxes::run_library(&mut module, name);
-    let facts = zyntax_compiler::drop_insert::facts_of(&module);
-    zyntax_compiler::drop_insert::record_facts(&mut module, &facts);
+    zyntax_compiler::const_boxes::run_library(module, name);
+    let facts = zyntax_compiler::drop_insert::facts_of(module);
+    zyntax_compiler::drop_insert::record_facts(module, &facts);
     if let Some(flag) = error_flag_global {
-        zyntax_compiler::error_flag::record_keeps(&mut module, flag);
+        zyntax_compiler::error_flag::record_keeps(module, flag);
     }
-    zyntax_compiler::mark_optimized(&mut module);
+    zyntax_compiler::mark_optimized(module);
     module.functions.extend(templates);
-    Ok(module)
+    Ok(())
 }
 
 /// Drop every function body from a program whose HIR travels beside it.
 /// What remains types a caller; nothing lowers it.
-fn strip_bodies(program: &mut zyntax_typed_ast::TypedProgram) {
+pub(crate) fn strip_bodies(program: &mut zyntax_typed_ast::TypedProgram) {
     use zyntax_typed_ast::TypedDeclaration;
     program.declarations.retain(|d| !matches!(d.node, TypedDeclaration::Initializer(_))
         && !matches!(&d.node, TypedDeclaration::Function(f) if zyntax_compiler::module_init::is_initializer(f)));
