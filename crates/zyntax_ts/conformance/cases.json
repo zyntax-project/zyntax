@@ -1859,5 +1859,15 @@
     "id": "constants/assign",
     "file": "cases/constants/assign.ts",
     "mode": "check"
+  },
+  {
+    "id": "bitwise/operators",
+    "file": "cases/bitwise/operators.ts",
+    "mode": "run"
+  },
+  {
+    "id": "timing/clocks",
+    "file": "cases/timing/clocks.ts",
+    "mode": "run"
   }
 ]

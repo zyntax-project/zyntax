@@ -22,12 +22,14 @@ use zyntax_typed_ast::{
 use crate::{Error, ErrorKind, Indexing, ModuleDependency, ModuleId, Options, Soundness};
 
 mod arrays;
+mod bitwise;
 mod classes;
 mod constants;
 mod generics;
 mod math;
 mod modules;
 mod namespaces;
+mod timing;
 pub(crate) use modules::dependency_source;
 mod unions;
 use arrays::Integral;
@@ -1716,6 +1718,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$print_number", vec![number()], unit()),
             ("$TS$pow", vec![number(), number()], number()),
             ("$TS$index_trap", vec![number(), number()], unit()),
+            ("$TS$date_now", vec![], number()),
+            ("$TS$performance_now", vec![], number()),
+            (
+                "$TS$to_int32_slow",
+                vec![number()],
+                Type::Primitive(PrimitiveType::I64),
+            ),
             ("$TS$space", vec![], unit()),
             ("$TS$newline", vec![], unit()),
             ("$IO$print", vec![string()], unit()),
@@ -3459,6 +3468,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     )
                 } else {
                     let value = self.expr(&u.argument)?;
+                    if u.operator.as_str() == "~" {
+                        return self.bitwise_not(value, at);
+                    }
                     self.expect(&value.ty, &number(), at)?;
                     let op = match u.operator.as_str() {
                         "+" => UnaryOp::Plus,
@@ -3845,6 +3857,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.expect(&right.ty, &number(), at)?;
             return Ok(self.call("$TS$pow", vec![left, right], number(), at));
         }
+        if matches!(op, "|" | "&" | "^" | "<<" | ">>" | ">>>") {
+            return self.bitwise(op, left, right, at);
+        }
         if left.ty != right.ty {
             return self.unsupported("mixed-type operator coercion", at);
         }
@@ -4019,6 +4034,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if !m.optional {
                 if let Some(call) = self.math_call(c, m)? {
+                    return Ok(call);
+                }
+                if let Some(call) = self.timing_call(c, m)? {
                     return Ok(call);
                 }
                 if let Some(call) = self.method_call(c, m)? {
@@ -4365,15 +4383,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if let Some(read) = read {
             self.expect(&read.ty, &number(), a.span)?;
             self.expect(&value.ty, &number(), a.span)?;
-            let operation = match op {
-                "+=" => BinaryOp::Add,
-                "-=" => BinaryOp::Sub,
-                "*=" => BinaryOp::Mul,
-                "/=" => BinaryOp::Div,
-                "%=" => BinaryOp::Rem,
+            let arithmetic = match op {
+                "+=" => Some(BinaryOp::Add),
+                "-=" => Some(BinaryOp::Sub),
+                "*=" => Some(BinaryOp::Mul),
+                "/=" => Some(BinaryOp::Div),
+                "%=" => Some(BinaryOp::Rem),
+                "|=" | "&=" | "^=" | "<<=" | ">>=" | ">>>=" => None,
                 _ => return self.unsupported("this compound assignment", a.span),
             };
-            value = binary(operation, read, value, number(), a.span);
+            value = match arithmetic {
+                Some(operation) => binary(operation, read, value, number(), a.span),
+                None => self.bitwise(&op[..op.len() - 1], read, value, a.span)?,
+            };
         }
         let name = self.fresh("assigned");
         let ty = value.ty.clone();

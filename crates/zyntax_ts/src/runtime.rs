@@ -101,6 +101,32 @@ extern "C" fn index_trap(index: f64, length: f64) {
     std::process::exit(1);
 }
 
+/// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
+extern "C" fn to_int32_slow(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let wrapped = value.trunc().rem_euclid(4_294_967_296.0) as u64;
+    i64::from(wrapped as u32 as i32)
+}
+
+/// Milliseconds since the Unix epoch, whole, as `Date.now()` reports.
+extern "C" fn date_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_millis() as f64)
+}
+
+/// Milliseconds since the first read of the clock, with sub-millisecond resolution.
+extern "C" fn performance_now() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1000.0
+}
+
 extern "C" fn print_undefined() {
     print!("undefined");
 }
@@ -120,6 +146,9 @@ zrtl::zrtl_plugin! {
         ("$TS$number_to_string", number_to_string),
         ("$TS$pow", number_pow),
         ("$TS$index_trap", index_trap),
+        ("$TS$date_now", date_now),
+        ("$TS$performance_now", performance_now),
+        ("$TS$to_int32_slow", to_int32_slow),
         ("$TS$math_ceil", math_ceil),
         ("$TS$math_trunc", math_trunc),
         ("$TS$math_round", math_round),
