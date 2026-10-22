@@ -1888,7 +1888,7 @@ pub fn run_native_only_opts(module: &mut HirModule) -> parallel_dispatch::Dispat
 }
 
 pub fn run_interp_safe_opts(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true, None, false)
+    run_interp_safe_opts_with(module, true, None, false, None)
 }
 
 /// What the passes learn about a module as a whole and optimising one
@@ -1990,7 +1990,7 @@ impl OptCache {
 
 /// [`run_interp_safe_opts`] over what the cache already knows.
 pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true, Some(cache), false)
+    run_interp_safe_opts_with(module, true, Some(cache), false, None)
 }
 
 /// Select fixed-width counter vectors when Cranelift is the final native tier.
@@ -2000,7 +2000,7 @@ pub(crate) fn run_interp_safe_opts_cached_for_cranelift(
     module: &mut HirModule,
     cache: &OptCache,
 ) -> InterpOptStats {
-    run_interp_safe_opts_with(module, true, Some(cache), true)
+    run_interp_safe_opts_with(module, true, Some(cache), true, None)
 }
 
 /// [`run_interp_safe_opts`] for a module whose functions other modules
@@ -2009,7 +2009,17 @@ pub(crate) fn run_interp_safe_opts_cached_for_cranelift(
 /// module reads them to know what a result aliases. The program's own
 /// pass expands them.
 pub fn run_interp_safe_opts_keeping_readers(module: &mut HirModule) -> InterpOptStats {
-    run_interp_safe_opts_with(module, false, None, false)
+    run_interp_safe_opts_with(module, false, None, false, None)
+}
+
+/// Optimize an owned snapshot candidate, checking cancellation between passes.
+/// A cancelled candidate must be discarded rather than marked or published.
+pub fn run_snapshot_opts_cancellable(
+    module: &mut HirModule,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    run_interp_safe_opts_with(module, false, None, false, Some(cancelled));
+    !cancelled.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Mark every function as through the pipeline, so a program that
@@ -2074,8 +2084,12 @@ fn run_interp_safe_opts_with(
     expand_box_reads: bool,
     cache: Option<&OptCache>,
     counter_vectors: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> InterpOptStats {
     let mut stats = InterpOptStats::default();
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return stats;
+    }
     // Every pass walks the functions still to optimise; with none, the
     // module-wide facts some of them build first would be all the work.
     if module
@@ -2112,8 +2126,16 @@ fn run_interp_safe_opts_with(
         }
     };
     let mut at = web_time::Instant::now();
+    macro_rules! checkpoint {
+        ($name:expr) => {
+            timed($name, &mut at);
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return stats;
+            }
+        };
+    }
     let ap = alloca_promote::run_module(module);
-    timed("alloca_promote", &mut at);
+    checkpoint!("alloca_promote");
     check_hir_uses(module, "alloca_promote");
     stats.alloca_promote.allocas_scanned += ap.allocas_scanned;
     stats.alloca_promote.promoted += ap.promoted;
@@ -2126,7 +2148,7 @@ fn run_interp_safe_opts_with(
     // up front; it's re-run after recursive inlining (below), which
     // rewrites bodies and can expose freshly-shared pure calls.
     purity::infer_module(module);
-    timed("purity", &mut at);
+    checkpoint!("purity");
     check_hir_uses(module, "purity");
 
     // What each call does to the error flag, read from the bodies once
@@ -2139,7 +2161,7 @@ fn run_interp_safe_opts_with(
             &local_summaries
         }
     };
-    timed("error_flag summaries", &mut at);
+    checkpoint!("error_flag summaries");
 
     // Outer fixed-point: keeps iterating the whole sweep until none
     // of the passes report new work. Compounding example: inline
@@ -2164,27 +2186,27 @@ fn run_interp_safe_opts_with(
             eprintln!("[OPT] round {round}");
         }
         let cf = const_fold::fold_module(module);
-        timed("const_fold", &mut at);
+        checkpoint!("const_fold");
         check_hir_uses(module, "const_fold");
         let sf = sign_fold::run_module(module);
         stats.sign_fold.compares += sf.compares;
         stats.sign_fold.selects += sf.selects;
-        timed("sign_fold", &mut at);
+        checkpoint!("sign_fold");
         check_hir_uses(module, "sign_fold");
         let cs = cse::eliminate_module(module);
-        timed("cse", &mut at);
+        checkpoint!("cse");
         check_hir_uses(module, "cse");
         // After cse, which makes repeated compares one value: a branch
         // on a condition a dominating branch decided is a jump.
         let bf = branch_fold::run_module(module);
         stats.branch_fold.folded += bf.folded;
-        timed("branch_fold", &mut at);
+        checkpoint!("branch_fold");
         check_hir_uses(module, "branch_fold");
         // load_cse runs after value-cse so canonical pointer ids are
         // already chased — if two GEPs cse'd to one, the load_cse
         // pass sees both loads using the same canonical ptr id.
         let lcse = load_cse::run_module(module);
-        timed("load_cse", &mut at);
+        checkpoint!("load_cse");
         check_hir_uses(module, "load_cse");
         // aggregate_split runs after load_cse so the struct-typed
         // Loads it targets are the canonical ones (load_cse may
@@ -2192,7 +2214,7 @@ fn run_interp_safe_opts_with(
         // Eliminates the load-modify-store cycle on struct values
         // produced by `let mut b = arr[i]; b.x = …; arr[i] = b`.
         let ags = aggregate_split::run_module(module);
-        timed("aggregate_split", &mut at);
+        checkpoint!("aggregate_split");
         check_hir_uses(module, "aggregate_split");
         // An aggregate that never touches memory has no bytes to split:
         // its fields become values of their own.
@@ -2200,7 +2222,7 @@ fn run_interp_safe_opts_with(
         stats.aggregate_scalarize.webs += agsc.webs;
         stats.aggregate_scalarize.values += agsc.values;
         stats.aggregate_scalarize.rematerialized += agsc.rematerialized;
-        timed("aggregate_scalarize", &mut at);
+        checkpoint!("aggregate_scalarize");
         check_hir_uses(module, "aggregate_scalarize");
         // scalar_replace_alloc runs after aggregate_split:
         //   * aggregate_split has just rewritten any struct-typed
@@ -2212,19 +2234,19 @@ fn run_interp_safe_opts_with(
         // Cranelift's mem2reg cannot promote heap allocations
         // (Call results are opaque); this is the HIR-only path.
         let sra = scalar_replace_alloc::run_module(module);
-        timed("scalar_replace_alloc", &mut at);
+        checkpoint!("scalar_replace_alloc");
         check_hir_uses(module, "scalar_replace_alloc");
         let heap = heap_scalarize::run_module(module);
-        timed("heap_scalarize", &mut at);
+        checkpoint!("heap_scalarize");
         check_hir_uses(module, "heap_scalarize");
         // A field a constructor defaulted and its caller then set: the
         // default's store is dead once both are in one block.
         let ds = dead_store::run_module(module);
         stats.dead_store.removed += ds.removed;
-        timed("dead_store", &mut at);
+        checkpoint!("dead_store");
         check_hir_uses(module, "dead_store");
         let il = inline::run_module_with(module, cache);
-        timed("inline", &mut at);
+        checkpoint!("inline");
         check_hir_uses(module, "inline");
         // After inline, which puts a callee's raising arm and the
         // caller's check in one body; before licm, so a loop left with no
@@ -2238,10 +2260,10 @@ fn run_interp_safe_opts_with(
         };
         stats.error_flag.folded += ef.folded;
         stats.error_flag.threaded += ef.threaded;
-        timed("error_flag", &mut at);
+        checkpoint!("error_flag");
         check_hir_uses(module, "error_flag");
         let lc = licm::run_module(module);
-        timed("licm", &mut at);
+        checkpoint!("licm");
         check_hir_uses(module, "licm");
         // Before the loops are matched against a shape. A variable live
         // across a loop but never reassigned in it still carries a phi,
@@ -2252,7 +2274,7 @@ fn run_interp_safe_opts_with(
         let ppf = phi_prune::run_module(module);
         stats.phi_prune.removed += ppf.removed;
         stats.phi_prune.rounds = stats.phi_prune.rounds.max(ppf.rounds);
-        timed("phi_prune", &mut at);
+        checkpoint!("phi_prune");
         check_hir_uses(module, "phi_prune");
         // cfg_simplify runs last in the round — `const_fold`'s
         // CondBranch-on-known-Bool collapse routinely turns
@@ -2260,7 +2282,7 @@ fn run_interp_safe_opts_with(
         // the target block a straight-line successor ready for
         // merging.
         let cs_cfg = cfg_simplify::run_module(module);
-        timed("cfg_simplify", &mut at);
+        checkpoint!("cfg_simplify");
         check_hir_uses(module, "cfg_simplify");
 
         // The folders feed each other and nothing else: a compare
@@ -2295,7 +2317,7 @@ fn run_interp_safe_opts_with(
                     break;
                 }
             }
-            timed("fold to fixed point", &mut at);
+            checkpoint!("fold to fixed point");
             check_hir_uses(module, "fold to fixed point");
             folded = false;
         }
@@ -2374,7 +2396,7 @@ fn run_interp_safe_opts_with(
             cfg_simplify::run_module(module);
         }
     }
-    timed("partial_escape", &mut at);
+    checkpoint!("partial_escape");
     check_hir_uses(module, "partial_escape");
 
     // Once the sweep has hoisted what leaves the loops: a bound read
@@ -2385,7 +2407,7 @@ fn run_interp_safe_opts_with(
     let bv = bounds_version::run_module(module);
     stats.bounds_version.versioned += bv.versioned;
     stats.bounds_version.folded += bv.folded;
-    timed("bounds_version", &mut at);
+    checkpoint!("bounds_version");
     check_hir_uses(module, "bounds_version");
     if bv.versioned > 0 {
         for _ in 0..2 {
@@ -2402,7 +2424,7 @@ fn run_interp_safe_opts_with(
             stats.cfg_simplify.merged += cs_cfg.merged;
             stats.cfg_simplify.threaded += cs_cfg.threaded;
         }
-        timed("bounds_version cleanup", &mut at);
+        checkpoint!("bounds_version cleanup");
         check_hir_uses(module, "bounds_version cleanup");
     }
 
@@ -2410,7 +2432,7 @@ fn run_interp_safe_opts_with(
     if trace && reduced > 0 {
         eprintln!("[OPT] strength-reduced {reduced} bounded divisions/remainders");
     }
-    timed("bounded_div", &mut at);
+    checkpoint!("bounded_div");
     check_hir_uses(module, "bounded_div");
 
     // Affine reduction-loop closed-forming runs ONCE after the
@@ -2435,7 +2457,7 @@ fn run_interp_safe_opts_with(
     if trace {
         eprintln!("[OPT] affine_loop stats {al:?}");
     }
-    timed("affine_loop", &mut at);
+    checkpoint!("affine_loop");
     check_hir_uses(module, "affine_loop");
     stats.affine_loop.folded += al.folded;
     stats.affine_loop.loops_visited += al.loops_visited;
@@ -2463,13 +2485,13 @@ fn run_interp_safe_opts_with(
     // afterwards costs nothing, since the pass contracts vector and
     // scalar pairs alike. What they rewrite gets one cleaning pass.
     let lv = loop_vectorize::run_module(module);
-    timed("loop_vectorize", &mut at);
+    checkpoint!("loop_vectorize");
     check_hir_uses(module, "loop_vectorize");
     let rv = reduction_vectorize::run_module(module);
-    timed("reduction_vectorize", &mut at);
+    checkpoint!("reduction_vectorize");
     check_hir_uses(module, "reduction_vectorize");
     let av = auto_vectorize::run_module_with_counter_vectors(module, counter_vectors);
-    timed("auto_vectorize", &mut at);
+    checkpoint!("auto_vectorize");
     check_hir_uses(module, "auto_vectorize");
     stats.loop_vectorize.vectorized += lv.vectorized;
     stats.loop_vectorize.loops_visited += lv.loops_visited;
@@ -2498,7 +2520,7 @@ fn run_interp_safe_opts_with(
         fma_contract::run_module(module)
     };
     stats.fma_contract.contracted += fma.contracted;
-    timed("fma_contract", &mut at);
+    checkpoint!("fma_contract");
     check_hir_uses(module, "fma_contract");
     if lv.vectorized > 0 || rv.vectorized > 0 || av.vectorized > 0 || fma.contracted > 0 {
         let cf = const_fold::fold_module(module);
@@ -2511,7 +2533,7 @@ fn run_interp_safe_opts_with(
         let cs_cfg = cfg_simplify::run_module(module);
         stats.cfg_simplify.merged += cs_cfg.merged;
         stats.cfg_simplify.threaded += cs_cfg.threaded;
-        timed("vector cleanup", &mut at);
+        checkpoint!("vector cleanup");
         check_hir_uses(module, "vector cleanup");
     }
 
@@ -2538,7 +2560,7 @@ fn run_interp_safe_opts_with(
     // backend and holds a register for the whole loop, which is what
     // pushes the register allocator into spilling a real one.
     let pp = phi_prune::run_module(module);
-    timed("phi_prune", &mut at);
+    checkpoint!("phi_prune");
     check_hir_uses(module, "phi_prune");
     stats.phi_prune.removed += pp.removed;
     stats.phi_prune.rounds = stats.phi_prune.rounds.max(pp.rounds);
@@ -2554,12 +2576,12 @@ fn run_interp_safe_opts_with(
         stats.recursive_inline.skipped_too_many_sites += ri.skipped_too_many_sites;
         stats.recursive_inline.skipped_unsupported += ri.skipped_unsupported;
     }
-    timed("recursive_inline", &mut at);
+    checkpoint!("recursive_inline");
     check_hir_uses(module, "recursive_inline");
     // The copies come with the callee's block seams; fold them before
     // anything reads the shape.
     let cs = cfg_simplify::run_module(module);
-    timed("cfg_simplify", &mut at);
+    checkpoint!("cfg_simplify");
     check_hir_uses(module, "cfg_simplify");
     stats.cfg_simplify.merged += cs.merged;
     stats.cfg_simplify.threaded += cs.threaded;
@@ -2574,15 +2596,15 @@ fn run_interp_safe_opts_with(
     //   * `cse` collapses any remaining duplicate that already sits in a
     //     dominance relationship.
     purity::infer_module(module);
-    timed("purity", &mut at);
+    checkpoint!("purity");
     check_hir_uses(module, "purity");
     let pcp = pure_call_pre::run_module(module);
-    timed("pure_call_pre", &mut at);
+    checkpoint!("pure_call_pre");
     check_hir_uses(module, "pure_call_pre");
     stats.pure_call_pre.hoisted += pcp.hoisted;
     stats.pure_call_pre.groups_visited += pcp.groups_visited;
     let post_ri_cse = cse::eliminate_module(module);
-    timed("cse", &mut at);
+    checkpoint!("cse");
     check_hir_uses(module, "cse");
     stats.cse.eliminated += post_ri_cse.eliminated;
     stats.cse.rewrites += post_ri_cse.rewrites;
@@ -2601,7 +2623,7 @@ fn run_interp_safe_opts_with(
     //     first marks every valid shape; the drop_insert pass can
     //     then add Free calls without those marks getting lost.
     let tc = tco::run_module(module);
-    timed("tco", &mut at);
+    checkpoint!("tco");
     check_hir_uses(module, "tco");
     stats.tco.candidates_visited += tc.candidates_visited;
     stats.tco.marked += tc.marked;
@@ -2628,7 +2650,7 @@ fn run_interp_safe_opts_with(
         Some(cache) => drop_insert::run_module_with(module, &cache.facts),
         None => drop_insert::run_module(module),
     };
-    timed("drop_insert", &mut at);
+    checkpoint!("drop_insert");
     check_hir_uses(module, "drop_insert");
     stats.drop_insert.mallocs_scanned += di.mallocs_scanned;
     stats.drop_insert.frees_inserted += di.frees_inserted;
@@ -2644,7 +2666,7 @@ fn run_interp_safe_opts_with(
     } else {
         boxes::BoxStats::default()
     };
-    timed("boxes", &mut at);
+    checkpoint!("boxes");
     check_hir_uses(module, "boxes");
     stats.boxes.expanded += br.expanded;
     stats.boxes.made += br.made;
@@ -2662,13 +2684,13 @@ fn run_interp_safe_opts_with(
         if late_load_cleanup {
             stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
         }
-        timed("licm+cse+load_cse", &mut at);
+        checkpoint!("licm+cse+load_cse");
         check_hir_uses(module, "licm+cse+load_cse");
     }
 
     let pruned = cfg_simplify::prune_unreachable_module(module);
     stats.cfg_simplify.unreachable_removed += pruned;
-    timed("prune_unreachable", &mut at);
+    checkpoint!("prune_unreachable");
     check_hir_uses(module, "prune_unreachable");
     // Removing dead predecessors exposes single-entry blocks and field
     // reads that can now be compared with the stores preceding them.
@@ -2683,7 +2705,7 @@ fn run_interp_safe_opts_with(
         stats.cse.eliminated += cs.eliminated;
         stats.cse.rewrites += cs.rewrites;
         stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
-        timed("pruned load cleanup", &mut at);
+        checkpoint!("pruned load cleanup");
         check_hir_uses(module, "pruned load cleanup");
     }
 
@@ -2700,7 +2722,7 @@ fn run_interp_safe_opts_with(
             stats.cse.rewrites += cs.rewrites;
             stats.load_cse.eliminated += load_cse::run_module(module).eliminated;
         }
-        timed("late aggregate_split", &mut at);
+        checkpoint!("late aggregate_split");
         check_hir_uses(module, "late aggregate_split");
     }
 
@@ -2721,14 +2743,14 @@ fn run_interp_safe_opts_with(
             stats.cfg_simplify.merged += cfg.merged;
             stats.cfg_simplify.threaded += cfg.threaded;
         }
-        timed("late branch_fold", &mut at);
+        checkpoint!("late branch_fold");
         check_hir_uses(module, "late branch_fold");
     }
 
     // Closed scalar states are priced after unreachable dispatch arms
     // have gone. These copies contain no allocations or releases.
     let specialized = loop_specialize::run_module(module);
-    timed("loop_specialize", &mut at);
+    checkpoint!("loop_specialize");
     if specialized > 0 {
         const_fold::fold_module(module);
         phi_prune::run_module(module);

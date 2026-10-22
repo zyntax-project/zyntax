@@ -52,6 +52,9 @@ available for modules not packaged in the snapshot.
 | `module_with_source` | Checked AST plus original source | Same, with explicit source available for reparsing |
 | `module_lowered` | Body-free declarations, signatures/interfaces and split HIR | Decode reached bodies and execute; JIT compilation remains runtime work |
 
+`module_lowered_ref` borrows metadata that is already body-free, allowing its
+owner to keep preparing HIR without copying typed function bodies.
+
 `module_ref` borrows the checked program during encoding. `module_lowered`
 consumes its program and strips executable AST bodies; matching HIR is required
 for execution. Use shared `lower_for_snapshot_releasing` for library preparation,
@@ -110,6 +113,14 @@ A cache hit skips only the stages represented in the artifact: checked AST skips
 parsing/checking; compatible HIR also reuses native lowering and optimization.
 Artifact validation and runtime installation still run. Treat the cache directory
 as trusted local build storage.
+
+`SnapshotPreparation` offers one shared background optimization slot per process.
+It owns its HIR and metadata, revalidates source inputs, and publishes atomically.
+`optimize_inline` can finish small graphs before scheduling a worker.
+Dropping its handle cancels between compiler phases and publication writes without
+joining; `finish` explicitly waits for prewarming. Callers keep an executable
+fallback and include execution-root policy in their cache identity when saving
+only reachable code.
 
 See [TypeScript caching](language-integrations/typescript/architecture.md#persistent-project-cache)
 for a frontend integration. Keep measurements and work journals in git-bug.

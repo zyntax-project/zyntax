@@ -6,7 +6,10 @@ use zyntax_embed::{Snapshot, SnapshotBuilder, SnapshotCache, SnapshotError};
 use zyntax_typed_ast::InternedString;
 use zyntax_typed_ast::import_resolver::ModuleArchitecture;
 
-use super::{LoweredProject, ProjectError, SourceProject, canonicalize, load_canonical, resolve};
+use super::{
+    CachePreparation, LoweredProject, ProjectError, SourceProject, canonicalize, load_canonical,
+    resolve,
+};
 use crate::{Options, Soundness};
 
 /// Result of an optional persistent frontend cache operation.
@@ -31,7 +34,8 @@ pub fn load_project_cached(
     options: Options,
     cache_dir: impl AsRef<Path>,
 ) -> Result<(SourceProject, CacheStatus), ProjectError> {
-    load_cached(path.as_ref(), options, cache_dir.as_ref(), None)
+    load_cached(path.as_ref(), options, cache_dir.as_ref(), None, false)
+        .map(|(project, status, _)| (project, status))
 }
 
 /// Install TypeScript primitives and prepare a source-validated project for execution.
@@ -45,7 +49,32 @@ pub fn load_project_for_runtime(
     runtime: &mut zyntax_embed::TieredRuntime,
 ) -> Result<(SourceProject, CacheStatus), ProjectError> {
     crate::register_runtime(runtime)?;
-    load_cached(path.as_ref(), options, cache_dir.as_ref(), Some(runtime))
+    load_cached(
+        path.as_ref(),
+        options,
+        cache_dir.as_ref(),
+        Some(runtime),
+        false,
+    )
+    .map(|(project, status, _)| (project, status))
+}
+
+/// Prepare an executable fallback immediately and optimize the cache on a bounded
+/// worker. Keep the returned handle alive while executing; drop it at shutdown.
+pub fn load_project_for_runtime_background(
+    path: impl AsRef<Path>,
+    options: Options,
+    cache_dir: impl AsRef<Path>,
+    runtime: &mut zyntax_embed::TieredRuntime,
+) -> Result<(SourceProject, CacheStatus, Option<CachePreparation>), ProjectError> {
+    crate::register_runtime(runtime)?;
+    load_cached(
+        path.as_ref(),
+        options,
+        cache_dir.as_ref(),
+        Some(runtime),
+        true,
+    )
 }
 
 fn load_cached(
@@ -53,7 +82,8 @@ fn load_cached(
     options: Options,
     cache_dir: &Path,
     runtime: Option<&mut zyntax_embed::TieredRuntime>,
-) -> Result<(SourceProject, CacheStatus), ProjectError> {
+    background: bool,
+) -> Result<(SourceProject, CacheStatus, Option<CachePreparation>), ProjectError> {
     let path = canonicalize(path)?;
     let identity = path.to_str().ok_or_else(|| ProjectError::Io {
         file: path.clone(),
@@ -66,16 +96,36 @@ fn load_cached(
         Soundness::TypeScript => "typescript",
         Soundness::Checked => "checked",
     };
+    let entries = background
+        .then(|| runtime.as_ref().and_then(|r| r.closed_entry_points()))
+        .flatten();
+    let scoped_policy = entries.as_ref().map(|entries| {
+        format!(
+            "{policy};closed:{}",
+            serde_json::to_string(entries).unwrap()
+        )
+    });
     let cache = SnapshotCache::new(
         cache_dir,
         "typescript",
         identity,
         env!("ZYNTAX_TS_CACHE_BUILD_ID"),
-        policy,
+        scoped_policy.as_deref().unwrap_or(policy),
     );
     let architecture = ModuleArchitecture::typescript();
     let restored = cache
         .load(|file, specifier| resolve(&architecture, file, specifier).ok())
+        .or_else(|| {
+            scoped_policy.as_ref()?;
+            SnapshotCache::new(
+                cache_dir,
+                "typescript",
+                identity,
+                env!("ZYNTAX_TS_CACHE_BUILD_ID"),
+                policy,
+            )
+            .load(|file, specifier| resolve(&architecture, file, specifier).ok())
+        })
         .and_then(|snapshot| {
             let lowered = snapshot.carries_hir(identity);
             let sources = if runtime.is_some() && !lowered {
@@ -87,7 +137,7 @@ fn load_cached(
         });
     let (project, sources) = if let Some((project, sources, lowered)) = restored {
         if lowered || runtime.is_none() {
-            return Ok((project, CacheStatus::Hit));
+            return Ok((project, CacheStatus::Hit, None));
         }
         (project, sources)
     } else {
@@ -98,6 +148,45 @@ fn load_cached(
     if let Some(runtime) = runtime {
         let (program, resolver) = project.into_parts();
         runtime.add_compiled_import_resolver(resolver);
+        if background {
+            let closed = entries.is_some();
+            let (program, mut hir) = runtime.lower_typed_program_snapshot(program, entries)?;
+            let finished = closed
+                && CachePreparation::optimize_inline(identity, &mut hir, None)
+                    .map_err(native_error)?;
+            let builder = SnapshotBuilder::new("typescript")
+                .module_lowered_ref(identity, &program, &hir)
+                .map_err(native_error)?;
+            let snapshot = cache
+                .prepare(builder, sources.clone())
+                .map_err(native_error)?;
+            let status = if cache.publish(&snapshot).is_ok() {
+                CacheStatus::Stored
+            } else {
+                CacheStatus::Unavailable
+            };
+            let project = restore(snapshot, identity).ok_or_else(|| {
+                native_error(SnapshotError::Decode(
+                    "prepared project snapshot is unreadable".into(),
+                ))
+            })?;
+            let worker = if status == CacheStatus::Stored && !finished {
+                CachePreparation::start(
+                    identity.to_owned(),
+                    program,
+                    hir,
+                    cache,
+                    sources,
+                    None,
+                    |file, specifier| {
+                        resolve(&ModuleArchitecture::typescript(), file, specifier).ok()
+                    },
+                )
+            } else {
+                None
+            };
+            return Ok((project, status, worker));
+        }
         let (program, hir) = runtime.prepare_typed_program_snapshot(identity, program)?;
         let prepare = || -> Result<Snapshot, SnapshotError> {
             let builder =
@@ -117,7 +206,7 @@ fn load_cached(
                 "prepared project snapshot is unreadable".into(),
             ))
         })?;
-        return Ok((project, status));
+        return Ok((project, status, None));
     }
     let snapshot = (|| -> Result<_, SnapshotError> {
         let mut builder = SnapshotBuilder::new("typescript");
@@ -136,7 +225,7 @@ fn load_cached(
     } else {
         CacheStatus::Unavailable
     };
-    Ok((project, status))
+    Ok((project, status, None))
 }
 
 fn restore(snapshot: Snapshot, entry: &str) -> Option<SourceProject> {
@@ -171,4 +260,8 @@ fn restore(snapshot: Snapshot, entry: &str) -> Option<SourceProject> {
         dependencies: programs,
         lowered: None,
     })
+}
+
+fn native_error(error: SnapshotError) -> ProjectError {
+    ProjectError::Native(zyntax_embed::RuntimeError::Execution(error.to_string()))
 }

@@ -100,6 +100,10 @@ impl SnapshotCache {
         }
     }
 
+    pub(super) fn language(&self) -> &str {
+        &self.key.language
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -108,14 +112,25 @@ impl SnapshotCache {
     /// `resolve` applies the frontend's current module-resolution policy.
     pub fn load(&self, resolve: impl Fn(&Path, &str) -> Option<PathBuf>) -> Option<Snapshot> {
         let snapshot = Snapshot::load_owned(std::fs::read(&self.path).ok()?).ok()?;
-        let inputs = snapshot.cache.as_ref()?;
+        self.is_current(&snapshot, resolve).then_some(snapshot)
+    }
+
+    /// Revalidate prepared inputs before a background publication.
+    pub fn is_current(
+        &self,
+        snapshot: &Snapshot,
+        resolve: impl Fn(&Path, &str) -> Option<PathBuf>,
+    ) -> bool {
+        let Some(inputs) = snapshot.cache.as_ref() else {
+            return false;
+        };
         if inputs.key != self.key
             || snapshot.language() != self.key.language
             || digest(snapshot.blobs()) != inputs.blobs_hash
             || snapshot.validate_compatibility().is_err()
             || !self.validate_sources(&inputs.sources, resolve)
         {
-            return None;
+            return false;
         }
         let mut names: FxHashSet<_> = inputs.sources.iter().map(|s| s.path.as_str()).collect();
         // A linked project has one lowered entry and records all of its source
@@ -127,9 +142,9 @@ impl SnapshotCache {
             && (snapshot.module_names().count() != names.len()
                 || !snapshot.module_names().all(|name| names.remove(name)))
         {
-            return None;
+            return false;
         }
-        Some(snapshot)
+        true
     }
 
     /// Publish a complete snapshot with its checked inputs using an atomic rename.
@@ -169,6 +184,27 @@ impl SnapshotCache {
         self.persist(&snapshot.bytes)
     }
 
+    /// Publish only while the preparation remains live. Cancellation is checked
+    /// between writes and immediately before the atomic rename.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn publish_unless_cancelled(
+        &self,
+        snapshot: &Snapshot,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool, SnapshotError> {
+        if snapshot
+            .cache
+            .as_ref()
+            .is_none_or(|inputs| inputs.key != self.key)
+        {
+            return Err(SnapshotError::Encode(
+                "snapshot belongs to another cache".into(),
+            ));
+        }
+        self.persist_cancellable(&snapshot.bytes, Some(cancelled))
+            .map(|path| path.is_some())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn encode(
         &self,
@@ -190,14 +226,38 @@ impl SnapshotCache {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn persist(&self, bytes: &[u8]) -> Result<PathBuf, SnapshotError> {
+        Ok(self
+            .persist_cancellable(bytes, None)?
+            .expect("uncancelled publication"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_cancellable(
+        &self,
+        bytes: &[u8],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<PathBuf>, SnapshotError> {
+        let stopped =
+            || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        if stopped() {
+            return Ok(None);
+        }
         let directory = self.path.parent().unwrap();
         let io = |error: std::io::Error| SnapshotError::Encode(error.to_string());
         std::fs::create_dir_all(directory).map_err(io)?;
         let mut file = tempfile::NamedTempFile::new_in(directory).map_err(io)?;
-        file.write_all(bytes).map_err(io)?;
+        for chunk in bytes.chunks(64 * 1024) {
+            if stopped() {
+                return Ok(None);
+            }
+            file.write_all(chunk).map_err(io)?;
+        }
         file.flush().map_err(io)?;
+        if stopped() {
+            return Ok(None);
+        }
         file.persist(&self.path).map_err(|error| io(error.error))?;
-        Ok(self.path.clone())
+        Ok(Some(self.path.clone()))
     }
 
     fn validate_sources(
@@ -351,6 +411,33 @@ mod tests {
                 .unwrap();
             assert!(cache.load(|_, _| None).is_none());
         }
+    }
+
+    #[test]
+    fn cancelled_publication_preserves_the_existing_artifact() {
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let (entry, cache) = setup(directory.path());
+        let prepared = cache
+            .prepare(
+                builder(&entry),
+                vec![SnapshotSource::new(&entry, b"source", vec![])],
+            )
+            .unwrap();
+        cache.publish(&prepared).unwrap();
+        let original = std::fs::read(cache.path()).unwrap();
+        assert!(
+            !cache
+                .publish_unless_cancelled(&prepared, &AtomicBool::new(true))
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(cache.path()).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(cache.path().parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]

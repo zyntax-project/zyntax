@@ -11,7 +11,10 @@ use zyntax_typed_ast::{InternedString, TypedDeclaration, TypedProgram};
 use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, lower};
 
 mod snapshot;
-pub use snapshot::{CacheStatus, load_project_cached, load_project_for_runtime};
+pub use snapshot::{
+    CacheStatus, load_project_cached, load_project_for_runtime, load_project_for_runtime_background,
+};
+pub use zyntax_embed::SnapshotPreparation as CachePreparation;
 
 /// A filesystem failure or a diagnostic in the source file that caused it.
 #[derive(Debug, thiserror::Error)]

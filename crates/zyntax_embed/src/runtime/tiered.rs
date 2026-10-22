@@ -1363,6 +1363,17 @@ impl TieredRuntime {
             .collect()
     }
 
+    /// The configured roots of a closed runtime; `None` allows arbitrary host calls.
+    /// Initializers are implicit roots and need not appear in this list.
+    pub fn closed_entry_points(&self) -> Option<Vec<String>> {
+        self.closed.then(|| {
+            let mut entries = self.entry_names();
+            entries.sort_unstable();
+            entries.dedup();
+            entries
+        })
+    }
+
     /// Declare the functions programs are entered through, for a
     /// frontend that compiles typed programs without a grammar. Lowering
     /// and codegen then build only what a program's own declarations
@@ -1896,8 +1907,31 @@ impl TieredRuntime {
     pub fn prepare_typed_program_snapshot(
         &self,
         name: &str,
-        mut program: zyntax_typed_ast::TypedProgram,
+        program: zyntax_typed_ast::TypedProgram,
     ) -> RuntimeResult<(zyntax_typed_ast::TypedProgram, HirModule)> {
+        let (program, mut module) = self.lower_typed_program_snapshot(program, None)?;
+        let flag = self
+            .error_flag_global
+            .and_then(|name| name.resolve_global());
+        crate::snapshot::optimize_for_snapshot(
+            name,
+            &mut module,
+            self.automatic_release,
+            flag.as_deref(),
+        )
+        .map_err(|error| RuntimeError::Execution(error.to_string()))?;
+        Ok((program, module))
+    }
+
+    /// Lower once into owned, body-free metadata and HIR, before optimization.
+    /// The result contains no borrowed runtime state and may be prepared on a worker.
+    /// `None` retains an open library; `Some` lowers only the given roots and initializers.
+    pub fn lower_typed_program_snapshot(
+        &self,
+        mut program: zyntax_typed_ast::TypedProgram,
+        entries: Option<Vec<String>>,
+    ) -> RuntimeResult<(zyntax_typed_ast::TypedProgram, HirModule)> {
+        let closed = entries.is_some();
         let lowered = crate::lower::lower_typed_program_in_place(
             &mut program,
             crate::lower::Inputs {
@@ -1909,8 +1943,8 @@ impl TieredRuntime {
                 snapshot_modules: &self.snapshot_modules,
                 builtins: self.builtin_aliases.clone(),
                 builtin_registry: self.snapshot_builtin_registry(),
-                entry_names: Vec::new(),
-                closed: false,
+                closed,
+                entry_names: entries.unwrap_or_default(),
                 prelowered: Vec::new(),
                 defer_prelowered_bodies: false,
                 keep_generic_templates: true,
@@ -1926,19 +1960,35 @@ impl TieredRuntime {
             .retain(|decl| !matches!(decl.node, zyntax_typed_ast::TypedDeclaration::Import(_)));
         crate::snapshot::strip_bodies(&mut program);
         let mut module = lowered.module;
+        if closed {
+            let names: rustc_hash::FxHashSet<_> =
+                module.functions.values().map(|f| f.name).collect();
+            program.declarations.retain(|decl| match &decl.node {
+                zyntax_typed_ast::TypedDeclaration::Function(f) => names.contains(&f.name),
+                _ => true,
+            });
+        }
         apply_krio_async_lowering(&mut module)?;
         apply_krio_effect_lowering(&mut module)?;
         apply_krio_fiber_lowering(&mut module);
-        let flag = self
+        module.automatic_release = self.automatic_release;
+        // Release summaries let readers keep raw callees encoded too.
+        let templates: Vec<_> = module
+            .functions
+            .extract_if(.., |_, f| {
+                !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
+            })
+            .collect();
+        zyntax_compiler::alloca_promote::run_module(&mut module);
+        let facts = zyntax_compiler::drop_insert::facts_of(&module);
+        zyntax_compiler::drop_insert::record_facts(&mut module, &facts);
+        if let Some(flag) = self
             .error_flag_global
-            .and_then(|name| name.resolve_global());
-        crate::snapshot::optimize_for_snapshot(
-            name,
-            &mut module,
-            self.automatic_release,
-            flag.as_deref(),
-        )
-        .map_err(|error| RuntimeError::Execution(error.to_string()))?;
+            .and_then(|name| name.resolve_global())
+        {
+            zyntax_compiler::error_flag::record_keeps(&mut module, &flag);
+        }
+        module.functions.extend(templates);
         Ok((program, module))
     }
 

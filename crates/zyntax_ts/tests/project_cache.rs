@@ -356,45 +356,294 @@ fn checked_cache_upgrades_to_one_lowered_project_and_validates_all_sources() {
 fn an_unwritable_lowered_cache_still_returns_executable_hir() {
     let _runtime = RUNTIME.lock().unwrap();
     use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
+    for background in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write(
+            root,
+            "entry.ts",
+            "export function answer():number{return 42;}",
+        );
+        write(root, "not-a-directory", "file");
+        let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+        let (project, status) = if background {
+            let (project, status, worker) = zyntax_ts::load_project_for_runtime_background(
+                root.join("entry.ts"),
+                Options::default(),
+                root.join("not-a-directory/cache"),
+                &mut runtime,
+            )
+            .unwrap();
+            assert!(worker.is_none());
+            (project, status)
+        } else {
+            zyntax_ts::load_project_for_runtime(
+                root.join("entry.ts"),
+                Options::default(),
+                root.join("not-a-directory/cache"),
+                &mut runtime,
+            )
+            .unwrap()
+        };
+        assert_eq!(status, CacheStatus::Unavailable);
+        let answer = zyntax_ts::ModuleId::new(
+            root.join("entry.ts")
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .function_name("answer")
+        .resolve_global()
+        .unwrap();
+        let (program, resolver) = project.into_parts();
+        runtime.add_compiled_import_resolver(resolver);
+        runtime.declare_entry_points([answer.as_str()]);
+        runtime.enter_only_through_entry_points();
+        runtime.compile_typed_program(program).unwrap();
+        assert_eq!(runtime.statistics().baseline_functions, 0);
+        assert_eq!(
+            runtime.call_raw(&answer, &[]).unwrap(),
+            ZyntaxValue::Float(42.0)
+        );
+        runtime.stop();
+    }
+}
 
+#[test]
+fn background_preparation_uses_owned_hir_and_keeps_interpreter_first_execution() {
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_compiler::tiered_backend::OptimizationTier;
+    use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(root, "lib.ts", "export function keep<T>(x:T):T{return x;}");
+    write(
+        root,
+        "entry.ts",
+        "import {keep} from './lib'; export function score(n:number):number{const xs=[n,n+2];const ys=keep(xs);ys[1]+=3;return xs[0]+ys[1];}",
+    );
+    let config = TieredConfig {
+        #[cfg(feature = "llvm-backend")]
+        tier2_backend: zyntax_compiler::tiered_backend::Tier2Backend::LLVM,
+        ..Default::default()
+    };
+    let mut runtime = TieredRuntime::new(config).unwrap();
+    let (project, status, worker) = zyntax_ts::load_project_for_runtime_background(
+        root.join("entry.ts"),
+        Options::default(),
+        root.join("cache"),
+        &mut runtime,
+    )
+    .unwrap();
+    assert_eq!(status, CacheStatus::Stored);
+    let worker = worker.expect("the bounded worker is available");
+    let entry = root.join("entry.ts").canonicalize().unwrap();
+    let score = zyntax_ts::ModuleId::new(entry.to_str().unwrap())
+        .function_name("score")
+        .resolve_global()
+        .unwrap();
+    let (program, resolver) = project.into_parts();
+    runtime.add_compiled_import_resolver(resolver);
+    runtime.declare_entry_points([score.as_str()]);
+    runtime.enter_only_through_entry_points();
+    runtime.compile_typed_program(program).unwrap();
+    assert_eq!(runtime.statistics().baseline_functions, 0);
+    assert_eq!(runtime.statistics().optimized_functions, 0);
+    let check = |runtime: &mut TieredRuntime| {
+        for n in [-4.0, 0.0, 3.25] {
+            assert_eq!(
+                runtime.call_raw(&score, &[ZyntaxValue::Float(n)]).unwrap(),
+                ZyntaxValue::Float(n * 2.0 + 5.0)
+            );
+        }
+    };
+    check(&mut runtime);
+    runtime
+        .optimize_function(&score, OptimizationTier::Baseline)
+        .unwrap();
+    check(&mut runtime);
+    #[cfg(feature = "llvm-backend")]
+    {
+        runtime
+            .optimize_function(&score, OptimizationTier::Optimized)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while runtime.statistics().optimized_functions == 0 {
+            assert!(std::time::Instant::now() < deadline, "LLVM did not install");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        check(&mut runtime);
+    }
+    runtime.stop();
+    drop(runtime);
+    assert!(worker.finish().unwrap());
+    let snapshot =
+        zyntax_embed::Snapshot::load_owned(std::fs::read(cached_file(root)).unwrap()).unwrap();
+    let import = snapshot.module(entry.to_str().unwrap()).unwrap().unwrap();
+    assert!(
+        import
+            .hir()
+            .unwrap()
+            .by_name(&score)
+            .unwrap()
+            .attributes
+            .optimized
+    );
+    let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+    let (_, status, worker) = zyntax_ts::load_project_for_runtime_background(
+        &entry,
+        Options::default(),
+        root.join("cache"),
+        &mut runtime,
+    )
+    .unwrap();
+    assert_eq!(status, CacheStatus::Hit);
+    assert!(worker.is_none());
+    runtime.stop();
+}
+
+#[test]
+fn cancelled_snapshot_optimization_leaves_input_untouched() {
+    let _runtime = RUNTIME.lock().unwrap();
+    let mut runtime = zyntax_embed::TieredRuntime::new(Default::default()).unwrap();
+    zyntax_ts::register_runtime(&mut runtime).unwrap();
+    let program = zyntax_ts::parse_program(
+        "export function f(n:number):number{const xs=[n,n+2];return xs[1];}",
+        "cancel.ts",
+        Default::default(),
+    )
+    .unwrap();
+    let (_, mut hir) = runtime.lower_typed_program_snapshot(program, None).unwrap();
+    assert!(
+        hir.functions
+            .values()
+            .filter(|f| !f.is_external && f.signature.type_params.is_empty())
+            .all(|f| f.attributes.release_facts.is_some() && !f.attributes.optimized)
+    );
+    let format = zyntax_compiler::bytecode::Format::Split;
+    let before = zyntax_compiler::bytecode::serialize_module(&hir, format).unwrap();
+    let stopped = std::sync::atomic::AtomicBool::new(true);
+    assert!(
+        !zyntax_embed::optimize_snapshot_hir("cancel", &mut hir, true, None, Some(&stopped))
+            .unwrap()
+    );
+    assert_eq!(
+        zyntax_compiler::bytecode::serialize_module(&hir, format).unwrap(),
+        before
+    );
+    runtime.stop();
+}
+
+#[test]
+fn closed_cache_keys_preserve_host_roots_and_do_not_replace_open_projects() {
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_embed::{TieredConfig, TieredRuntime, ZyntaxValue};
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     write(
         root,
         "entry.ts",
-        "export function answer():number{return 42;}",
+        "export function first():number{return 41;} export function second():number{return 99;}",
     );
-    write(root, "not-a-directory", "file");
+    assert_eq!(load(root).unwrap().1, CacheStatus::Stored);
+    let entry = root.join("entry.ts").canonicalize().unwrap();
+    let id = zyntax_ts::ModuleId::new(entry.to_str().unwrap());
+    for (selected, omitted, answer) in [("first", "second", 41.0), ("second", "first", 99.0)] {
+        let name = id.function_name(selected).resolve_global().unwrap();
+        let missing = id.function_name(omitted).resolve_global().unwrap();
+        let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+        runtime.declare_entry_points([name.as_str()]);
+        runtime.enter_only_through_entry_points();
+        let (project, status, worker) = zyntax_ts::load_project_for_runtime_background(
+            &entry,
+            Options::default(),
+            root.join("cache"),
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            CacheStatus::Stored,
+            "each root set gets a separate HIR artifact"
+        );
+        assert!(project.entry().declarations.iter().all(|decl| !matches!(
+            &decl.node, zyntax_typed_ast::TypedDeclaration::Function(f) if f.name.resolve_global().as_deref() == Some(missing.as_str())
+        )), "closed metadata omits unreached declarations as well as their HIR");
+        let (program, resolver) = project.into_parts();
+        runtime.add_compiled_import_resolver(resolver);
+        runtime.compile_typed_program(program).unwrap();
+        assert_eq!(runtime.statistics().baseline_functions, 0);
+        assert_eq!(
+            runtime.call_raw(&name, &[]).unwrap(),
+            ZyntaxValue::Float(answer)
+        );
+        assert!(runtime.call_raw(&missing, &[]).is_err());
+        runtime.stop();
+        assert!(
+            worker.is_none(),
+            "small closed preparations complete inline"
+        );
+    }
     let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
     let (project, status) = zyntax_ts::load_project_for_runtime(
-        root.join("entry.ts"),
+        &entry,
         Options::default(),
-        root.join("not-a-directory/cache"),
+        root.join("cache"),
         &mut runtime,
     )
     .unwrap();
-    assert_eq!(status, CacheStatus::Unavailable);
-    let answer = zyntax_ts::ModuleId::new(
-        root.join("entry.ts")
-            .canonicalize()
-            .unwrap()
-            .to_str()
-            .unwrap(),
-    )
-    .function_name("answer")
-    .resolve_global()
-    .unwrap();
+    assert_eq!(
+        status,
+        CacheStatus::Stored,
+        "the open AST entry remains available for a full-library upgrade"
+    );
     let (program, resolver) = project.into_parts();
     runtime.add_compiled_import_resolver(resolver);
-    runtime.declare_entry_points([answer.as_str()]);
-    runtime.enter_only_through_entry_points();
     runtime.compile_typed_program(program).unwrap();
-    assert_eq!(runtime.statistics().baseline_functions, 0);
-    assert_eq!(
-        runtime.call_raw(&answer, &[]).unwrap(),
-        ZyntaxValue::Float(42.0)
-    );
+    for (name, value) in [("first", 41.0), ("second", 99.0)] {
+        assert_eq!(
+            runtime
+                .call_raw(&id.function_name(name).resolve_global().unwrap(), &[])
+                .unwrap(),
+            ZyntaxValue::Float(value)
+        );
+    }
     runtime.stop();
+    assert_eq!(std::fs::read_dir(root.join("cache")).unwrap().count(), 3);
+}
+
+#[test]
+fn large_closed_graphs_prepare_on_a_worker_and_survive_runtime_drop() {
+    let _runtime = RUNTIME.lock().unwrap();
+    use zyntax_embed::{TieredConfig, TieredRuntime};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut source = String::new();
+    for i in 0..129 {
+        source.push_str(&format!(
+            "function f{i}(x:number):number{{return f{}(x)+1;}}\n",
+            i + 1
+        ));
+    }
+    source.push_str("function f129(x:number):number{return x;} console.log(f0(0));");
+    write(root, "entry.ts", &source);
+    let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
+    runtime.enter_only_through_entry_points();
+    let (project, status, worker) = zyntax_ts::load_project_for_runtime_background(
+        root.join("entry.ts"),
+        Options::default(),
+        root.join("cache"),
+        &mut runtime,
+    )
+    .unwrap();
+    assert_eq!(status, CacheStatus::Stored);
+    let worker = worker.expect("the large reached graph uses the worker");
+    // The worker keeps no interpreter, backend or plugin lifetime from this runtime.
+    runtime.stop();
+    drop(runtime);
+    assert!(worker.finish().unwrap());
+    assert_eq!(project.module_count(), 1);
 }
 
 #[test]
@@ -419,7 +668,7 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
     if cfg!(feature = "llvm-backend") {
         profiles.push(vec!["--llvm", "--baseline-threshold", "1"]);
     }
-    for profile in profiles {
+    for (profile_index, profile) in profiles.into_iter().enumerate() {
         for _ in 0..2 {
             let output = Command::new(env!("CARGO_BIN_EXE_zynode"))
                 .arg("run")
@@ -439,7 +688,14 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
                 "library\n4\ntext\nentry\n"
             );
         }
-        assert_eq!(load(root).unwrap().1, CacheStatus::Hit);
+        assert_eq!(
+            load(root).unwrap().1,
+            if profile_index == 0 {
+                CacheStatus::Stored
+            } else {
+                CacheStatus::Hit
+            }
+        );
     }
     write(
         root,

@@ -68,7 +68,10 @@ fn run() -> ExitCode {
     }
     let mut runtime = if command == "run" {
         match TieredRuntime::new(config) {
-            Ok(runtime) => Some(runtime),
+            Ok(mut runtime) => {
+                runtime.enter_only_through_entry_points();
+                Some(runtime)
+            }
             Err(error) => {
                 eprintln!("zynode: {error}");
                 return ExitCode::from(4);
@@ -78,11 +81,15 @@ fn run() -> ExitCode {
         None
     };
     let using_cache = cache_dir.is_some();
+    let mut preparation = None;
     let loaded = match cache_dir {
         Some(directory) => {
             if let Some(runtime) = runtime.as_mut() {
-                zyntax_ts::load_project_for_runtime(&file, options, directory, runtime)
-                    .map(|(project, _)| project)
+                zyntax_ts::load_project_for_runtime_background(&file, options, directory, runtime)
+                    .map(|(project, _, worker)| {
+                        preparation = worker;
+                        project
+                    })
             } else {
                 zyntax_ts::load_project_cached(&file, options, directory)
                     .map(|(project, _)| project)
@@ -150,6 +157,7 @@ fn run() -> ExitCode {
             ExitCode::from(4)
         }
     };
+    drop(preparation);
     runtime.stop();
     // Compiling workers can still hold code; process exit owns their storage.
     std::mem::forget(runtime);

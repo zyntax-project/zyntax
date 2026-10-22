@@ -141,8 +141,11 @@ pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 pub use snapshot::{
     SNAPSHOT_EXTENSION, Snapshot, SnapshotBuilder, SnapshotCache, SnapshotDependency,
     SnapshotError, SnapshotSource, lower_for_snapshot, lower_for_snapshot_releasing,
-    snapshot_file_name,
+    optimize_snapshot_hir, snapshot_file_name,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use snapshot::SnapshotPreparation;
 
 pub use zyntax_compiler::track_snapshot_build_inputs;
 // Re-export the BC interpreter so embedders that want a bare

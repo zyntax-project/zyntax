@@ -69,13 +69,15 @@ flowchart TD
     Validate -->|No| Check[Parse and check source graph]
     Check --> Mode{Command}
     Mode -->|check| AST[Publish checked AST]
-    Mode -->|run| Prepare[Lower and optimize linked HIR]
+    Mode -->|run| Prepare[Lower HIR for the execution policy]
     Validate -->|Checked AST hit| CachedMode{Command}
     CachedMode -->|check| Done[Return checked project]
     CachedMode -->|run| Prepare
     Validate -->|HIR hit| Restore[Restore metadata and lazy HIR]
-    Prepare --> Publish[Publish split HIR atomically]
-    Publish --> Restore
+    Prepare --> Fallback[Publish executable HIR fallback]
+    Fallback --> Restore
+    Fallback -.-> Worker[Optimize owned HIR on a bounded worker]
+    Worker --> Publish[Upgrade cached HIR atomically]
     Restore --> Command{Command}
     Command -->|check| Done
     Command -->|run| Runtime[Shared linker and interpreter-first execution]
@@ -85,8 +87,16 @@ flowchart TD
 - `load_project_cached` creates checked-only entries without native lowering. It
   can also read HIR entries. `load_project_for_runtime` installs TS primitives
   and prepares execution entries under the runtime's native policy.
-- A first run upgrades a checked entry. Cold HIR preparation currently lowers
-  and optimizes the complete linked project synchronously, before execution.
+- The CLI lowers only initializer-reachable code and starts interpretation from
+  cached HIR. Small closed graphs finish preparation inline. For larger graphs,
+  a shared `SnapshotPreparation` worker optimizes owned HIR and upgrades the
+  executable fallback; exit cancels it without waiting. A short run can leave
+  an unoptimized but reusable HIR entry with precomputed release summaries.
+- Closed execution caches include their sorted host entry points in the key.
+  They can reuse an open checked entry, but never replace it. Open host snapshots
+  retain callable exports and generic templates; `load_project_for_runtime`
+  remains the synchronous preparation API. Hosts use
+  `load_project_for_runtime_background` for optional worker preparation.
 - HIR entries retain checker metadata, exported generic templates and release
   facts. Unused split bodies stay encoded until reached. An owned single-module
   image moves into the lazy reader without a second allocation for all bodies.

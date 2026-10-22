@@ -8,8 +8,8 @@ mod runtime;
 pub use lower::{parse_module, parse_module_with_dependencies, parse_program};
 pub use modules::{ModuleDependency, ModuleId};
 pub use project::{
-    CacheStatus, ProjectError, SourceProject, load_project, load_project_cached,
-    load_project_for_runtime,
+    CachePreparation, CacheStatus, ProjectError, SourceProject, load_project, load_project_cached,
+    load_project_for_runtime, load_project_for_runtime_background,
 };
 pub use runtime::register_runtime;
 

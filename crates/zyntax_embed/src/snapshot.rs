@@ -23,8 +23,12 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 mod cache;
+#[cfg(not(target_arch = "wasm32"))]
+mod preparation;
 use cache::CachedInputs;
 pub use cache::{SnapshotCache, SnapshotDependency, SnapshotSource};
+#[cfg(not(target_arch = "wasm32"))]
+pub use preparation::SnapshotPreparation;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
 const SCHEMA_VERSION: u32 = 13;
@@ -865,12 +869,34 @@ pub(crate) fn optimize_for_snapshot(
     automatic_release: bool,
     error_flag_global: Option<&str>,
 ) -> Result<(), SnapshotError> {
+    optimize_snapshot_hir(name, module, automatic_release, error_flag_global, None).map(|_| ())
+}
+
+/// Optimize an owned HIR candidate. Cancellation leaves it unpublished and discardable.
+pub fn optimize_snapshot_hir(
+    name: &str,
+    module: &mut HirModule,
+    automatic_release: bool,
+    error_flag_global: Option<&str>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<bool, SnapshotError> {
+    let stopped = || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    if stopped() {
+        return Ok(false);
+    }
     if !module.effects.is_empty() || !module.handlers.is_empty() {
         return Err(SnapshotError::Effectful {
             module: name.to_string(),
         });
     }
     module.automatic_release = automatic_release;
+    for function in module
+        .functions
+        .values_mut()
+        .filter(|f| !f.attributes.optimized)
+    {
+        function.attributes.release_facts = None;
+    }
     // Opaque template bodies become executable only after type substitution.
     let templates: Vec<_> = module
         .functions
@@ -878,8 +904,17 @@ pub(crate) fn optimize_for_snapshot(
             !f.signature.type_params.is_empty() || !f.signature.const_params.is_empty()
         })
         .collect();
-    let _ = zyntax_compiler::run_interp_safe_opts_keeping_readers(module);
+    if let Some(flag) = cancelled {
+        if !zyntax_compiler::run_snapshot_opts_cancellable(module, flag) {
+            return Ok(false);
+        }
+    } else {
+        zyntax_compiler::run_interp_safe_opts_keeping_readers(module);
+    }
     zyntax_compiler::run_native_only_opts(module);
+    if stopped() {
+        return Ok(false);
+    }
     // The bodies as every program adopts them, then the facts of those
     // bodies: a program that links the module reads them rather than
     // computing them over the library again.
@@ -891,7 +926,7 @@ pub(crate) fn optimize_for_snapshot(
     }
     zyntax_compiler::mark_optimized(module);
     module.functions.extend(templates);
-    Ok(())
+    Ok(!stopped())
 }
 
 /// Drop every function body from a program whose HIR travels beside it.
@@ -974,12 +1009,23 @@ impl SnapshotBuilder {
     }
 
     fn push(
-        self,
+        mut self,
         name: impl Into<String>,
         program: zyntax_typed_ast::TypedProgram,
         source: Option<String>,
     ) -> Result<Self, SnapshotError> {
-        self.push_with(name, program, source, None)
+        let name = name.into();
+        let artifact = CompiledImport::encode_program(&self.language, &name, &program)?;
+        self.modules.push(PendingModule {
+            name,
+            max_type_id: program.type_registry.max_type_id(),
+            artifact,
+            interface: None,
+            source,
+            lowered: None,
+            signatures: None,
+        });
+        Ok(self)
     }
 
     /// Add a module together with its lowered form, from
@@ -993,7 +1039,32 @@ impl SnapshotBuilder {
         hir: &HirModule,
     ) -> Result<Self, SnapshotError> {
         strip_bodies(&mut program);
-        let signatures = signature_table(&program)?;
+        self.module_lowered_ref(name, &program, hir)
+    }
+
+    /// Encode lowered HIR while retaining its body-free declarations for another owner.
+    pub fn module_lowered_ref(
+        mut self,
+        name: impl Into<String>,
+        program: &zyntax_typed_ast::TypedProgram,
+        hir: &HirModule,
+    ) -> Result<Self, SnapshotError> {
+        use zyntax_typed_ast::TypedDeclaration;
+        let name = name.into();
+        if !hir.effects.is_empty() || !hir.handlers.is_empty() {
+            return Err(SnapshotError::Effectful { module: name });
+        }
+        if program.declarations.iter().any(|decl| match &decl.node {
+            TypedDeclaration::Function(f) => f.body.is_some(),
+            TypedDeclaration::Initializer(_) => true,
+            TypedDeclaration::Impl(imp) => imp.methods.iter().any(|f| f.body.is_some()),
+            _ => false,
+        }) {
+            return Err(SnapshotError::Encode(
+                "lowered metadata still contains typed bodies".into(),
+            ));
+        }
+        let signatures = signature_table(program)?;
         // Bodies encoded one by one, so a program decodes the ones it
         // reaches and no others.
         let encoded = zyntax_compiler::bytecode::serialize_module(
@@ -1003,45 +1074,31 @@ impl SnapshotBuilder {
         .map_err(|e| SnapshotError::Encode(e.to_string()))?;
         let pointer_size = u8::try_from(zyntax_compiler::target_pointer_size())
             .map_err(|e| SnapshotError::Encode(e.to_string()))?;
-        let mut builder = self.push_with(
-            name,
-            program,
-            None,
-            Some((encoded, zyntax_compiler::BUILD_ID.to_string(), pointer_size)),
-        )?;
-        if let Some(module) = builder.modules.last_mut() {
-            module.signatures = Some(signatures);
-        }
-        Ok(builder)
-    }
-
-    fn push_with(
-        mut self,
-        name: impl Into<String>,
-        program: zyntax_typed_ast::TypedProgram,
-        source: Option<String>,
-        lowered: Option<(Vec<u8>, String, u8)>,
-    ) -> Result<Self, SnapshotError> {
-        let name = name.into();
-        let max_type_id = program.type_registry.max_type_id();
-        let interface = if lowered.is_some() {
-            let mut interface = program.clone();
-            interface.declarations.retain(|decl| {
-                !matches!(decl.node, zyntax_typed_ast::TypedDeclaration::Function(_))
-            });
-            Some(CompiledImport::new(self.language.clone(), name.clone(), interface).encode()?)
-        } else {
-            None
+        let interface = zyntax_typed_ast::TypedProgram {
+            declarations: program
+                .declarations
+                .iter()
+                .filter(|d| !matches!(d.node, TypedDeclaration::Function(_)))
+                .cloned()
+                .collect(),
+            language: program.language,
+            span: program.span,
+            source_files: program.source_files.clone(),
+            checker_interface: program.checker_interface.clone(),
+            type_registry: program.type_registry.clone(),
         };
-        let artifact = CompiledImport::new(self.language.clone(), name.clone(), program);
         self.modules.push(PendingModule {
+            max_type_id: program.type_registry.max_type_id(),
+            artifact: CompiledImport::encode_program(&self.language, &name, program)?,
+            interface: Some(CompiledImport::encode_program(
+                &self.language,
+                &name,
+                &interface,
+            )?),
             name,
-            max_type_id,
-            artifact: artifact.encode()?,
-            interface,
-            source,
-            lowered,
-            signatures: None,
+            source: None,
+            lowered: Some((encoded, zyntax_compiler::BUILD_ID.to_string(), pointer_size)),
+            signatures: Some(signatures),
         });
         Ok(self)
     }
@@ -1141,6 +1198,36 @@ macro_rules! include_snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_lowered_entries_reject_unrelocatable_effects() {
+        use zyntax_compiler::hir::{HirEffect, HirId};
+        use zyntax_typed_ast::{InternedString, TypedProgram};
+        let name = InternedString::new_global("effects");
+        let mut hir = HirModule::new(name);
+        let id = HirId::new();
+        hir.effects.insert(
+            id,
+            HirEffect {
+                id,
+                name,
+                type_params: vec![],
+                operations: vec![],
+            },
+        );
+        assert!(matches!(
+            SnapshotBuilder::new("test").module_lowered("effects", TypedProgram::default(), &hir),
+            Err(SnapshotError::Effectful { .. })
+        ));
+        assert!(matches!(
+            SnapshotBuilder::new("test").module_lowered_ref(
+                "effects",
+                &TypedProgram::default(),
+                &hir
+            ),
+            Err(SnapshotError::Effectful { .. })
+        ));
+    }
     use zyntax_typed_ast::TypedProgram;
 
     fn empty_program() -> TypedProgram {
