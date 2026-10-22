@@ -47,72 +47,74 @@ pub fn initialize_host() {
     LLVM_InitializeNativeDisassembler();
 }
 
+/// Native and All wrappers share one process-wide registration.
+fn initialize() {
+    static INITIALIZED: std::sync::Once = std::sync::Once::new();
+    INITIALIZED.call_once(|| {
+        // SAFETY: registration finishes once before any caller proceeds.
+        unsafe {
+            host::info();
+            host::target();
+            host::mc();
+            host::asm_parser();
+            host::asm_printer();
+            host::disassembler();
+        }
+    });
+}
+
 /// `LLVMInitializeNativeTarget`: the host's target info, target and
 /// machine-code layer. Returns 0, LLVM's success.
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeNativeTarget() -> LLVMBool {
-    // SAFETY: LLVM's target registration, safe to repeat.
-    unsafe {
-        host::info();
-        host::target();
-        host::mc();
-    }
+    initialize();
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeNativeAsmParser() -> LLVMBool {
-    // SAFETY: as above.
-    unsafe { host::asm_parser() };
+    initialize();
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeNativeAsmPrinter() -> LLVMBool {
-    // SAFETY: as above.
-    unsafe { host::asm_printer() };
+    initialize();
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeNativeDisassembler() -> LLVMBool {
-    // SAFETY: as above.
-    unsafe { host::disassembler() };
+    initialize();
     0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllTargetInfos() {
-    // SAFETY: as above.
-    unsafe { host::info() }
+    initialize();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllTargets() {
-    // SAFETY: as above.
-    unsafe { host::target() }
+    initialize();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllTargetMCs() {
-    // SAFETY: as above.
-    unsafe { host::mc() }
+    initialize();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllAsmPrinters() {
-    // SAFETY: as above.
-    unsafe { host::asm_printer() }
+    initialize();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllAsmParsers() {
-    // SAFETY: as above.
-    unsafe { host::asm_parser() }
+    initialize();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn LLVM_InitializeAllDisassemblers() {
-    // SAFETY: as above.
-    unsafe { host::disassembler() }
+    initialize();
 }
