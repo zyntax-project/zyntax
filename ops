@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1792699789,"nonce":"5JCH7IZsC+fgXj4Hvj5fVV3FbVk=","added":["bug","area:compiler"],"removed":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792699789,"nonce":"8duuDuf248Edqpr2OIoDmrsRO2I=","message":"Fixed in c56a8bd6. zyntax_compiler lib tests (425) and the zyntax_ts suite pass; LLVM backend not examined.","files":null}]}
