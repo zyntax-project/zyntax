@@ -1884,5 +1884,10 @@
     "id": "numeric/remainder_invariant",
     "file": "cases/numeric/remainder_invariant.ts",
     "mode": "run"
+  },
+  {
+    "id": "loops/counters",
+    "file": "cases/loops/counters.ts",
+    "mode": "run"
   }
 ]

@@ -379,6 +379,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             } else {
                 self.expr(index)?
             }
+        } else if let Some(offset) = self.integer_offset(index, at) {
+            offset
         } else {
             self.expr(index)?
         };
@@ -562,6 +564,43 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             at,
         ))
     }
+    /// `counter + c` or `counter - c` for a native integer counter and a small whole constant,
+    /// kept in integers so its guard stays an integer compare.
+    fn integer_offset(&self, index: &js::Expression<'ast>, at: oxc_span::Span) -> Option<Expr> {
+        let js::Expression::BinaryExpression(b) = index else {
+            return None;
+        };
+        let operation = match b.operator.as_str() {
+            "+" => BinaryOp::Add,
+            "-" => BinaryOp::Sub,
+            _ => return None,
+        };
+        let (js::Expression::Identifier(id), js::Expression::NumericLiteral(n)) =
+            (&b.left, &b.right)
+        else {
+            return None;
+        };
+        if n.value.fract() != 0.0 || !(0.0..=2_147_483_648.0).contains(&n.value) {
+            return None;
+        }
+        let binding = self.binding(id.name.as_str(), id.span).ok()?;
+        let integer = Type::Primitive(PrimitiveType::I64);
+        if binding.ty != integer {
+            return None;
+        }
+        let constant = node(
+            TypedExpression::Literal(TypedLiteral::Integer(n.value as i128)),
+            integer.clone(),
+            at,
+        );
+        Some(binary(
+            operation,
+            var(binding.name, integer.clone(), at),
+            constant,
+            integer,
+            at,
+        ))
+    }
     pub(super) fn array_length(&self, value: Expr, at: oxc_span::Span) -> Expr {
         let count = node(
             TypedExpression::MethodCall(TypedMethodCall::positional(
@@ -715,14 +754,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let Some(js::Expression::BinaryExpression(test)) = &f.test else {
             return Ok(None);
         };
-        let (index, source) = match test.operator.as_str() {
-            "<" => (&test.left, Self::length_source(&test.right)),
-            ">" => (&test.right, Self::length_source(&test.left)),
+        let operator = test.operator.as_str();
+        // A length bound keeps the compare in integers; any other bound is a number the
+        // counter is converted to for the compare.
+        let (index, bound, source) = match operator {
+            "<" => (&test.left, &test.right, Self::length_source(&test.right)),
+            "<=" => (&test.left, &test.right, None),
+            ">" => (&test.right, &test.left, Self::length_source(&test.left)),
             _ => return Ok(None),
         };
-        let (js::Expression::Identifier(id), Some(source)) = (index, source) else {
+        let js::Expression::Identifier(id) = index else {
             return Ok(None);
         };
+        if source.is_none() && !matches!(operator, "<" | "<=") {
+            return Ok(None);
+        }
         if self.binding(id.name.as_str(), id.span)?.name != name {
             return Ok(None);
         }
@@ -751,24 +797,43 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 break;
             }
         }
-        let array = self.expr(source)?;
-        self.array_element(&array.ty, at)?;
-        let length = node(
-            TypedExpression::MethodCall(TypedMethodCall::positional(
-                array,
-                self.name("len"),
-                vec![],
-            )),
-            integer.clone(),
-            at,
-        );
-        let condition = binary(
-            BinaryOp::Lt,
-            var(name, integer.clone(), at),
-            length,
-            boolean(),
-            at,
-        );
+        let condition = if let Some(source) = source {
+            let array = self.expr(source)?;
+            self.array_element(&array.ty, at)?;
+            let length = node(
+                TypedExpression::MethodCall(TypedMethodCall::positional(
+                    array,
+                    self.name("len"),
+                    vec![],
+                )),
+                integer.clone(),
+                at,
+            );
+            binary(
+                BinaryOp::Lt,
+                var(name, integer.clone(), at),
+                length,
+                boolean(),
+                at,
+            )
+        } else {
+            let limit = self.expr(bound)?;
+            self.expect(&limit.ty, &number(), at)?;
+            let counter = node(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(var(name, integer.clone(), at)),
+                    target_type: number(),
+                }),
+                number(),
+                at,
+            );
+            let compare = if operator == "<" {
+                BinaryOp::Lt
+            } else {
+                BinaryOp::Le
+            };
+            binary(compare, counter, limit, boolean(), at)
+        };
         let step = match f.update.as_ref().unwrap() {
             js::Expression::UpdateExpression(_) => 1,
             js::Expression::AssignmentExpression(a) => match &a.right {
