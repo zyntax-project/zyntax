@@ -61,6 +61,7 @@ fn build() -> Result<(), BuildError> {
 
     let library = zyntax_builtins::library(&policy::POLICY);
     let program = TypedProgram {
+        checker_interface: None,
         declarations: library.declarations,
         language: Some(InternedString::new_global("python")),
         span: Span::new(0, 0),

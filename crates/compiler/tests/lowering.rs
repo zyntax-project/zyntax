@@ -111,6 +111,7 @@ fn program() -> TypedProgram {
         ),
     ];
     TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: declarations
             .into_iter()

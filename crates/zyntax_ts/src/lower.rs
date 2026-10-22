@@ -1,25 +1,29 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast as js;
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use zyntax_typed_ast::checker_interface::{
+    CheckerField, CheckerFunction as Signature, CheckerInterface, CheckerParameter, CheckerType,
+    CheckerView,
+};
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::{
     CallingConvention, FieldDef, InternedString, Mutability, NullabilityKind, PrimitiveType, Span,
     Type, TypeId, TypeMetadata, TypeRegistry, Visibility,
 };
 
-use crate::{Error, ErrorKind, ModuleId, Options, Soundness};
+use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, Soundness};
 
 mod arrays;
 mod generics;
+mod modules;
 mod unions;
 use arrays::{ArrayResult, FlowState, array_type, element_type};
 
@@ -180,7 +184,9 @@ fn strict_fp(name: InternedString) -> TypedAnnotation {
 struct Field {
     ty: PrimitiveType,
     readonly: bool,
+    span: oxc_span::Span,
 }
+type Fields<'ast> = SmallVec<[(&'ast str, Field); 4]>;
 struct Binding {
     name: InternedString,
     symbol: Option<oxc_semantic::SymbolId>,
@@ -189,15 +195,6 @@ struct Binding {
     mutable: bool,
     initialized: bool,
 }
-struct Signature<'ast> {
-    native: InternedString,
-    type_params: Vec<(InternedString, Type)>,
-    params: Vec<(&'ast str, Type, Option<InternedString>)>,
-    ret: Option<Type>,
-    ret_view: Option<InternedString>,
-    array_result: Option<ArrayResult>,
-}
-
 struct ReturnContext {
     expected: Option<(Type, Option<InternedString>)>,
     inferred: Option<(Type, Option<InternedString>)>,
@@ -369,6 +366,20 @@ pub fn parse_module(
     module: ModuleId,
     options: Options,
 ) -> Result<TypedProgram> {
+    parse_module_with_dependencies(source, file, module, options, &[])
+}
+
+/// Check against dependency interfaces without reading or cloning their executable bodies.
+pub fn parse_module_with_dependencies(
+    source: &str,
+    file: &str,
+    module: ModuleId,
+    options: Options,
+    dependencies: &[ModuleDependency<'_>],
+) -> Result<TypedProgram> {
+    for dependency in dependencies {
+        dependency.program.type_registry.reserve_type_ids();
+    }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
     if let Some(error) = parsed.diagnostics.first() {
@@ -380,7 +391,13 @@ pub fn parse_module(
     if let Some(error) = semantic.diagnostics.first() {
         return Err(Error::from_oxc(ErrorKind::Type, error));
     }
-    Lowerer::new(options, module).program(&parsed.program, &semantic.semantic, source, file)
+    Lowerer::new(options, module).program(
+        &parsed.program,
+        &semantic.semantic,
+        source,
+        file,
+        dependencies,
+    )
 }
 
 struct Lowerer<'ast, 'program> {
@@ -391,10 +408,10 @@ struct Lowerer<'ast, 'program> {
     prefix_len: usize,
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
-    views: FxHashMap<InternedString, BTreeMap<&'ast str, Field>>,
+    views: FxHashMap<InternedString, Arc<CheckerView>>,
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
     compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
-    signatures: FxHashMap<InternedString, Rc<Signature<'ast>>>,
+    signatures: FxHashMap<InternedString, Arc<Signature>>,
     active_types: SmallVec<[(InternedString, Type); 2]>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
     lowered: FxHashSet<InternedString>,
@@ -491,6 +508,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         semantic: &oxc_semantic::Semantic<'_>,
         source: &str,
         file: &str,
+        dependencies: &[ModuleDependency<'_>],
     ) -> Result<TypedProgram> {
         WritePositions {
             scoping: semantic.scoping(),
@@ -499,15 +517,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         .visit_program(program);
         self.write_offsets = self.writes.values().flatten().copied().collect();
         self.write_offsets.sort_unstable();
+        self.imports(program, semantic, dependencies)?;
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
             .iter()
+            .filter_map(modules::declaration)
             .filter(|s| {
                 matches!(
                     s,
-                    js::Statement::TSInterfaceDeclaration(_)
-                        | js::Statement::TSTypeAliasDeclaration(_)
+                    js::Declaration::TSInterfaceDeclaration(_)
+                        | js::Declaration::TSTypeAliasDeclaration(_)
                 )
             })
             .collect();
@@ -530,7 +550,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             pending = next;
         }
         for item in &program.body {
-            if let js::Statement::FunctionDeclaration(f) = item {
+            if let Some(f) = modules::function(item) {
                 self.signature(f)?;
             }
         }
@@ -538,7 +558,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let dependencies = self.dependencies(semantic)?;
         let mut visiting = FxHashSet::default();
         for item in &program.body {
-            if let js::Statement::FunctionDeclaration(f) = item {
+            if let Some(f) = modules::function(item) {
                 let mut pending = vec![(self.name(f.id.as_ref().unwrap().name.as_str()), false)];
                 while let Some((name, ready)) = pending.pop() {
                     if self.lowered.contains(&name) {
@@ -564,6 +584,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.reserve(&program.body)?;
         let mut body = vec![];
         for item in &program.body {
+            if matches!(
+                item,
+                js::Statement::ImportDeclaration(_) | js::Statement::ExportNamedDeclaration(_)
+            ) {
+                continue;
+            }
+            if let js::Statement::ExportDeclaration(export) = item {
+                if !matches!(
+                    export.declaration,
+                    js::Declaration::FunctionDeclaration(_)
+                        | js::Declaration::TSInterfaceDeclaration(_)
+                        | js::Declaration::TSTypeAliasDeclaration(_)
+                ) {
+                    return self.unsupported("this exported declaration", export.span);
+                }
+                continue;
+            }
             if !matches!(
                 item,
                 js::Statement::FunctionDeclaration(_)
@@ -588,7 +625,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 program.span,
             ));
         }
+        let checker_interface = self.export_interface(program)?;
         Ok(TypedProgram {
+            checker_interface,
             declarations: self.declarations,
             language: Some(intern("typescript")),
             span: span(program.span),
@@ -673,9 +712,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(dependencies)
     }
 
-    fn type_declaration(&mut self, item: &js::Statement<'ast>) -> Result<()> {
+    fn type_declaration(&mut self, item: &js::Declaration<'ast>) -> Result<()> {
         match item {
-            js::Statement::TSInterfaceDeclaration(i) => {
+            js::Declaration::TSInterfaceDeclaration(i) => {
                 if i.type_parameters.is_some() || !i.extends.is_empty() {
                     return self.unsupported("generic or extending interfaces", i.span);
                 }
@@ -685,10 +724,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 let fields = self.fields(&i.body.body)?;
                 let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
-                self.views.insert(name, fields);
-                self.aliases.insert(name, (ty, Some(name)));
+                let view = self.record_view(i.id.name.as_str(), &ty, fields);
+                self.aliases.insert(name, (ty, Some(view)));
             }
-            js::Statement::TSTypeAliasDeclaration(a) => {
+            js::Declaration::TSTypeAliasDeclaration(a) => {
                 if a.type_parameters.is_some() {
                     return self.unsupported("generic aliases", a.span);
                 }
@@ -699,8 +738,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let (ty, view) = if let js::TSType::TSTypeLiteral(literal) = &a.type_annotation {
                     let fields = self.fields(&literal.members)?;
                     let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
-                    self.views.insert(name, fields);
-                    (ty, Some(name))
+                    let view = self.record_view(a.id.name.as_str(), &ty, fields);
+                    (ty, Some(view))
                 } else {
                     self.ty(&a.type_annotation)?
                 };
@@ -711,8 +750,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
-    fn fields(&mut self, members: &[js::TSSignature<'ast>]) -> Result<BTreeMap<&'ast str, Field>> {
-        let mut fields = BTreeMap::new();
+    fn fields(&mut self, members: &[js::TSSignature<'ast>]) -> Result<Fields<'ast>> {
+        let mut fields = Fields::new();
         for member in members {
             let js::TSSignature::TSPropertySignature(p) = member else {
                 return self.unsupported("interface method or index signatures", member.span());
@@ -728,20 +767,43 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
                 return self.unsupported("reference-valued object fields", p.span);
             };
-            if fields
-                .insert(
-                    name,
-                    Field {
-                        ty,
-                        readonly: p.readonly,
-                    },
-                )
-                .is_some()
-            {
-                return self.error(ErrorKind::Type, "duplicate property", p.span);
-            }
+            fields.push((
+                name,
+                Field {
+                    ty,
+                    readonly: p.readonly,
+                    span: p.span,
+                },
+            ));
+        }
+        fields.sort_by_key(|(name, _)| *name);
+        if let Some(pair) = fields.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return self.error(ErrorKind::Type, "duplicate property", pair[1].1.span);
         }
         Ok(fields)
+    }
+
+    fn record_view(&mut self, name: &str, ty: &Type, fields: Fields<'ast>) -> InternedString {
+        self.name_buffer.truncate(self.prefix_len);
+        self.name_buffer.push_str("view$");
+        crate::modules::append_component(&mut self.name_buffer, name);
+        let name = intern(&self.name_buffer);
+        let fields = fields
+            .into_iter()
+            .map(|(name, field)| CheckerField {
+                name: self.name(name),
+                ty: Type::Primitive(field.ty),
+                readonly: field.readonly,
+            })
+            .collect();
+        self.views.insert(
+            name,
+            Arc::new(CheckerView {
+                ty: ty.clone(),
+                fields,
+            }),
+        );
+        name
     }
 
     fn layout(&mut self, fields: impl Iterator<Item = (&'ast str, PrimitiveType)>) -> Type {
@@ -938,7 +1000,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if !names.insert(self.name(name.name.as_str())) {
                 return self.error(ErrorKind::Type, "duplicate parameter", p.span);
             }
-            params.push((name.name.as_str(), ty, view));
+            params.push(CheckerParameter {
+                name: self.name(name.name.as_str()),
+                ty,
+                view,
+                ownership: ParamOwnership::Borrowed,
+            });
         }
         let (ret, ret_view) = match &f.return_type {
             Some(ret) => {
@@ -955,7 +1022,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let native = intern(&self.name_buffer);
         self.signatures.insert(
             name,
-            Rc::new(Signature {
+            Arc::new(Signature {
                 native,
                 type_params,
                 params,
@@ -985,7 +1052,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let inferred = self.signatures[&name].ret.is_none();
         let recursive = inferred && self.self_recursive.contains(&name);
         if recursive {
-            let sig = Rc::get_mut(self.signatures.get_mut(&name).unwrap()).unwrap();
+            let sig = Arc::get_mut(self.signatures.get_mut(&name).unwrap()).unwrap();
             if !sig.type_params.is_empty() {
                 return self.unsupported("recursive generic return inference", f.span);
             }
@@ -998,12 +1065,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.active_types.extend(sig.type_params.iter().cloned());
         self.scopes.push(FxHashMap::default());
         let mut params = vec![];
-        for ((name, ty, view), parameter) in sig.params.iter().zip(&f.params.items) {
+        for (parameter_type, parameter) in sig.params.iter().zip(&f.params.items) {
+            let CheckerParameter { name, ty, view, .. } = parameter_type;
             let js::BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
                 unreachable!()
             };
-            let unique = self.fresh(name);
-            let source_name = self.name(name);
+            let unique = self.fresh(id.name.as_str());
+            let source_name = *name;
             self.scopes.last_mut().unwrap().insert(
                 source_name,
                 Binding {
@@ -1081,7 +1149,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             })
             .collect();
         drop(sig);
-        let sig = Rc::get_mut(self.signatures.get_mut(&name).unwrap())
+        let sig = Arc::get_mut(self.signatures.get_mut(&name).unwrap())
             .expect("signature handles do not escape body lowering");
         sig.ret = Some(ret.clone());
         sig.ret_view = ret_view;
@@ -1141,8 +1209,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("inferred union return types", at);
         }
         let logical = |view: Option<InternedString>| {
-            view.and_then(|name| self.aliases.get(&name))
-                .map(|(ty, _)| ty)
+            view.and_then(|name| self.views.get(&name))
+                .map(|view| &view.ty)
         };
         if logical(*first_view).unwrap_or(first) != logical(view).unwrap_or(ty) {
             return self.unsupported("inferred returns with different property views", at);
@@ -1150,7 +1218,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let readonly = |view: Option<InternedString>| {
             view.and_then(|name| self.views.get(&name))
                 .into_iter()
-                .flat_map(|fields| fields.iter().filter(|(_, f)| f.readonly).map(|(n, _)| n))
+                .flat_map(|view| view.fields.iter().filter(|f| f.readonly).map(|f| f.name))
         };
         if !readonly(*first_view).eq(readonly(view)) {
             return self.unsupported("inferred returns with different readonly views", at);
@@ -1365,8 +1433,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     // Source views constrain properties; the expression still carries its concrete layout.
     fn source_type<'s>(&'s self, source: &js::Expression<'ast>, physical: &'s Type) -> &'s Type {
         self.view_of(source)
-            .and_then(|view| self.aliases.get(&view))
-            .map_or(physical, |(ty, _)| ty)
+            .and_then(|view| self.views.get(&view))
+            .map_or(physical, |view| &view.ty)
     }
 
     fn fresh_properties(&self, source: &js::Expression<'ast>, expected: &Type) -> Result<()> {
@@ -1955,7 +2023,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         let arg = sig
                             .params
                             .iter()
-                            .position(|(_, ty, _)| Some(ty) == sig.ret.as_ref())?;
+                            .position(|p| Some(&p.ty) == sig.ret.as_ref())?;
                         return c
                             .arguments
                             .get(arg)
@@ -1987,10 +2055,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if self.options.soundness == Soundness::Checked {
             if let Some(from) = from.and_then(|n| self.views.get(&n)) {
                 let to = to.and_then(|n| self.views.get(&n));
-                for (name, field) in from {
+                for field in &from.fields {
+                    let name = field.name.resolve_global().unwrap();
                     if field.readonly
                         && !to
-                            .and_then(|fields| fields.get(name))
+                            .and_then(|view| view.field(field.name))
                             .is_some_and(|f| f.readonly)
                     {
                         return self.error(ErrorKind::Soundness, format!("readonly field `{name}` cannot become a writable alias in checked mode"), at);
@@ -2645,7 +2714,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 Error::new(ErrorKind::Unsupported, "unresolved function result", at)
                             })?;
                             let ty = self.function_type(
-                                sig.params.iter().map(|(_, ty, _)| ty.clone()),
+                                sig.params.iter().map(|p| p.ty.clone()),
                                 ret.clone(),
                                 at,
                             )?;
@@ -3271,23 +3340,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let hints: SmallVec<[Type; 4]> = sig
             .params
             .iter()
-            .map(|(_, ty, view)| {
+            .map(|parameter| {
                 if explicit {
-                    self.instantiate_type(ty, *view, &sig.type_params, &types, at)
-                        .map(|(ty, _)| ty)
+                    self.instantiate_type(
+                        &parameter.ty,
+                        parameter.view,
+                        &sig.type_params,
+                        &types,
+                        at,
+                    )
+                    .map(|(ty, _)| ty)
                 } else {
-                    Ok(ty.clone())
+                    Ok(parameter.ty.clone())
                 }
             })
             .collect::<Result<_>>()?;
         let mut static_strings = SmallVec::new();
         let args = self.arguments(c, hints.iter(), Some(&mut static_strings))?;
         if !explicit {
-            for ((arg, source), (_, expected, _)) in args.iter().zip(&c.arguments).zip(&sig.params)
-            {
+            for ((arg, source), parameter) in args.iter().zip(&c.arguments).zip(&sig.params) {
                 let source = source.as_expression().unwrap();
                 self.infer_arguments(
-                    expected,
+                    &parameter.ty,
                     self.source_type(source, &arg.ty),
                     self.view_of(source),
                     &sig.type_params,
@@ -3300,9 +3374,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .zip(&c.arguments)
             .zip(&sig.params)
             .zip(static_strings)
-            .map(|(((arg, source), (_, expected, view)), static_string)| {
-                let (expected, view) =
-                    self.instantiate_type(expected, *view, &sig.type_params, &types, at)?;
+            .map(|(((arg, source), parameter), static_string)| {
+                let (expected, view) = self.instantiate_type(
+                    &parameter.ty,
+                    parameter.view,
+                    &sig.type_params,
+                    &types,
+                    at,
+                )?;
                 let source = source.as_expression().unwrap();
                 self.expect(self.source_type(source, &arg.ty), &expected, at)?;
                 if matches!(expected, Type::Union(_)) && !static_string {
@@ -3448,7 +3527,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if self
             .view_of(&m.object)
             .and_then(|n| self.views.get(&n))
-            .and_then(|fs| fs.get(m.property.name.as_str()))
+            .and_then(|view| view.field(self.name(m.property.name.as_str())))
             .is_some_and(|f| f.readonly)
         {
             return self.error(
@@ -3506,8 +3585,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             None
         };
         let logical_target = target_view
-            .and_then(|view| self.aliases.get(&view))
-            .map_or(&target.ty, |(ty, _)| ty)
+            .and_then(|view| self.views.get(&view))
+            .map_or(&target.ty, |view| &view.ty)
             .clone();
         let op = a.operator.as_str();
         let read = if op == "=" {

@@ -82,6 +82,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
     };
 
     TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -121,6 +122,7 @@ fn create_bool_test_program(
     };
 
     TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -573,6 +575,7 @@ fn test_matmul_dispatch_uses_named_type_function() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![
             typed_node(
@@ -906,6 +909,7 @@ fn test_implicit_from_conversion_inserted_for_call_arguments() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![
             typed_node(
@@ -1231,6 +1235,7 @@ fn test_implicit_from_conversion_inserted_for_assignment_and_return() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![
             typed_node(

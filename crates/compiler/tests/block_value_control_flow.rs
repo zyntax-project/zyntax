@@ -772,6 +772,7 @@ fn module() -> HirModule {
         declarations.push(function(extra.name, &["a", "b", "e"], (extra.body)()));
     }
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations,
         span: span(),

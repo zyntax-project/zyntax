@@ -77,6 +77,7 @@ fn build() -> Result<(), BuildError> {
     let (lib, _types) = library::library(&policy::POLICY);
     let lib_declarations = lib.declarations.clone();
     let program = TypedProgram {
+        checker_interface: None,
         declarations: lib.declarations,
         language: Some(InternedString::new_global("lua")),
         span: Span::new(0, 0),

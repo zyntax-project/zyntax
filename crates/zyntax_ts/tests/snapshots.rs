@@ -3,8 +3,7 @@
 use std::sync::Arc;
 use zyntax_compiler::hir::*;
 use zyntax_embed::{Snapshot, SnapshotBuilder};
-use zyntax_typed_ast::typed_ast::{TypedDeclaration, TypedImport, TypedImportItem};
-use zyntax_typed_ast::{InternedString, Span, Type, TypedNode, TypedProgram};
+use zyntax_typed_ast::{InternedString, TypedProgram};
 
 // Tiered backends install process-wide lazy-compiler callbacks.
 static TIERED_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -15,15 +14,15 @@ static ALLOCATOR: zyntax_compiler::allocation_audit::CountingAllocator =
     zyntax_compiler::allocation_audit::CountingAllocator;
 
 const LIBRARY: &str = r#"
-    function identity<T>(x:T):T{return x;}
-    function second<T>(xs:T[],fallback:T):T{if(xs.length>1)return xs[1];return fallback;}
-    function through<U>(xs:U[],fallback:U):U{return second<U>(xs,fallback);}
-    function alias<T>(xs:T[]):T[]{return xs;}
-    function recur<T>(x:T,n:number):T{if(n<=0)return identity(x);return recur<T>(x,n-1);}
+    export function identity<T>(x:T):T{return x;}
+    export function second<T>(xs:T[],fallback:T):T{if(xs.length>1)return xs[1];return fallback;}
+    export function through<U>(xs:U[],fallback:U):U{return second<U>(xs,fallback);}
+    export function alias<T>(xs:T[]):T[]{return xs;}
+    export function recur<T>(x:T,n:number):T{if(n<=0)return identity(x);return recur<T>(x,n-1);}
     function bump(n:number):number{return n+1;}
-    function step<T>(x:T,other:T,n:number):T{if(bump(n)>0)return recur<T>(x,2);return other;}
-    function literal<T>(x:T):string{return "from snapshot";}
-    function unused<T>(x:T):T{return x;}
+    export function step<T>(x:T,other:T,n:number):T{if(bump(n)>0)return recur<T>(x,2);return other;}
+    export function literal<T>(x:T):string{return "from snapshot";}
+    export function unused<T>(x:T):T{return x;}
 "#;
 
 fn library_program() -> TypedProgram {
@@ -53,47 +52,14 @@ fn library() -> Arc<Snapshot> {
     )
 }
 
-// Parse against the library's signatures until the native frontend has import syntax.
-// Runtime linking must use the snapshot; none of these source bodies reach it.
-// The combined source uses the library identity so its references match the image.
-fn client(source: &str) -> TypedProgram {
-    let mut program = zyntax_ts::parse_module(
-        &format!("{LIBRARY}\n{source}"),
+fn client(source: &str, dependency: &TypedProgram) -> TypedProgram {
+    zyntax_ts::parse_module_with_dependencies(
+        &format!("import {{identity,second,through,alias,recur,step,literal,unused}} from \"library\";\n{source}"),
         "client.ts",
-        zyntax_ts::ModuleId::new("library.ts"),
+        zyntax_ts::ModuleId::new("client.ts"),
         Default::default(),
-    )
-    .unwrap();
-    let mut items = Vec::new();
-    program.declarations.retain(|d| {
-        if matches!(&d.node, TypedDeclaration::Function(f) if f.name.resolve_global().as_deref()==Some("ts$m$library_2ets$fn$bump")) {
-            return false;
-        }
-        if let TypedDeclaration::Function(f) = &d.node
-            && !f.type_params.is_empty()
-        {
-            items.push(TypedImportItem::Named {
-                name: f.name,
-                alias: None,
-            });
-            return false;
-        }
-        true
-    });
-    program.declarations.insert(
-        0,
-        TypedNode::new(
-            TypedDeclaration::Import(TypedImport {
-                language: None,
-                module_path: vec![InternedString::new_global("library")],
-                items,
-                span: Span::new(0, 0),
-            }),
-            Type::Primitive(zyntax_typed_ast::PrimitiveType::Unit),
-            Span::new(0, 0),
-        ),
-    );
-    program
+        &[zyntax_ts::ModuleDependency { specifier: "library", program: dependency }],
+    ).unwrap()
 }
 
 #[test]
@@ -146,6 +112,7 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
     use zyntax_compiler::tiered_backend::{OptimizationTier, TieredConfig};
     use zyntax_embed::{TieredRuntime, ZyntaxValue};
     let snapshot = library();
+    let interface = snapshot.module_interface("library").unwrap().unwrap();
     for closed in [false, true] {
         let config = TieredConfig {
             baseline_threshold: u32::MAX,
@@ -170,6 +137,7 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
             function flags():number {return through([false,true,false],false) && !through([true,false,true],true) ? 1 : -1;}
             score(1);words();flags();
         "#,
+            interface.program(),
         );
         let names = runtime.compile_typed_program(program).unwrap();
         assert!(
@@ -189,12 +157,12 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
             for n in [-2.0, 0.0, 3.0, 7.0] {
                 assert_eq!(
                     runtime
-                        .call_raw("ts$m$library_2ets$fn$score", &[ZyntaxValue::Float(n)])
+                        .call_raw("ts$m$client_2ets$fn$score", &[ZyntaxValue::Float(n)])
                         .unwrap(),
                     ZyntaxValue::Float(4.0 * n + 8.0)
                 );
             }
-            for name in ["ts$m$library_2ets$fn$words", "ts$m$library_2ets$fn$flags"] {
+            for name in ["ts$m$client_2ets$fn$words", "ts$m$client_2ets$fn$flags"] {
                 assert_eq!(
                     runtime.call_raw(name, &[]).unwrap(),
                     ZyntaxValue::Float(1.0)
@@ -204,10 +172,7 @@ fn imported_generics_run_across_interpreter_native_and_mixed_tiers() {
         check(&mut runtime);
         assert_eq!(runtime.statistics().baseline_functions, 0);
         assert_eq!(runtime.statistics().optimized_functions, 0);
-        let natives: Vec<_> = names
-            .iter()
-            .filter(|n| n.starts_with("ts$m$library_2ets$fn$"))
-            .collect();
+        let natives: Vec<_> = names.iter().filter(|n| n.starts_with("ts$m$")).collect();
         let leaves: Vec<_> = natives
             .iter()
             .copied()
@@ -521,10 +486,11 @@ fn unused_snapshot_template_stays_encoded() {
     let image_bytes = bytes.len();
     let snapshot = Arc::new(Snapshot::load_owned(bytes).unwrap());
     let mut runtime = TieredRuntime::new(TieredConfig::default()).unwrap();
-    runtime.install_snapshot(snapshot).unwrap();
+    runtime.install_snapshot(Arc::clone(&snapshot)).unwrap();
     zyntax_ts::register_runtime(&mut runtime).unwrap();
     runtime.enter_only_through_entry_points();
-    let program = client("console.log(through([1,2],0));");
+    let interface = snapshot.module_interface("library").unwrap().unwrap();
+    let program = client("console.log(through([1,2],0));", interface.program());
     let before = allocation_audit::for_phase(Phase::Decode);
     let hir = runtime.lower_to_hir(program).unwrap();
     let after = allocation_audit::for_phase(Phase::Decode);

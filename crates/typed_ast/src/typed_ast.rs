@@ -55,6 +55,9 @@ pub struct TypedProgram {
     /// Source files used in this program (for diagnostics)
     #[serde(default)]
     pub source_files: Vec<SourceFile>,
+    /// Source-level facts used by importing frontends, independent of executable bodies.
+    #[serde(default)]
+    pub checker_interface: Option<std::sync::Arc<crate::checker_interface::CheckerInterface>>,
     /// Type registry for custom struct/enum types defined in the program
     #[serde(skip, default = "crate::TypeRegistry::new")]
     pub type_registry: crate::TypeRegistry,
@@ -67,6 +70,7 @@ impl Default for TypedProgram {
             language: None,
             span: Span::default(),
             source_files: Vec::new(),
+            checker_interface: None,
             type_registry: crate::TypeRegistry::new(),
         }
     }

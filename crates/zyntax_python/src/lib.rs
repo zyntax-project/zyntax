@@ -1255,6 +1255,7 @@ fn parse_program_once(
     ));
 
     Ok(TypedProgram {
+        checker_interface: None,
         declarations,
         language: Some(intern("python")),
         span: Span::new(0, source.len()),

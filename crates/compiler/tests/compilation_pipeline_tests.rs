@@ -50,6 +50,7 @@ fn create_test_program(arena: &mut AstArena, func_name: &str, body: TypedBlock) 
     };
 
     TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -316,15 +317,16 @@ fn test_monomorphization_module_integration() {
 
     hir_module.functions.insert(func_id, generic_func);
 
-    // Run monomorphization on the module
-    let result = monomorphize_module(&mut hir_module);
-    assert!(result.is_ok(), "Monomorphization should succeed");
-
-    // Verify module still has the generic function
+    zyntax_compiler::monomorphize_library(&mut hir_module).unwrap();
     assert_eq!(
         hir_module.functions.len(),
         1,
-        "Should have the generic function"
+        "a library retains its exported template"
+    );
+    monomorphize_module(&mut hir_module).unwrap();
+    assert!(
+        hir_module.functions.is_empty(),
+        "an unused template is not executable code"
     );
 }
 
@@ -734,6 +736,7 @@ fn test_compilation_pipeline_with_async_function() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(func),
@@ -822,6 +825,7 @@ fn test_compilation_pipeline_without_async_runtime() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(func),
@@ -950,6 +954,7 @@ fn test_compilation_pipeline_mixed_sync_async() -> CompilerResult<()> {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![
             typed_node(

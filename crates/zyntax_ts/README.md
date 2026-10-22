@@ -85,7 +85,7 @@ strict equality, truthiness and formatting preserve their payload types across
 tiers without heap boxes. String construction requires a proven static lifetime;
 owned/reference payloads and combinations with nullable values need further work.
 
-General reference-bearing unions, capturing closures, classes, multi-file linking and other
+General reference-bearing unions, capturing closures, classes and other
 unimplemented constructs produce `Unsupported` diagnostics. These are implementation gaps, measured by
 the conformance suite; they are not permanent language restrictions.
 
@@ -95,8 +95,20 @@ uses the supplied filename; resolvers can use `parse_module` with a canonical
 path. Hosts obtain callable names with `ModuleId::function_name`, rather than
 constructing native names. Functions, lifted arrows, bindings and record layouts
 retain separate identities when libraries are linked through shared imports or
-snapshots. TypeScript import/export syntax and exported checker interfaces still
-need integration.
+snapshots.
+
+Hosts check named imports with `parse_module_with_dependencies`, supplying
+`ModuleDependency` entries resolved through shared compiled imports or
+`Snapshot::module_interface`. Exported functions, interfaces, aliases and local
+export renaming retain their checker facts in `TypedProgram::checker_interface`.
+The interface contains interned signatures and referenced property views without
+executable bodies. Readonly policy, generic specialization, borrowed parameters
+and array result bounds/provenance survive source and snapshot imports. Named
+imports within a source module combine their native signature requests. Explicit type-only and
+unused named imports do not evaluate dependencies; bare imports retain side effects.
+`zynode` filesystem/package resolution, default/namespace imports, re-exports and
+full cyclic/live-binding semantics still need integration. Snapshot and compiled
+import schema versions have changed; rebuild older artifacts.
 
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
 related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`

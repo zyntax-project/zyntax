@@ -1,6 +1,13 @@
 use std::fmt::Write;
 use zyntax_typed_ast::InternedString;
 
+/// A host-resolved dependency; shared compiled imports and snapshots supply its program.
+#[derive(Clone, Copy)]
+pub struct ModuleDependency<'a> {
+    pub specifier: &'a str,
+    pub program: &'a zyntax_typed_ast::TypedProgram,
+}
+
 pub(crate) fn append_component(buffer: &mut String, component: &str) {
     for byte in component.bytes() {
         if byte.is_ascii_alphanumeric() {

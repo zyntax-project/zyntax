@@ -12385,6 +12385,7 @@ pub(crate) fn loaded_program(
     declarations.push(import);
     let span = Span::new(0, source.len());
     Ok(TypedProgram {
+        checker_interface: None,
         declarations,
         language: Some(intern("lua")),
         span,
@@ -12522,6 +12523,7 @@ pub(crate) fn error_text_program(library: &Library) -> TypedProgram {
         span,
     );
     TypedProgram {
+        checker_interface: None,
         declarations: vec![
             TypedNode::new(TypedDeclaration::Function(entry), Type::Unknown, span),
             library_import(),
@@ -12989,6 +12991,7 @@ pub(crate) fn program(
         ));
     }
     let mut program = TypedProgram {
+        checker_interface: None,
         declarations,
         language: Some(intern("lua")),
         span,

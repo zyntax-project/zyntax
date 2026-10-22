@@ -627,6 +627,7 @@ pub fn bridge_program(t: &Types, type_registry: TypeRegistry, module: &str) -> T
         Span::new(0, 0),
     ));
     TypedProgram {
+        checker_interface: None,
         declarations,
         language: Some(intern("lua")),
         span: Span::new(0, 0),

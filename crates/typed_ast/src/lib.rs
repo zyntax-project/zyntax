@@ -61,6 +61,7 @@ pub mod source;
 
 pub mod advanced_analysis;
 pub mod ast_convert;
+pub mod checker_interface;
 pub mod constraint_solver;
 pub mod import_resolver;
 pub mod names;

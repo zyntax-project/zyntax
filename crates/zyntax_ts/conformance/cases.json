@@ -1093,5 +1093,25 @@
     "id": "no_main/top_level_loop",
     "file": "cases/no_main/top_level_loop.ts",
     "mode": "run"
+  },
+  {
+    "id": "exports/function",
+    "file": "cases/exports/function.ts",
+    "mode": "run"
+  },
+  {
+    "id": "exports/aliases",
+    "file": "cases/exports/aliases.ts",
+    "mode": "run"
+  },
+  {
+    "id": "exports/interface",
+    "file": "cases/exports/interface.ts",
+    "mode": "run"
+  },
+  {
+    "id": "exports/empty",
+    "file": "cases/exports/empty.ts",
+    "mode": "run"
   }
 ]

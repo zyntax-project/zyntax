@@ -115,6 +115,7 @@ fn module() -> HirModule {
         prim(PrimitiveType::Unit),
     );
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![run],
         span: span(),

@@ -92,6 +92,7 @@ fn test_struct_type_resolution() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -212,6 +213,7 @@ fn test_enum_type_resolution() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -328,6 +330,7 @@ fn test_type_alias_resolution() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -456,6 +459,7 @@ fn test_nested_struct_resolution() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(function),
@@ -650,6 +654,7 @@ fn test_multiple_struct_types() {
     };
 
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![
             typed_node(

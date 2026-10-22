@@ -25,11 +25,7 @@ pub(super) struct ArrayFact {
     root: ArrayRoot,
     minimum: u64,
 }
-#[derive(Clone, Copy)]
-pub(super) struct ArrayResult {
-    minimum: u64,
-    parameter: Option<usize>,
-}
+pub(super) use zyntax_typed_ast::checker_interface::ArrayReturn as ArrayResult;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Integral {
     Constant(u64),

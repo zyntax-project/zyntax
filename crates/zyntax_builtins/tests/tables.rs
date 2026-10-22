@@ -130,6 +130,7 @@ fn the_tables_run() {
         }
     }
     let program = TypedProgram {
+        checker_interface: None,
         declarations,
         language: None,
         span: Span::new(0, 0),

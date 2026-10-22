@@ -32,6 +32,7 @@ use zyntax_typed_ast::InternedString;
 
 fn create_test_module() -> HirModule {
     HirModule {
+        initializers: vec![],
         id: HirId::new(),
         name: InternedString::new_global("test"),
         functions: Default::default(),

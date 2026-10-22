@@ -228,6 +228,7 @@ fn module() -> HirModule {
         ),
     ];
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations,
         span: span(),

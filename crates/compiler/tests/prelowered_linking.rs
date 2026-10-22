@@ -79,6 +79,7 @@ fn returning_call(name: InternedString) -> TypedBlock {
 
 fn program(declarations: Vec<TypedDeclaration>) -> TypedProgram {
     TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: declarations
             .into_iter()

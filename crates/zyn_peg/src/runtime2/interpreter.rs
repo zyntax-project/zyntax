@@ -1632,6 +1632,7 @@ impl<'g> GrammarInterpreter<'g> {
         let type_registry = state.type_registry().clone();
 
         Ok(ParsedValue::Program(Box::new(TypedProgram {
+            checker_interface: None,
             language: None,
             declarations,
             span,

@@ -1200,6 +1200,7 @@ impl TypedASTBuilder {
             };
 
         TypedProgram {
+            checker_interface: None,
             declarations,
             language: None,
             span,

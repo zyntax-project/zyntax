@@ -127,6 +127,7 @@ fn test_vtable_generation_simple() {
     // 5. Create program with the method function
     use zyntax_typed_ast::{TypedDeclaration, typed_node};
     let mut program = TypedProgram {
+        checker_interface: None,
         language: None,
         declarations: vec![typed_node(
             TypedDeclaration::Function(impl_function),
