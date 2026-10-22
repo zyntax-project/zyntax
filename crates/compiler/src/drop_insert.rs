@@ -2935,10 +2935,11 @@ fn derived_values_using(
     while let Some(v) = work.pop() {
         if through_phis {
             for (b, i) in users.phi_users.get(&v).map(|u| u.as_slice()).unwrap_or(&[]) {
-                if let Some(phi) = func.blocks.get(b).and_then(|blk| blk.phis.get(*i))
-                    && set.insert(phi.result)
-                {
-                    work.push(phi.result);
+                if let Some(phi) = func.blocks.get(b).and_then(|blk| blk.phis.get(*i)) {
+                    let header = list && heads.contains(&v) && heads.insert(phi.result);
+                    if set.insert(phi.result) || header {
+                        work.push(phi.result);
+                    }
                 }
             }
         }
@@ -3016,9 +3017,20 @@ fn derived_values_using(
                     && args
                         .iter()
                         .any(|a| set.contains(a) && facts.result_aliases_arg(callee, args, *a))
-                    && set.insert(*result)
                 {
-                    work.push(*result);
+                    // A returned header alias owns the same element storage.
+                    let header = list
+                        && func
+                            .values
+                            .get(result)
+                            .is_some_and(|v| crate::ssa::is_list_header(&v.ty))
+                        && args.iter().any(|a| {
+                            heads.contains(a) && facts.result_aliases_arg(callee, args, *a)
+                        })
+                        && heads.insert(*result);
+                    if set.insert(*result) || header {
+                        work.push(*result);
+                    }
                 }
                 continue;
             }
@@ -3632,93 +3644,163 @@ mod tests {
     /// header, so the release lands after it.
     #[test]
     fn a_list_header_release_frees_the_elements_first() {
+        for via_alias in [false, true] {
+            let mut f = HirFunction::new(
+                InternedString::new_global("list_literal"),
+                empty_sig(HirType::I64),
+            );
+            let entry = *f.blocks.keys().next().unwrap();
+            let data_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(32));
+            let header_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(24));
+            let data = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+            let header = add_inst_val(
+                &mut f,
+                HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type())),
+            );
+            let alias = add_inst_val(&mut f, crate::ssa::list_header_type());
+            let identity = HirId::new();
+            let loaded = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+            let elem = add_inst_val(&mut f, HirType::I64);
+            let block = f.blocks.get_mut(&entry).unwrap();
+            block.instructions.push(HirInstruction::Call {
+                result: Some(data),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![data_bytes],
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
+            block.instructions.push(HirInstruction::Call {
+                result: Some(header),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![header_bytes],
+                type_args: Vec::new(),
+                const_args: Vec::new(),
+                is_tail: false,
+            });
+            block.instructions.push(HirInstruction::Store {
+                value: data,
+                ptr: header,
+                align: 8,
+                volatile: false,
+            });
+            if via_alias {
+                block.instructions.push(HirInstruction::Call {
+                    result: Some(alias),
+                    callee: HirCallable::Function(identity),
+                    args: vec![header],
+                    type_args: vec![],
+                    const_args: vec![],
+                    is_tail: false,
+                });
+            }
+            block.instructions.push(HirInstruction::Load {
+                result: loaded,
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+                ptr: if via_alias { alias } else { header },
+                align: 8,
+                volatile: false,
+            });
+            block.instructions.push(HirInstruction::Load {
+                result: elem,
+                ty: HirType::I64,
+                ptr: loaded,
+                align: 8,
+                volatile: false,
+            });
+            block.terminator = HirTerminator::Return { values: vec![elem] };
+
+            let mut facts = ModuleFacts::default();
+            facts.returns_param.insert(identity, vec![true]);
+            facts.borrowed_params.insert(identity, vec![true]);
+            let stats = run_function(&mut f, &facts);
+            assert_eq!(stats.mallocs_scanned, 2);
+            assert_eq!(
+                stats.escapes_skipped, 1,
+                "the element storage is the header's"
+            );
+            assert_eq!(stats.frees_inserted, 1);
+
+            let block = f.blocks.values().next().unwrap();
+            let freed: Vec<HirId> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i {
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(Intrinsic::Free),
+                        args,
+                        ..
+                    } => Some(args[0]),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(freed.len(), 2, "elements and header");
+            assert_eq!(freed[1], header, "the header goes last");
+            let read_back = block.instructions.iter().position(
+                |i| matches!(i, HirInstruction::Load { result, .. } if *result == freed[0]),
+            );
+            let last_use = block
+                .instructions
+                .iter()
+                .position(|i| matches!(i, HirInstruction::Load { result, .. } if *result == elem));
+            assert!(
+                read_back > last_use,
+                "the release reads the elements' address after the last element read"
+            );
+        }
+    }
+
+    #[test]
+    fn list_elements_loaded_through_a_header_phi_share_its_lifetime() {
         let mut f = HirFunction::new(
-            InternedString::new_global("list_literal"),
+            InternedString::new_global("header_phi"),
             empty_sig(HirType::I64),
         );
-        let entry = *f.blocks.keys().next().unwrap();
-        let data_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(32));
-        let header_bytes = add_const(&mut f, HirType::I64, HirConstant::I64(24));
-        let data = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
-        let header = add_inst_val(
-            &mut f,
-            HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type())),
-        );
-        let loaded = add_inst_val(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
-        let elem = add_inst_val(&mut f, HirType::I64);
+        let entry = f.entry_block;
+        let ty = HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type()));
+        let header = add_inst_val(&mut f, ty.clone());
+        let alias = add_inst_val(&mut f, ty.clone());
+        let data_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
+        let data = add_inst_val(&mut f, data_ty.clone());
+        let slot = add_inst_val(&mut f, data_ty.clone());
+        let size = add_const(&mut f, HirType::I64, HirConstant::I64(24));
+        let zero = add_const(&mut f, HirType::I64, HirConstant::I64(0));
+        let merge = HirId::new();
         let block = f.blocks.get_mut(&entry).unwrap();
-        block.instructions.push(HirInstruction::Call {
-            result: Some(data),
-            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
-            args: vec![data_bytes],
-            type_args: Vec::new(),
-            const_args: Vec::new(),
-            is_tail: false,
-        });
         block.instructions.push(HirInstruction::Call {
             result: Some(header),
             callee: HirCallable::Intrinsic(Intrinsic::Malloc),
-            args: vec![header_bytes],
-            type_args: Vec::new(),
-            const_args: Vec::new(),
+            args: vec![size],
+            type_args: vec![],
+            const_args: vec![],
             is_tail: false,
         });
-        block.instructions.push(HirInstruction::Store {
-            value: data,
-            ptr: header,
-            align: 8,
-            volatile: false,
+        block.terminator = HirTerminator::Branch { target: merge };
+        let mut block = HirBlock::new(merge);
+        block.predecessors.push(entry);
+        block.phis.push(crate::hir::HirPhi {
+            result: alias,
+            ty,
+            incoming: vec![(header, entry)],
         });
         block.instructions.push(HirInstruction::Load {
-            result: loaded,
-            ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
-            ptr: header,
+            result: data,
+            ty: data_ty.clone(),
+            ptr: alias,
             align: 8,
             volatile: false,
         });
-        block.instructions.push(HirInstruction::Load {
-            result: elem,
-            ty: HirType::I64,
-            ptr: loaded,
-            align: 8,
-            volatile: false,
+        block.instructions.push(HirInstruction::GetElementPtr {
+            result: slot,
+            ty: data_ty,
+            ptr: data,
+            indices: vec![zero],
         });
-        block.terminator = HirTerminator::Return { values: vec![elem] };
-
-        let stats = run_function(&mut f, &ModuleFacts::default());
-        assert_eq!(stats.mallocs_scanned, 2);
-        assert_eq!(
-            stats.escapes_skipped, 1,
-            "the element storage is the header's"
-        );
-        assert_eq!(stats.frees_inserted, 1);
-
-        let block = f.blocks.values().next().unwrap();
-        let freed: Vec<HirId> = block
-            .instructions
-            .iter()
-            .filter_map(|i| match i {
-                HirInstruction::Call {
-                    callee: HirCallable::Intrinsic(Intrinsic::Free),
-                    args,
-                    ..
-                } => Some(args[0]),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(freed.len(), 2, "elements and header");
-        assert_eq!(freed[1], header, "the header goes last");
-        let read_back = block
-            .instructions
-            .iter()
-            .position(|i| matches!(i, HirInstruction::Load { result, .. } if *result == freed[0]));
-        let last_use = block
-            .instructions
-            .iter()
-            .position(|i| matches!(i, HirInstruction::Load { result, .. } if *result == elem));
+        f.blocks.insert(merge, block);
+        let derived = derived_values_in(&f, header, &ModuleFacts::default());
         assert!(
-            read_back > last_use,
-            "the release reads the elements' address after the last element read"
+            derived.contains(&slot),
+            "a later element access keeps the header's buffer live"
         );
     }
 
