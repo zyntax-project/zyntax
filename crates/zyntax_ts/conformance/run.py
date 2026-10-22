@@ -94,8 +94,9 @@ def oracle(args, case, files, options):
 
 def source_hash(files):
     digest = hashlib.sha256()
+    base = Path(os.path.commonpath([p.parent for p in files]))
     for p in files:
-        digest.update(p.name.encode())
+        digest.update(p.relative_to(base).as_posix().encode())
         digest.update(b"\0")
         digest.update(p.read_bytes())
     return digest.hexdigest()
@@ -231,7 +232,10 @@ def main():
         selected = [c for c in cases if args.only in c["id"]]
         for case in selected[:args.limit]:
             file = ROOT / case["file"]
-            rows += execute_case(args, case, [file], case.get("options", {}), file.with_suffix(".reference.json"), known)
+            files = [ROOT / p for p in case.get("files", [case["file"]])]
+            if not files or files[0] != file:
+                raise ValueError(f"entry must be the first file: {case['id']}")
+            rows += execute_case(args, case, files, case.get("options", {}), file.with_suffix(".reference.json"), known)
     else:
         paths = sorted(p for p in args.upstream.rglob("*.ts") if args.only in str(p.relative_to(args.upstream)))
         for path in paths[:args.limit]:
@@ -262,7 +266,7 @@ def main():
                         rows.append({"case": label, "status": "SKIP", "reason": "no .ts source files"})
                         continue
                     if len(staged) != 1:
-                        rows.append({"case": label, "status": "SKIP", "reason": "native multi-file project checking is not implemented yet"})
+                        rows.append({"case": label, "status": "SKIP", "reason": "upstream multi-root project checking is not implemented yet"})
                         continue
                     case = {"id": f"{label}#{i}", "mode": "check"}
                     rows += execute_case(args, case, staged, options, None, {})

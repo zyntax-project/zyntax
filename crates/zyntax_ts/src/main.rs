@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zyntax_embed::{TieredConfig, TieredRuntime};
-use zyntax_ts::{ErrorKind, ModuleId, Options, Soundness};
+use zyntax_ts::{ErrorKind, Options, ProjectError, Soundness};
 
 fn main() -> ExitCode {
     std::thread::Builder::new()
@@ -50,36 +50,29 @@ fn run() -> ExitCode {
     let Some(file) = file else {
         return usage();
     };
-    let source = match std::fs::read_to_string(&file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{}: {e}", file.display());
+    let project = match zyntax_ts::load_project(&file, options) {
+        Ok(project) => project,
+        Err(ProjectError::Io { file, error }) => {
+            eprintln!("{}: {error}", file.display());
             return ExitCode::from(2);
         }
-    };
-    let filename = file.to_string_lossy();
-    let identity = match file.canonicalize() {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("{}: {e}", file.display());
-            return ExitCode::from(2);
-        }
-    };
-    let module = ModuleId::new(&identity.to_string_lossy());
-    let program = match zyntax_ts::parse_module(&source, &filename, module, options) {
-        Ok(program) => program,
-        Err(e) => {
+        Err(ProjectError::Diagnostic {
+            file,
+            source_code,
+            error: e,
+        }) => {
+            let filename = file.to_string_lossy();
             if json {
                 eprintln!(
                     "{}",
-                    serde_json::json!({"kind": format!("{:?}", e.kind), "message": e.message, "start": e.start, "end": e.end})
+                    serde_json::json!({"kind": format!("{:?}", e.kind), "message": e.message, "file": filename, "start": e.start, "end": e.end})
                 );
             } else {
                 eprint!(
                     "{}",
                     e.render(
                         &filename,
-                        &source,
+                        &source_code,
                         zyntax_typed_ast::diagnostics::colors_enabled()
                     )
                 );
@@ -113,6 +106,8 @@ fn run() -> ExitCode {
         }
     };
     let result = zyntax_ts::register_runtime(&mut runtime).and_then(|()| {
+        let (program, resolver) = project.into_parts();
+        runtime.add_compiled_import_resolver(resolver);
         runtime.enter_only_through_entry_points();
         runtime.compile_typed_program(program)
     });

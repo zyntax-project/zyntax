@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2459,
+      "start": 8,
+      "length": 6,
+      "file": "entry.ts",
+      "message": "Module '\"./library\"' declares 'secret' locally, but it is not exported."
+    }
+  ],
+  "source_sha256": "da8618fb1c3e53ab2b9c0c88e064fe19c3a5f2d4a83d1543018475d3311e5346",
+  "options": {}
+}

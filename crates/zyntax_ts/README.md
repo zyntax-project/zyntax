@@ -106,14 +106,20 @@ executable bodies. Readonly policy, generic specialization, borrowed parameters
 and array result bounds/provenance survive source and snapshot imports. Named
 imports within a source module combine their native signature requests. Explicit type-only and
 unused named imports do not evaluate dependencies; bare imports retain side effects.
-`zynode` filesystem/package resolution, default/namespace imports, re-exports and
-full cyclic/live-binding semantics still need integration. Snapshot and compiled
-import schema versions have changed; rebuild older artifacts.
+`load_project` and `zynode` resolve relative `.ts` files, extensionless imports,
+directory indexes, and emitted `.js` specifiers backed by TypeScript source.
+Each canonical file is checked once, including type-only dependencies. Runtime
+bodies move into the shared compiled-import linker; type-only bodies are dropped.
+Dependency initializers run once before their importers. Diagnostics identify
+the file that failed, including errors in transitive dependencies.
+Package resolution, default/namespace imports, `export ... from`, `export *` and
+cyclic/live-binding semantics still need integration. Cycles report `Unsupported`.
+Snapshot and compiled import schema versions have changed; rebuild older artifacts.
 
 Diagnostics use Zyntax's shared Ariadne formatter, including source labels and
 related declaration locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE`
-enables them. Use `--diagnostics=json` for structured diagnostic categories and
-byte ranges.
+enables them. Use `--diagnostics=json` for structured diagnostic categories,
+byte ranges and source filenames.
 
 ## Type and soundness policies
 
@@ -181,8 +187,9 @@ python3 -m unittest discover -s crates/zyntax_ts/conformance -p test_harness.py
 `--typescript PATH` selects the pinned compiler package and `--node PATH`
 selects its runtime. A different compiler version is rejected. Pins include
 the source hash and compiler options, so editing a fixture requires refreshing
-its oracle. `--only TEXT` filters cases; `--out PATH` saves the machine-readable
-report. The runner never invokes Cargo.
+its oracle. Multi-file fixtures list the entry first in `files`; pins hash every
+file's relative path and contents. `--only TEXT` filters cases; `--out PATH` saves
+the machine-readable report. The runner never invokes Cargo.
 
 The default profiles disable promotion for the interpreter control and request
 early Cranelift promotion for the baseline control. They both use
@@ -215,7 +222,7 @@ python3 crates/zyntax_ts/conformance/run.py \
 The driver reads `@filename` sections and expands compiler-option matrices.
 It compares native acceptance with the pinned reference compiler rather than
 guessing acceptance from an upstream filename. Upstream mode currently checks
-types only. Native multi-file projects, relaxed-checking options and unsupported
+types only. Upstream multi-root projects, relaxed-checking options and unsupported
 test directives are explicitly reported as `SKIP`, with reasons; they are not
 compatibility passes. Unimplemented syntax and representations in runnable
 single-file tests report `UNSUPPORTED`. Selecting no cases or only skipped

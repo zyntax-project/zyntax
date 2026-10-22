@@ -1113,5 +1113,99 @@
     "id": "exports/empty",
     "file": "cases/exports/empty.ts",
     "mode": "run"
+  },
+  {
+    "id": "modules/graph",
+    "file": "cases/modules/graph/entry.ts",
+    "files": [
+      "cases/modules/graph/entry.ts",
+      "cases/modules/graph/left.ts",
+      "cases/modules/graph/right.ts",
+      "cases/modules/graph/shared.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "modules/extensions",
+    "file": "cases/modules/extensions/entry.ts",
+    "files": [
+      "cases/modules/extensions/entry.ts",
+      "cases/modules/extensions/math.ts",
+      "cases/modules/extensions/ops.ts",
+      "cases/modules/extensions/directory.ts",
+      "cases/modules/extensions/directory/index.ts"
+    ],
+    "mode": "run",
+    "options": {
+      "allowImportingTsExtensions": true
+    }
+  },
+  {
+    "id": "modules/types_only",
+    "file": "cases/modules/types_only/entry.ts",
+    "files": [
+      "cases/modules/types_only/entry.ts",
+      "cases/modules/types_only/types.ts",
+      "cases/modules/types_only/unused.ts",
+      "cases/modules/types_only/effect.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "modules/side_effect",
+    "file": "cases/modules/side_effect/entry.ts",
+    "files": [
+      "cases/modules/side_effect/entry.ts",
+      "cases/modules/side_effect/script.ts"
+    ],
+    "mode": "run",
+    "options": {
+      "allowImportingTsExtensions": true
+    }
+  },
+  {
+    "id": "modules/alias_chain",
+    "file": "cases/modules/alias_chain/entry.ts",
+    "files": [
+      "cases/modules/alias_chain/entry.ts",
+      "cases/modules/alias_chain/middle.ts",
+      "cases/modules/alias_chain/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "modules/argument_error",
+    "file": "cases/modules/argument_error/entry.ts",
+    "files": [
+      "cases/modules/argument_error/entry.ts",
+      "cases/modules/argument_error/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "modules/dependency_error",
+    "file": "cases/modules/dependency_error/entry.ts",
+    "files": [
+      "cases/modules/dependency_error/entry.ts",
+      "cases/modules/dependency_error/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "modules/private_error",
+    "file": "cases/modules/private_error/entry.ts",
+    "files": [
+      "cases/modules/private_error/entry.ts",
+      "cases/modules/private_error/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "modules/missing",
+    "file": "cases/modules/missing/entry.ts",
+    "files": [
+      "cases/modules/missing/entry.ts"
+    ],
+    "mode": "check"
   }
 ]

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2307,
+      "start": 16,
+      "length": 11,
+      "file": "entry.ts",
+      "message": "Cannot find module './missing' or its corresponding type declarations."
+    }
+  ],
+  "source_sha256": "be3b431a44f5c60fb63549a73bf8136eb55141fbb1eecaddab73269a482f15cf",
+  "options": {}
+}

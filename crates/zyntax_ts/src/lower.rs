@@ -380,24 +380,45 @@ pub fn parse_module_with_dependencies(
     for dependency in dependencies {
         dependency.program.type_registry.reserve_type_ids();
     }
+    let mut program = with_parsed(source, std::convert::identity, |program, semantic| {
+        lower_parsed(program, semantic, module, options, dependencies)
+    })?;
+    program
+        .source_files
+        .push(zyntax_typed_ast::source::SourceFile::new(
+            file.to_owned(),
+            source.to_owned(),
+        ));
+    Ok(program)
+}
+
+pub(crate) fn with_parsed<T, E>(
+    source: &str,
+    error: impl Fn(Error) -> E,
+    lower: impl FnOnce(&js::Program<'_>, &oxc_semantic::Semantic<'_>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
-    if let Some(error) = parsed.diagnostics.first() {
-        return Err(Error::from_oxc(ErrorKind::Syntax, error));
+    if let Some(diagnostic) = parsed.diagnostics.first() {
+        return Err(error(Error::from_oxc(ErrorKind::Syntax, diagnostic)));
     }
     let semantic = oxc_semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
-    if let Some(error) = semantic.diagnostics.first() {
-        return Err(Error::from_oxc(ErrorKind::Type, error));
+    if let Some(diagnostic) = semantic.diagnostics.first() {
+        return Err(error(Error::from_oxc(ErrorKind::Type, diagnostic)));
     }
-    Lowerer::new(options, module).program(
-        &parsed.program,
-        &semantic.semantic,
-        source,
-        file,
-        dependencies,
-    )
+    lower(&parsed.program, &semantic.semantic)
+}
+
+pub(crate) fn lower_parsed(
+    program: &js::Program<'_>,
+    semantic: &oxc_semantic::Semantic<'_>,
+    module: ModuleId,
+    options: Options,
+    dependencies: &[ModuleDependency<'_>],
+) -> Result<TypedProgram> {
+    Lowerer::new(options, module).program(program, semantic, dependencies)
 }
 
 struct Lowerer<'ast, 'program> {
@@ -506,8 +527,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         mut self,
         program: &'program js::Program<'ast>,
         semantic: &oxc_semantic::Semantic<'_>,
-        source: &str,
-        file: &str,
         dependencies: &[ModuleDependency<'_>],
     ) -> Result<TypedProgram> {
         WritePositions {
@@ -631,10 +650,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             declarations: self.declarations,
             language: Some(intern("typescript")),
             span: span(program.span),
-            source_files: vec![zyntax_typed_ast::source::SourceFile::new(
-                file.to_string(),
-                source.to_string(),
-            )],
+            source_files: vec![],
             type_registry: self.registry,
         })
     }

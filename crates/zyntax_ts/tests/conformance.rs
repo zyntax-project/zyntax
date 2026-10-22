@@ -91,9 +91,32 @@ fn reference_pins_match_native_acceptance_and_execution() {
         .unwrap();
         assert_eq!(reference["compiler"], "6.0.2");
         let mut hash = Sha256::new();
-        hash.update(file.file_name().unwrap().to_string_lossy().as_bytes());
-        hash.update([0]);
-        hash.update(std::fs::read(&file).unwrap());
+        let files: Vec<_> = case["files"].as_array().map_or_else(
+            || vec![file.clone()],
+            |files| {
+                files
+                    .iter()
+                    .map(|f| root().join(f.as_str().unwrap()))
+                    .collect()
+            },
+        );
+        assert_eq!(files.first(), Some(&file), "entry must be the first file");
+        let mut base = file.parent().unwrap();
+        while !files.iter().all(|path| path.starts_with(base)) {
+            base = base.parent().unwrap();
+        }
+        for source in files {
+            hash.update(
+                source
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .as_bytes(),
+            );
+            hash.update([0]);
+            hash.update(std::fs::read(source).unwrap());
+        }
         assert_eq!(
             reference["source_sha256"],
             format!("{:x}", hash.finalize()),

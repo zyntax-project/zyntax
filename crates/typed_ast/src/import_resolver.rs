@@ -237,7 +237,7 @@ pub enum ModuleArchitecture {
         init_file_name: String,
     },
 
-    /// Node.js style: Uses package.json "main" field or index.js
+    /// Node.js style: File extensions or a directory index.
     NodeStyle {
         /// File extensions to try in order (e.g., [".js", ".ts", ".json"])
         extensions: Vec<String>,
@@ -368,7 +368,7 @@ impl ModuleArchitecture {
     /// Create a TypeScript/Node-style module architecture
     pub fn typescript() -> Self {
         ModuleArchitecture::NodeStyle {
-            extensions: vec![".ts".to_string(), ".tsx".to_string(), ".js".to_string()],
+            extensions: vec![".ts".into(), ".tsx".into(), ".d.ts".into(), ".js".into()],
             index_name: "index".to_string(),
         }
     }
@@ -450,13 +450,50 @@ impl ModuleArchitecture {
                 index_name,
             } => {
                 // module -> base/module.ts, base/module/index.ts, etc.
+                let directory_only = module_path
+                    .last()
+                    .is_none_or(|part| matches!(part.rsplit('/').next(), Some("" | "." | "..")));
                 let mut path = base_path.clone();
                 for segment in module_path {
                     path = path.join(segment);
                 }
+                // Node resolves dot segments lexically, before probing the filesystem.
+                let mut normalized = PathBuf::new();
+                for component in path.components() {
+                    match component {
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if normalized.file_name().is_some() {
+                                normalized.pop();
+                            } else if !normalized.has_root() {
+                                normalized.push("..");
+                            }
+                        }
+                        component => normalized.push(component.as_os_str()),
+                    }
+                }
+                let path = normalized;
                 let mut paths = Vec::new();
+                if !directory_only
+                    && let Some(extension) = path.extension().and_then(|s| s.to_str())
+                {
+                    let suffix = format!(".{extension}");
+                    if extensions.contains(&suffix) {
+                        // TypeScript resolves emitted .js specifiers against source files first.
+                        if extension == "js" {
+                            for ext in extensions
+                                .iter()
+                                .filter(|ext| matches!(ext.as_str(), ".ts" | ".tsx" | ".d.ts"))
+                            {
+                                paths.push(path.with_extension(ext.trim_start_matches('.')));
+                            }
+                        }
+                        paths.push(path);
+                        return paths;
+                    }
+                }
                 // Try direct file with each extension
-                for ext in extensions {
+                for ext in extensions.iter().filter(|_| !directory_only) {
                     let file_name = format!(
                         "{}{}",
                         path.file_name().unwrap_or_default().to_string_lossy(),

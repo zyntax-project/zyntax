@@ -1,0 +1,12 @@
+{
+  "compiler": "6.0.2",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "4\n5\n",
+  "exit": 0,
+  "source_sha256": "74b1428069aaab536eba9795efdc573434fb7316dd6c1396c8ffe356ec7ebfab",
+  "options": {
+    "allowImportingTsExtensions": true
+  }
+}

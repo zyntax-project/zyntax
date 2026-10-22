@@ -2,10 +2,12 @@
 
 mod lower;
 mod modules;
+mod project;
 mod runtime;
 
 pub use lower::{parse_module, parse_module_with_dependencies, parse_program};
 pub use modules::{ModuleDependency, ModuleId};
+pub use project::{ProjectError, SourceProject, load_project};
 pub use runtime::register_runtime;
 
 /// Additional checks beyond TypeScript's strict static checking.

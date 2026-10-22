@@ -54,6 +54,21 @@ class HarnessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.known_failures(path)
 
+    def test_multifile_pins_hash_dependency_contents_and_relative_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entry = root / "entry.ts"
+            dependency = root / "sub" / "library.ts"
+            dependency.parent.mkdir()
+            entry.write_text("import {f} from './sub/library'; f();")
+            dependency.write_text("export function f():number{return 1;}")
+            stamp = runner.source_hash([entry, dependency])
+            dependency.write_text("export function f():number{return 2;}")
+            self.assertNotEqual(stamp, runner.source_hash([entry, dependency]))
+            moved = root / "library.ts"
+            moved.write_text("export function f():number{return 1;}")
+            self.assertNotEqual(stamp, runner.source_hash([entry, moved]))
+
     def test_hung_process_is_bounded(self):
         result = runner.bounded([sys.executable, "-c", "import time; time.sleep(10)"], 0.05)
         self.assertIsNone(result["code"])

@@ -29,6 +29,14 @@ if (action === "check") {
       message: ts.flattenDiagnosticMessageText(d.messageText, "\n")})),
   }));
 } else if (action === "run") {
+  const resolve = Module._resolveFilename;
+  Module._resolveFilename = function(specifier, parent, ...rest) {
+    if (parent?.filename.endsWith(".ts") && /^\.\.?\//.test(specifier)) {
+      const result = ts.resolveModuleName(specifier, parent.filename, converted.options, ts.sys).resolvedModule;
+      if (result && !result.resolvedFileName.endsWith(".d.ts")) return fs.realpathSync(result.resolvedFileName);
+    }
+    return resolve.call(this, specifier, parent, ...rest);
+  };
   Module._extensions[".ts"] = (module, filename) => {
     const source = fs.readFileSync(filename, "utf8");
     const output = ts.transpileModule(source, {compilerOptions: {...converted.options, noEmit: false}});
