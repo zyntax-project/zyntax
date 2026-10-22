@@ -64,6 +64,7 @@ fn main() -> Result<(), BuildError> {
 }
 
 fn build() -> Result<(), BuildError> {
+    zyntax_embed::track_snapshot_build_inputs();
     let out = PathBuf::from(env::var("OUT_DIR")?);
     emit_link_flags(&out)?;
     println!("cargo:rerun-if-changed=src/policy.rs");

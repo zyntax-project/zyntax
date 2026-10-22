@@ -40,6 +40,7 @@ fn main() -> Result<(), BuildError> {
 }
 
 fn build() -> Result<(), BuildError> {
+    zyntax_embed::track_snapshot_build_inputs();
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let out = PathBuf::from(env::var("OUT_DIR")?);
     emit_link_flags(&out)?;
