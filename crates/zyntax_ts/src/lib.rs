@@ -1,5 +1,6 @@
 //! TypeScript source to Zyntax's typed AST, with compile-time release analysis.
 
+mod ambient;
 mod lower;
 mod modules;
 mod project;

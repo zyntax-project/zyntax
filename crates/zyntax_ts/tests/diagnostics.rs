@@ -101,3 +101,30 @@ fn every_file_is_checked_under_strict_mode_rules() {
         "const a = 0o17 + 0b1 + 1_0 + 0.5;\nconst o = { yield: 1 };\nconsole.log(o.yield, a);\n";
     zyntax_ts::parse_program(valid, "valid.ts", Default::default()).unwrap();
 }
+
+#[test]
+fn declaration_files_reject_implementations_and_statements() {
+    for source in [
+        "function f() {}\n",
+        "declare function f() {}\n",
+        "declare class C { *generator(): any; }\n",
+        "for (;;) {}\n",
+        "return;\n",
+        "module \"Foo\" {}\n",
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "entry.d.ts", Default::default()).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::Type, "{source}");
+    }
+    // Declaration syntax is checked as ambient, not rejected as executable code.
+    let error = zyntax_ts::parse_program(
+        "export const a: number | null;\n",
+        "entry.d.ts",
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Unsupported);
+    // The same source is an ordinary file when its name is not a declaration file.
+    let error = zyntax_ts::parse_program("function f() {}\n", "entry.ts", Default::default());
+    assert!(error.is_ok());
+}

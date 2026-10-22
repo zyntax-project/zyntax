@@ -200,7 +200,7 @@ impl Loader<'_> {
         };
         self.active.insert(identity);
         self.stack.push(identity);
-        let result = lower::with_parsed(&source, diagnostic, |program, semantic| {
+        let result = lower::with_parsed(&source, filename, diagnostic, |program, semantic| {
             let mut requests = vec![];
             for statement in &program.body {
                 let Some(source) = lower::dependency_source(statement) else {

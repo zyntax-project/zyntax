@@ -7,7 +7,7 @@ use std::sync::Arc;
 use oxc_allocator::Allocator;
 use oxc_ast::ast as js;
 use oxc_ast_visit::{Visit, walk};
-use oxc_parser::Parser;
+use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType};
 use zyntax_typed_ast::checker_interface::{
     CheckerExport, CheckerField, CheckerFunction as Signature, CheckerInterface, CheckerParameter,
@@ -385,7 +385,7 @@ pub fn parse_module_with_dependencies(
     for dependency in dependencies {
         dependency.program.type_registry.reserve_type_ids();
     }
-    let mut program = with_parsed(source, std::convert::identity, |program, semantic| {
+    let mut program = with_parsed(source, file, std::convert::identity, |program, semantic| {
         lower_parsed(program, semantic, module, options, dependencies)
     })?;
     program
@@ -399,14 +399,31 @@ pub fn parse_module_with_dependencies(
 
 pub(crate) fn with_parsed<T, E>(
     source: &str,
+    file: &str,
     error: impl Fn(Error) -> E,
     lower: impl FnOnce(&js::Program<'_>, &oxc_semantic::Semantic<'_>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     let allocator = Allocator::default();
+    let declaration = crate::ambient::is_declaration_file(file);
     // TypeScript checks every file under strict-mode rules.
-    let parsed = Parser::new(&allocator, source, SourceType::ts().with_module(true)).parse();
+    let source_type = SourceType::ts()
+        .with_module(true)
+        .with_typescript_definition(declaration);
+    // Declaration files report stray statements as ambient-context errors.
+    let options = ParseOptions {
+        allow_return_outside_function: declaration,
+        ..ParseOptions::default()
+    };
+    let parsed = Parser::new(&allocator, source, source_type)
+        .with_options(options)
+        .parse();
     if let Some(diagnostic) = parsed.diagnostics.first() {
-        return Err(error(Error::from_oxc(ErrorKind::Syntax, diagnostic)));
+        let kind = if diagnostic.message.contains("ambient context") {
+            ErrorKind::Type
+        } else {
+            ErrorKind::Syntax
+        };
+        return Err(error(Error::from_oxc(kind, diagnostic)));
     }
     let semantic = oxc_semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
@@ -419,6 +436,9 @@ pub(crate) fn with_parsed<T, E>(
             ErrorKind::Type
         };
         return Err(error(Error::from_oxc(kind, diagnostic)));
+    }
+    if declaration && let Some(diagnostic) = crate::ambient::check(&parsed.program) {
+        return Err(error(diagnostic));
     }
     lower(&parsed.program, &semantic.semantic)
 }
