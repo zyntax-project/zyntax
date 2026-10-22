@@ -20,6 +20,7 @@ This directory contains architectural and educational documentation for the Zynt
 ### Language Integrations
 Located in [language-integrations/](language-integrations/) directory:
 - **Zyn Parser** - Zig language parser implementation
+- **[TypeScript](language-integrations/typescript/architecture.md)** - Native frontend architecture, [compatibility](language-integrations/typescript/compatibility.md) and [testing](language-integrations/typescript/testing.md)
 
 ## Other Documentation
 
