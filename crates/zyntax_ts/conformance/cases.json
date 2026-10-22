@@ -1764,5 +1764,20 @@
     "id": "variables/uninitialized_read",
     "file": "cases/variables/uninitialized_read.ts",
     "mode": "check"
+  },
+  {
+    "id": "variables/uninitialized_string",
+    "file": "cases/variables/uninitialized_string.ts",
+    "mode": "run"
+  },
+  {
+    "id": "variables/uninitialized_aggregates",
+    "file": "cases/variables/uninitialized_aggregates.ts",
+    "mode": "run"
+  },
+  {
+    "id": "variables/uninitialized_optional",
+    "file": "cases/variables/uninitialized_optional.ts",
+    "mode": "run"
   }
 ]

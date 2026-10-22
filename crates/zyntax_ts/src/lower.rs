@@ -2817,7 +2817,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("uninitialized bindings without a type annotation", d.span);
         };
         let (ty, view) = self.ty(&annotation.type_annotation)?;
-        if ty != number() && ty != boolean() {
+        if matches!(
+            ty,
+            Type::Union(_) | Type::Function { .. } | Type::TypeVar(_)
+        ) {
             return self.unsupported("uninitialized bindings of this type", d.span);
         }
         if let Some(earlier) = earlier {
@@ -2846,6 +2849,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 initialized: true,
             },
         );
+        // A type admitting `undefined` starts as `undefined`; reading it unassigned is valid.
+        if matches!(ty, Type::Optional(_)) {
+            let none = var(self.name("None"), undefined(), d.span);
+            if let Some(flow) = ScalarFlow::of(&none.ty) {
+                self.flow.insert(unique, flow);
+            }
+            let value = self.adapt_value(none, &ty, d.span)?;
+            return Ok(Some(stmt(
+                TypedStatement::Let(TypedLet {
+                    name: unique,
+                    ty,
+                    mutability: Mutability::Mutable,
+                    initializer: Some(Box::new(value)),
+                    span: span(d.span),
+                }),
+                d.span,
+            )));
+        }
         self.unassigned.insert(unique, Unassigned::Declared);
         Ok(Some(stmt(
             TypedStatement::Let(TypedLet {
