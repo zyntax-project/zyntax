@@ -418,11 +418,7 @@ pub(crate) fn with_parsed<T, E>(
         .with_options(options)
         .parse();
     if let Some(diagnostic) = parsed.diagnostics.first() {
-        let kind = if diagnostic.message.contains("ambient context") {
-            ErrorKind::Type
-        } else {
-            ErrorKind::Syntax
-        };
+        let kind = parse_error_kind(&diagnostic.message);
         return Err(error(Error::from_oxc(kind, diagnostic)));
     }
     let semantic = oxc_semantic::SemanticBuilder::new()
@@ -441,6 +437,59 @@ pub(crate) fn with_parsed<T, E>(
         return Err(error(diagnostic));
     }
     lower(&parsed.program, &semantic.semantic)
+}
+
+// Grammar rules oxc enforces while parsing but TypeScript reports from its checker.
+const CHECKER_GRAMMAR_ERRORS: &[&str] = &[
+    "ambient context",
+    "modifier cannot be used here",
+    "modifier must precede",
+    "modifier cannot appear on",
+    "modifier already seen",
+    "clause already seen",
+    "Only a single declaration is allowed in a",
+    "expression is only allowed in a generator body",
+    "is not allowed in property names",
+    "may not be declared using a binding pattern",
+    "Cannot assign to this expression",
+    "Missing initializer in const declaration",
+    "statement can only be used within a function body",
+    "Computed property names are not allowed in enums",
+    "Class name cannot be",
+    "Interface name cannot be",
+    "Classes may not have a static property named",
+    "Classes can only extend a single class",
+    "Generators can only be declared at the top level",
+    "cannot have an initializer because it is marked",
+    "cannot have a question mark and an initializer",
+    "A rest parameter cannot be optional",
+    "Missing initializer in destructuring declaration",
+    "Invalid rest element target",
+    "as an identifier in an async context",
+    "as an identifier in a generator context",
+    "overload signature cannot be declared as a generator",
+    "Interface declaration cannot have",
+    "accessor must not have any formal parameters",
+    "An index signature must have a type annotation",
+    "A rest element must be last in a destructuring pattern",
+    "A required element cannot follow an optional element",
+    "modifier can only appear on",
+    "cannot have an implementation because it is marked",
+    "modifier cannot be used with",
+    "Decorators are not valid here",
+    "Modifiers cannot appear here",
+    "An accessibility modifier cannot be used with",
+];
+
+fn parse_error_kind(message: &str) -> ErrorKind {
+    if CHECKER_GRAMMAR_ERRORS
+        .iter()
+        .any(|fragment| message.contains(fragment))
+    {
+        ErrorKind::Type
+    } else {
+        ErrorKind::Syntax
+    }
 }
 
 fn is_legacy_numeric_literal(message: &str) -> bool {

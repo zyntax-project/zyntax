@@ -128,3 +128,22 @@ fn declaration_files_reject_implementations_and_statements() {
     let error = zyntax_ts::parse_program("function f() {}\n", "entry.ts", Default::default());
     assert!(error.is_ok());
 }
+
+#[test]
+fn checker_grammar_errors_are_type_errors_and_parse_failures_are_syntax_errors() {
+    for (source, kind) in [
+        ("class C { public public x = 1; }\n", ErrorKind::Type),
+        ("for (let a = 1, b = 2 in {}) {}\n", ErrorKind::Type),
+        (
+            "function* g() {}\nfunction h() { yield 1; }\n",
+            ErrorKind::Type,
+        ),
+        ("interface any {}\n", ErrorKind::Type),
+        ("const value: number = ;\n", ErrorKind::Syntax),
+        ("let s = \"unterminated;\n", ErrorKind::Syntax),
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "grammar.ts", Default::default()).expect_err(source);
+        assert_eq!(error.kind, kind, "{source}");
+    }
+}
