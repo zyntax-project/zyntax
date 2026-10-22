@@ -26,6 +26,7 @@ crates/compiler/examples/
 
 # Session-specific documentation archives
 docs/session-archive/
+handoffs/performance-2026-10-09/
 
 output/
 test/output/
