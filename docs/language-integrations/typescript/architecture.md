@@ -35,6 +35,9 @@ promotion. To enable LLVM, build with `--features llvm-backend` and run with
 - `parse_module_with_dependencies` checks imports against exported checker interfaces.
   `TypedProgram::checker_interface` retains signatures, readonly views, generic
   parameters, layouts, borrow facts and array result summaries without bodies.
+- Static namespace members resolve by semantic symbol to those same signatures.
+  A borrowed AST pass indexes namespace uses; only referenced functions enter
+  shared linking, and no namespace object is allocated for these accesses.
 - `load_project` checks canonical filesystem dependencies. `SourceProject::into_parts`
   moves runtime-reachable programs into the shared compiled-import resolver;
   type-only bodies are omitted. Shared initialization roots preserve evaluation order.

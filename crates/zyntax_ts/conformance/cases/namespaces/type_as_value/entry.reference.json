@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 37,
+      "length": 4,
+      "file": "entry.ts",
+      "message": "Property 'Read' does not exist on type 'typeof import(\"/Users/amaterasu/Vibranium/zyntax/crates/zyntax_ts/conformance/cases/namespaces/type_as_value/library\")'."
+    }
+  ],
+  "source_sha256": "99dcac7498ccef2da65352832351f6c99b89f9e18b2b5ae6ee5e5a5549390202",
+  "options": {}
+}

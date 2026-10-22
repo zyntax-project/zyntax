@@ -1535,5 +1535,204 @@
       "cases/defaults/type_forward_call/library.ts"
     ],
     "mode": "check"
+  },
+  {
+    "id": "namespaces/direct",
+    "file": "cases/namespaces/direct/entry.ts",
+    "files": [
+      "cases/namespaces/direct/entry.ts",
+      "cases/namespaces/direct/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/computed",
+    "file": "cases/namespaces/computed/entry.ts",
+    "files": [
+      "cases/namespaces/computed/entry.ts",
+      "cases/namespaces/computed/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/callbacks",
+    "file": "cases/namespaces/callbacks/entry.ts",
+    "files": [
+      "cases/namespaces/callbacks/entry.ts",
+      "cases/namespaces/callbacks/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/shadowing",
+    "file": "cases/namespaces/shadowing/entry.ts",
+    "files": [
+      "cases/namespaces/shadowing/entry.ts",
+      "cases/namespaces/shadowing/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/types_only",
+    "file": "cases/namespaces/types_only/entry.ts",
+    "files": [
+      "cases/namespaces/types_only/entry.ts",
+      "cases/namespaces/types_only/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/default_type",
+    "file": "cases/namespaces/default_type/entry.ts",
+    "files": [
+      "cases/namespaces/default_type/entry.ts",
+      "cases/namespaces/default_type/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/initialization",
+    "file": "cases/namespaces/initialization/entry.ts",
+    "files": [
+      "cases/namespaces/initialization/entry.ts",
+      "cases/namespaces/initialization/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/reexports",
+    "file": "cases/namespaces/reexports/entry.ts",
+    "files": [
+      "cases/namespaces/reexports/entry.ts",
+      "cases/namespaces/reexports/barrel.ts",
+      "cases/namespaces/reexports/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/console_binding",
+    "file": "cases/namespaces/console_binding/entry.ts",
+    "files": [
+      "cases/namespaces/console_binding/entry.ts",
+      "cases/namespaces/console_binding/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/wrong_argument",
+    "file": "cases/namespaces/wrong_argument/entry.ts",
+    "files": [
+      "cases/namespaces/wrong_argument/entry.ts",
+      "cases/namespaces/wrong_argument/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/missing_value",
+    "file": "cases/namespaces/missing_value/entry.ts",
+    "files": [
+      "cases/namespaces/missing_value/entry.ts",
+      "cases/namespaces/missing_value/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/missing_type",
+    "file": "cases/namespaces/missing_type/entry.ts",
+    "files": [
+      "cases/namespaces/missing_type/entry.ts",
+      "cases/namespaces/missing_type/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/type_as_value",
+    "file": "cases/namespaces/type_as_value/entry.ts",
+    "files": [
+      "cases/namespaces/type_as_value/entry.ts",
+      "cases/namespaces/type_as_value/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/type_only_call",
+    "file": "cases/namespaces/type_only_call/entry.ts",
+    "files": [
+      "cases/namespaces/type_only_call/entry.ts",
+      "cases/namespaces/type_only_call/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/type_only_export",
+    "file": "cases/namespaces/type_only_export/entry.ts",
+    "files": [
+      "cases/namespaces/type_only_export/entry.ts",
+      "cases/namespaces/type_only_export/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/write",
+    "file": "cases/namespaces/write/entry.ts",
+    "files": [
+      "cases/namespaces/write/entry.ts",
+      "cases/namespaces/write/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/computed_write",
+    "file": "cases/namespaces/computed_write/entry.ts",
+    "files": [
+      "cases/namespaces/computed_write/entry.ts",
+      "cases/namespaces/computed_write/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/readonly_view",
+    "file": "cases/namespaces/readonly_view/entry.ts",
+    "files": [
+      "cases/namespaces/readonly_view/entry.ts",
+      "cases/namespaces/readonly_view/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/namespace_generic",
+    "file": "cases/namespaces/namespace_generic/entry.ts",
+    "files": [
+      "cases/namespaces/namespace_generic/entry.ts",
+      "cases/namespaces/namespace_generic/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/type_only_object",
+    "file": "cases/namespaces/type_only_object/entry.ts",
+    "files": [
+      "cases/namespaces/type_only_object/entry.ts",
+      "cases/namespaces/type_only_object/library.ts"
+    ],
+    "mode": "check"
+  },
+  {
+    "id": "namespaces/unused",
+    "file": "cases/namespaces/unused/entry.ts",
+    "files": [
+      "cases/namespaces/unused/entry.ts",
+      "cases/namespaces/unused/library.ts"
+    ],
+    "mode": "run"
+  },
+  {
+    "id": "namespaces/invalid_generic",
+    "file": "cases/namespaces/invalid_generic/entry.ts",
+    "files": [
+      "cases/namespaces/invalid_generic/entry.ts",
+      "cases/namespaces/invalid_generic/library.ts"
+    ],
+    "mode": "check"
   }
 ]

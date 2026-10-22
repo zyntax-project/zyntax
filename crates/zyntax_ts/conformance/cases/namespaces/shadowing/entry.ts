@@ -1,0 +1,1 @@
+import * as lib from './library';type Point={x:number};function read(lib:Point):number{return lib.x;}const call=(n:number):number=>lib.step(n);console.log(call(3));console.log(read({x:9}));{const lib={x:11};console.log(lib.x);}console.log(lib.step(6));

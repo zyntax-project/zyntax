@@ -1,0 +1,1 @@
+console.log('elided');export type Read={readonly x:number};export function step(n:number):number{return n+2;}export default function<T>(x:T):T{return x;}export function array():number[]{return [2,4,8];}export type {step as typeOnly};

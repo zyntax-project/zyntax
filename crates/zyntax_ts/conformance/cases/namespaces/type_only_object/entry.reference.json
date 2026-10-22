@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1361,
+      "start": 46,
+      "length": 3,
+      "file": "entry.ts",
+      "message": "'lib' cannot be used as a value because it was imported using 'import type'."
+    }
+  ],
+  "source_sha256": "ce18a6dd61683b8dcb9912fa9f0fb6578ed298ea804e0564645ca677c24db100",
+  "options": {}
+}

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2540,
+      "start": 37,
+      "length": 6,
+      "file": "entry.ts",
+      "message": "Cannot assign to 'step' because it is a read-only property."
+    }
+  ],
+  "source_sha256": "9e604cec509a2d2c27a07d0ce9bcaf907cb083a0a7fcefacfad27482d0ee4269",
+  "options": {}
+}

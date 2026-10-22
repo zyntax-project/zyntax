@@ -1,0 +1,1 @@
+import * as lib from './library';function apply(f:(n:number)=>number,n:number):number{return f(n);}const f=lib.step;const g=lib['step'];console.log(apply(f,4));console.log(g(6));console.log(typeof lib.step);

@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2709,
+      "start": 41,
+      "length": 3,
+      "file": "entry.ts",
+      "message": "Cannot use namespace 'lib' as a type."
+    }
+  ],
+  "source_sha256": "ea0ed14238ee68375abb8157e930394a456ba3da66db8935bed53208ee34856f",
+  "options": {}
+}

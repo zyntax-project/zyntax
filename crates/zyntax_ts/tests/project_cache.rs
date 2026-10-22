@@ -663,7 +663,7 @@ fn cached_cli_preserves_initializers_arrays_and_generic_calls_across_tiers() {
     write(
         root,
         "entry.ts",
-        "import id,{array} from './barrel'; const a=array(); console.log(id(a[1])); console.log(id('text')); console.log('entry');",
+        "import id,* as lib from './barrel'; const a=lib.array(); console.log(id(a[1])); console.log(lib.default('text')); console.log('entry');",
     );
     let mut profiles = vec![
         vec!["--baseline-threshold", "2000000000"],

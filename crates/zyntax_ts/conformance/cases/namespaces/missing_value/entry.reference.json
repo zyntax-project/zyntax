@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 37,
+      "length": 7,
+      "file": "entry.ts",
+      "message": "Property 'missing' does not exist on type 'typeof import(\"/Users/amaterasu/Vibranium/zyntax/crates/zyntax_ts/conformance/cases/namespaces/missing_value/library\")'."
+    }
+  ],
+  "source_sha256": "7ace9ed9891f5f9c0375e8a08362db4a3a8a065661c068a51523aceae00bffe6",
+  "options": {}
+}

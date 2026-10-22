@@ -189,19 +189,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if self.has_binding_write(c.span) {
             return None;
         }
-        let js::Expression::Identifier(id) = &c.callee else {
-            return None;
-        };
-        if self
-            .scopes
-            .iter()
-            .any(|s| s.contains_key(&self.name(id.name.as_str())))
-        {
-            return None;
-        }
         let result = self
-            .signatures
-            .get(&self.name(id.name.as_str()))?
+            .direct_signature(&c.callee)
+            .ok()
+            .flatten()?
             .array_result?;
         let argument = result
             .parameter

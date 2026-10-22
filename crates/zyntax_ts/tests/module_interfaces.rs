@@ -38,6 +38,15 @@ const CLIENT: &str = r#"
     }
     score(1);
 "#;
+const NAMESPACE_CLIENT: &str = r#"
+    import * as lib from "./library";
+    export function score(n:number):number {
+        const p:lib.Read=lib.make(n);const q=lib.default(p);
+        const xs=lib.numbers(q.x);const ys=lib['alias'](xs);ys[1]=ys[1]+3;
+        return lib.pick(xs,0)+p.x;
+    }
+    score(1);
+"#;
 
 fn library() -> TypedProgram {
     parse_module(
@@ -235,7 +244,10 @@ fn imports_preserve_readonly_policy_and_diagnose_inaccessible_or_invalid_names()
         ("import type {Private} from './library';", ErrorKind::Type),
         ("import {missing} from './library';", ErrorKind::Type),
         ("import {make} from './missing';", ErrorKind::Type),
-        ("import * as lib from './library';", ErrorKind::Unsupported),
+        (
+            "import * as lib from './library'; const namespace=lib;",
+            ErrorKind::Unsupported,
+        ),
     ] {
         let error = client(source, &library, Options::default()).unwrap_err();
         assert_eq!(error.kind, kind, "{error}");
@@ -265,7 +277,7 @@ fn imports_preserve_readonly_policy_and_diagnose_inaccessible_or_invalid_names()
     .unwrap();
 }
 
-fn execute(snapshot_mode: bool, reexport: bool) {
+fn execute(snapshot_mode: bool, reexport: bool, namespace: bool) {
     let source = library();
     let image = snapshot(source.clone());
     let compact = image.module_interface("library").unwrap().unwrap();
@@ -286,7 +298,7 @@ fn execute(snapshot_mode: bool, reexport: bool) {
     )
     .unwrap();
     let program = client(
-        CLIENT,
+        if namespace { NAMESPACE_CLIENT } else { CLIENT },
         if reexport { &barrel } else { dependency },
         Options::default(),
     )
@@ -402,25 +414,36 @@ fn wait(runtime: &TieredRuntime, count: usize) {
 #[test]
 fn source_interfaces_run_with_native_layouts_and_array_aliases_in_each_tier() {
     let _test = TEST.lock().unwrap();
-    execute(false, false);
+    execute(false, false, false);
 }
 
 #[test]
 fn snapshot_interfaces_run_with_native_layouts_and_array_aliases_in_each_tier() {
     let _test = TEST.lock().unwrap();
-    execute(true, false);
+    execute(true, false, false);
 }
 
 #[test]
 fn source_reexports_preserve_native_geps_release_sites_and_each_promotion() {
     let _test = TEST.lock().unwrap();
-    execute(false, true);
+    execute(false, true, false);
 }
 
 #[test]
 fn snapshot_reexports_preserve_native_geps_release_sites_and_each_promotion() {
     let _test = TEST.lock().unwrap();
-    execute(true, true);
+    execute(true, true, false);
+}
+
+#[test]
+fn namespace_calls_reuse_native_layouts_release_sites_and_promotions_through_source_and_snapshots()
+{
+    let _test = TEST.lock().unwrap();
+    for snapshot in [false, true] {
+        for reexport in [false, true] {
+            execute(snapshot, reexport, true);
+        }
+    }
 }
 
 #[test]

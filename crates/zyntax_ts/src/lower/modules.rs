@@ -72,6 +72,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         {
             return Ok(exports);
         }
+        let namespace_uses = namespaces::NamespaceUses::collect(program, semantic.scoping());
         // Explicit exports shadow star bindings regardless of declaration order.
         let mut explicit = FxHashSet::default();
         let mut export_uses = FxHashMap::default();
@@ -185,9 +186,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 js::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
                                     (default_export, &s.local, false)
                                 }
-                                js::ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {
-                                    return self
-                                        .unsupported("namespace import objects", import.span);
+                                js::ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                                    let interface = dependency.checker_interface.as_ref().unwrap();
+                                    self.import_namespace(
+                                        s,
+                                        import.import_kind == js::ImportOrExportKind::Type,
+                                        interface,
+                                        &namespace_uses,
+                                        &mut items,
+                                    )?;
+                                    continue;
                                 }
                             };
                             let local = self.name(identifier.name.as_str());
@@ -301,7 +309,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         })
     }
 
-    fn export_binding(
+    pub(super) fn export_binding(
         &self,
         interface: &CheckerInterface,
         name: InternedString,
@@ -319,7 +327,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         })
     }
 
-    fn validate_signature(&self, signature: &Signature, at: oxc_span::Span) -> Result<()> {
+    pub(super) fn validate_signature(
+        &self,
+        signature: &Signature,
+        at: oxc_span::Span,
+    ) -> Result<()> {
         if signature.ret.is_none()
             || signature
                 .array_result
@@ -378,7 +390,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
-    fn request_function(items: &mut Vec<TypedImportItem>, name: InternedString) {
+    pub(super) fn request_function(items: &mut Vec<TypedImportItem>, name: InternedString) {
         let item = TypedImportItem::Named { name, alias: None };
         if !items.contains(&item) {
             items.push(item);

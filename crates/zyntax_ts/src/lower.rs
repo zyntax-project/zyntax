@@ -24,6 +24,7 @@ use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, Soundness};
 mod arrays;
 mod generics;
 mod modules;
+mod namespaces;
 pub(crate) use modules::dependency_source;
 mod unions;
 use arrays::{ArrayResult, FlowState, array_type, element_type};
@@ -434,6 +435,8 @@ struct Lowerer<'ast, 'program> {
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
     imported_exports: FxHashMap<InternedString, CheckerExport>,
+    namespaces: Vec<namespaces::Namespace>,
+    namespace_references: FxHashMap<oxc_semantic::NodeId, usize>,
     views: FxHashMap<InternedString, Arc<CheckerView>>,
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
     compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
@@ -469,6 +472,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             registry,
             aliases: FxHashMap::default(),
             imported_exports: FxHashMap::default(),
+            namespaces: vec![],
+            namespace_references: FxHashMap::default(),
             views: FxHashMap::default(),
             layouts: FxHashMap::default(),
             compatible_layouts: FxHashMap::default(),
@@ -915,6 +920,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self.unsupported("qualified type names", r.span);
                 };
                 if name.name != "Array" {
+                    if self.namespace_references.contains_key(&name.node_id.get()) {
+                        return self.error(
+                            ErrorKind::Type,
+                            "namespace cannot be used as a generic type",
+                            r.span,
+                        );
+                    }
                     return self.unsupported("this generic type reference", r.span);
                 }
                 if r.type_arguments.as_ref().unwrap().params.len() != 1 {
@@ -947,6 +959,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 (self.function_type(params.into_iter(), ret, f.span)?, None)
             }
             js::TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
+                if let js::TSTypeName::QualifiedName(name) = &r.type_name {
+                    return self.namespace_type(name);
+                }
                 let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
                     return self.unsupported("qualified type names", r.span);
                 };
@@ -2030,8 +2045,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .ok()
                 .and_then(|b| b.view),
             js::Expression::CallExpression(c) => {
-                if let js::Expression::Identifier(i) = &c.callee {
-                    let sig = self.signatures.get(&self.name(i.name.as_str()))?;
+                if let Some(sig) = self.direct_signature(&c.callee).ok().flatten() {
                     if let Some(index) = sig
                         .type_params
                         .iter()
@@ -2703,6 +2717,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             ),
             js::Expression::Identifier(i) => {
+                if self.namespace_references.contains_key(&i.node_id.get()) {
+                    return self.unsupported("namespace objects as values", at);
+                }
                 self.require_value(i.name.as_str(), at)?;
                 if self
                     .scopes
@@ -2732,18 +2749,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         "Infinity" => num(f64::INFINITY, at),
                         name if self.signatures.contains_key(&self.name(name)) => {
                             let sig = &self.signatures[&self.name(name)];
-                            if !sig.type_params.is_empty() {
-                                return self.unsupported("generic function values", at);
-                            }
-                            let ret = sig.ret.as_ref().ok_or_else(|| {
-                                Error::new(ErrorKind::Unsupported, "unresolved function result", at)
-                            })?;
-                            let ty = self.function_type(
-                                sig.params.iter().map(|p| p.ty.clone()),
-                                ret.clone(),
-                                at,
-                            )?;
-                            var(sig.native, ty, at)
+                            self.function_value(sig, at)?
                         }
                         name => {
                             let b = self.binding(name, at)?;
@@ -2891,6 +2897,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 )
             }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
+                if let Some(sig) = self.namespace_function(e)? {
+                    return self.function_value(sig, at);
+                }
                 let object = self.expr(&m.object)?;
                 if element_type(&object.ty).is_some() && m.property.name == "length" {
                     return Ok(self.array_length(object, at));
@@ -2911,6 +2920,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::Expression::ArrayExpression(a) => self.array_literal(a, None)?,
             js::Expression::ComputedMemberExpression(m) if !m.optional => {
+                if let Some(sig) = self.namespace_function(e)? {
+                    return self.function_value(sig, at);
+                }
                 self.array_index(&m.object, &m.expression, at)?
             }
             js::Expression::ObjectExpression(o) => self.object(o)?,
@@ -3280,6 +3292,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if receiver.name == "console"
                     && m.property.name == "log"
                     && !self
+                        .namespace_references
+                        .contains_key(&receiver.node_id.get())
+                    && !self.imported_exports.contains_key(&self.name("console"))
+                    && !self
                         .scopes
                         .iter()
                         .any(|s| s.contains_key(&self.name("console")))
@@ -3307,18 +3323,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.array_method(c, m);
             }
         }
-        let direct = match &c.callee {
-            js::Expression::Identifier(id)
-                if !self
-                    .scopes
-                    .iter()
-                    .any(|s| s.contains_key(&self.name(id.name.as_str()))) =>
-            {
-                Some(id)
-            }
-            _ => None,
-        };
-        let Some(id) = direct else {
+        let direct = self.direct_signature(&c.callee)?.cloned();
+        let Some(sig) = direct else {
             let callee = self.expr(&c.callee)?;
             let Type::Function {
                 params,
@@ -3341,14 +3347,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 ret,
                 at,
             ));
-        };
-        self.require_value(id.name.as_str(), id.span)?;
-        let Some(sig) = self.signatures.get(&self.name(id.name.as_str())).cloned() else {
-            return self.error(
-                ErrorKind::Type,
-                format!("cannot find function `{}`", id.name),
-                at,
-            );
         };
         if c.arguments.len() != sig.params.len() {
             return self.error(ErrorKind::Type, "wrong argument count", at);
@@ -3533,6 +3531,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::SimpleAssignmentTarget::StaticMemberExpression(m) => self.field_target(m),
             js::SimpleAssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
+                self.check_namespace_write(&m.object, at)?;
                 self.array_index(&m.object, &m.expression, at)
             }
             _ => self.unsupported("this assignment target", at),
@@ -3540,6 +3539,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn field_target(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
+        self.check_namespace_write(&m.object, m.span)?;
         if let js::Expression::Identifier(id) = &m.object {
             if self
                 .binding(id.name.as_str(), id.span)
@@ -3594,6 +3594,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::AssignmentTarget::StaticMemberExpression(m) => self.field_target(m)?,
             js::AssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
+                self.check_namespace_write(&m.object, a.span)?;
                 self.array_index(&m.object, &m.expression, a.span)?
             }
             _ => return self.unsupported("this assignment target", a.span),

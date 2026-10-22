@@ -1,0 +1,1 @@
+import * as lib from './library';const p:lib.Read={x:3};console.log(lib.default(p).x);const a=lib.array();const b=lib.default(a);b[1]+=3;console.log(a[1]);console.log(lib.step(4));console.log(lib.default<string>('text'));

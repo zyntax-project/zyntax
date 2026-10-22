@@ -1,0 +1,10 @@
+{
+  "compiler": "6.0.2",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "library\nbarrel\n4\n5\n",
+  "exit": 0,
+  "source_sha256": "021a64807ed8d5e8b34d2cfb7393c663f8fa377904f157d268a87de8d5390d6e",
+  "options": {}
+}

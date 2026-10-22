@@ -1,0 +1,16 @@
+{
+  "compiler": "6.0.2",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2694,
+      "start": 45,
+      "length": 7,
+      "file": "entry.ts",
+      "message": "Namespace '\"/Users/amaterasu/Vibranium/zyntax/crates/zyntax_ts/conformance/cases/namespaces/missing_type/library\"' has no exported member 'Missing'."
+    }
+  ],
+  "source_sha256": "abff44cb7f015dead06fe85f9349246e86a4991da925c46899c4e0fec517a673",
+  "options": {}
+}
