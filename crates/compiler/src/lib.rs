@@ -61,6 +61,7 @@ pub mod exclusive_args; // An exclusive argument may not be a second name for an
 pub mod fiber_backend; // `FiberCfg` trait + global install slot for fiber primitives
 pub mod fiber_lowering; // First-class fiber HIR ops → Call::Symbol("krio_fiber_*") rewrite
 pub mod fma_contract; // FMA contraction: rewrite fadd(fmul a b, c) → fma(a, b, c)
+pub mod frem_fast;
 pub mod heap_scalarize; // Immutable heap objects carried by phis become scalar fields
 pub mod hir;
 pub mod hir_builder; // HIR Builder API for direct HIR construction
@@ -2434,6 +2435,15 @@ fn run_interp_safe_opts_with(
     }
     checkpoint!("bounded_div");
     check_hir_uses(module, "bounded_div");
+
+    // After the integer strength reductions, before the vectorizers: a float remainder in a
+    // loop gains an integer path for whole operands. See the module docs.
+    let remainders = frem_fast::run_module(module);
+    if trace && remainders > 0 {
+        eprintln!("[OPT] float remainders given an integer path: {remainders}");
+    }
+    checkpoint!("frem_fast");
+    check_hir_uses(module, "frem_fast");
 
     // Affine reduction-loop closed-forming runs ONCE after the
     // fixed-point sweep, before the vectorizers. Ordering rationale:

@@ -1874,5 +1874,15 @@
     "id": "numeric/remainder_edge",
     "file": "cases/numeric/remainder_edge.ts",
     "mode": "run"
+  },
+  {
+    "id": "numeric/remainder_loop",
+    "file": "cases/numeric/remainder_loop.ts",
+    "mode": "run"
+  },
+  {
+    "id": "numeric/remainder_invariant",
+    "file": "cases/numeric/remainder_invariant.ts",
+    "mode": "run"
   }
 ]
