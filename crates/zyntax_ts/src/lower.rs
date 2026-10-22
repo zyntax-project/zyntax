@@ -1491,6 +1491,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$newline", vec![], unit()),
             ("$IO$print", vec![string()], unit()),
             ("$IO$print_bool", vec![boolean()], unit()),
+            ("$TS$number_to_string", vec![number()], string()),
+            ("$IO$format_bool", vec![boolean()], string()),
             ("$String$concat", vec![string(), string()], string()),
             ("$String$equals", vec![string(), string()], boolean()),
         ] {
@@ -2589,6 +2591,58 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(out)
     }
 
+    /// String conversion for `+` and template literals; other types stay unsupported.
+    fn text_of(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        let ty = value.ty.clone();
+        if ty == string() {
+            Ok(value)
+        } else if ty == number() {
+            Ok(self.call("$TS$number_to_string", vec![value], string(), at))
+        } else if ty == boolean() {
+            Ok(self.call("$IO$format_bool", vec![value], string(), at))
+        } else {
+            self.unsupported("string conversion of this type", at)
+        }
+    }
+
+    fn template(&mut self, template: &js::TemplateLiteral<'ast>) -> Result<Expr> {
+        let mut parts = vec![];
+        for (index, quasi) in template.quasis.iter().enumerate() {
+            let Some(cooked) = quasi
+                .value
+                .cooked
+                .as_ref()
+                .filter(|_| !quasi.lone_surrogates)
+            else {
+                return self.unsupported("template text with unpaired surrogates", quasi.span);
+            };
+            if !cooked.is_empty() {
+                parts.push(node(
+                    TypedExpression::Literal(TypedLiteral::String(self.name(cooked.as_str()))),
+                    string(),
+                    quasi.span,
+                ));
+            }
+            if let Some(expression) = template.expressions.get(index) {
+                let value = self.expr(expression)?;
+                parts.push(self.text_of(value, expression.span())?);
+            }
+        }
+        let at = template.span;
+        let mut parts = parts.into_iter();
+        let Some(mut result) = parts.next() else {
+            return Ok(node(
+                TypedExpression::Literal(TypedLiteral::String(self.name(""))),
+                string(),
+                at,
+            ));
+        };
+        for part in parts {
+            result = self.call("$String$concat", vec![result, part], string(), at);
+        }
+        Ok(result)
+    }
+
     fn condition(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let value = self.expr(e)?;
         self.truthy(value, e.span())
@@ -2907,6 +2961,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 string(),
                 at,
             ),
+            js::Expression::TemplateLiteral(template) => self.template(template)?,
             js::Expression::Identifier(i) => {
                 if self.namespace_references.contains_key(&i.node_id.get()) {
                     return self.unsupported("namespace objects as values", at);
@@ -3318,6 +3373,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 );
             }
             return self.unsupported("operators on unconstrained type parameters", at);
+        }
+        if op == "+" && (left.ty == string() || right.ty == string()) {
+            let left = self.text_of(left, at)?;
+            let right = self.text_of(right, at)?;
+            return Ok(self.call("$String$concat", vec![left, right], string(), at));
         }
         if left.ty == string() && right.ty == string() {
             return match op {

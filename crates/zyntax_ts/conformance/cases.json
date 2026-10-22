@@ -1744,5 +1744,10 @@
     "id": "variables/var_redeclared_type",
     "file": "cases/variables/var_redeclared_type.ts",
     "mode": "check"
+  },
+  {
+    "id": "strings/templates",
+    "file": "cases/strings/templates.ts",
+    "mode": "run"
   }
 ]

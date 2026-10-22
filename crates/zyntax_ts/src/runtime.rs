@@ -8,6 +8,15 @@ extern "C" fn print_number(value: f64) {
     }
 }
 
+extern "C" fn number_to_string(value: f64) -> zrtl::StringPtr {
+    let mut buffer = dragonbox_ecma::Buffer::new();
+    zrtl::string_new(if value == 0.0 {
+        "0"
+    } else {
+        buffer.format(value)
+    })
+}
+
 extern "C" fn number_pow(base: f64, exponent: f64) -> f64 {
     if base.abs() == 1.0 && exponent.is_infinite() {
         f64::NAN
@@ -32,6 +41,7 @@ zrtl::zrtl_plugin! {
     symbols: [
         ("$TS$print_number", print_number),
         ("$TS$print_undefined", print_undefined),
+        ("$TS$number_to_string", number_to_string),
         ("$TS$pow", number_pow),
         ("$TS$space", print_space),
         ("$TS$newline", print_newline),
