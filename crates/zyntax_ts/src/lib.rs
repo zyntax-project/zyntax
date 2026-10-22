@@ -12,7 +12,7 @@ pub use project::{
     CachePreparation, CacheStatus, ProjectError, SourceProject, load_project, load_project_cached,
     load_project_for_runtime, load_project_for_runtime_background,
 };
-pub use runtime::register_runtime;
+pub use runtime::{exit_process, register_runtime};
 
 /// Additional checks beyond TypeScript's strict static checking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

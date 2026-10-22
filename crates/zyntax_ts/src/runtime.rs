@@ -86,6 +86,29 @@ extern "C" fn math_max(a: f64, b: f64) -> f64 {
     }
 }
 
+/// Ends the process without running exit handlers, after flushing every output buffer.
+///
+/// A tier-up compile can still be running when the program ends, and the exit handlers of the
+/// LLVM library wait for it, which delays a short program by the length of that compile (and
+/// has crashed the process when they tear down state under a running compile). The system
+/// reclaims everything at exit, so every way out of a run goes through here.
+pub fn exit_process(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    {
+        // SAFETY: a null stream flushes every open C stream; `_exit` takes no pointers and
+        // never returns.
+        unsafe {
+            libc::fflush(std::ptr::null_mut());
+            libc::_exit(code)
+        }
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 /// An index TypeScript would read as `undefined` (or use to grow the array).
 extern "C" fn index_trap(index: f64, length: f64) {
     let shown = if index.is_nan() {
@@ -98,7 +121,7 @@ extern "C" fn index_trap(index: f64, length: f64) {
     eprintln!(
         "RangeError: array index {shown} is outside 0..{length}; TypeScript would read undefined or grow the array"
     );
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
