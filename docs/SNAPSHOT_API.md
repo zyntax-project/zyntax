@@ -1,333 +1,115 @@
 # Language snapshots
 
-A snapshot is everything a language brings to a runtime, in one
-artifact: its grammar, compiled; its standard library, already parsed;
-and the type ids both were built against. A host installs one and the
-language is ready to compile source.
+A `.zsnap` artifact packages a language's optional compiled grammar, checked
+modules and optional lowered HIR. A host installs it before checking user source
+so the runtime can reserve its type IDs and register its modules.
 
-This replaces five hand-written pieces per language with two lines,
-and it closes a hole that only opens when a runtime runs more than one
-language at a time.
+This reference covers artifact preparation and reuse. Language selection, type
+boundaries and symbol resolution are covered in [Cross-language imports](language-integrations/cross-language-imports.md).
 
-## What a language writes today
+## Build and install
 
-ZynML is the worked example. To ship a stdlib it writes a `build.rs`
-calling `CompiledImport::new` per module, three `include_bytes!`
-constants, a `OnceLock` per module with a decode helper, two resolver
-callbacks whose match arms have to agree, and a loop that decodes each
-artifact before any user source is parsed so the build-time type ids
-are reserved in order.
+```mermaid
+flowchart LR
+    Inputs[Optional grammar and checked modules] --> Builder[SnapshotBuilder]
+    Builder --> Artifact[Shared .zsnap artifact]
+    Artifact --> Validate[Validate compatibility]
+    Validate --> Install[Reserve type IDs and register modules]
+    Install --> Read[Read selected interfaces and bodies]
+```
 
-The last one is the tell. It is an ordering rule of the runtime, not of
-ZynML, and today it lives in a comment in the language crate. Every
-language on Zyntax has to rediscover it, and getting it wrong produces
-type ids that drift from the ones the artifacts were built against,
-which surfaces a long way from the cause.
+A build script supplies already checked programs:
 
-## What multi-language breaks
+```rust
+let path = zyntax_embed::SnapshotBuilder::new("demo")
+    .module("prelude", checked_program)?
+    .build_in(&out_dir)?;
+```
 
-A runtime holds a grammar per language, keyed by name, with a file
-extension map beside it (`register_grammar`). Imports do not work that
-way. `import_resolvers` and `compiled_import_resolvers` are flat lists
-on the runtime, each callback takes a bare module name, and the first
-resolver to answer wins.
+`build_in` chooses the filename. `include_snapshot!` uses the same convention
+under `OUT_DIR`, so hosts do not repeat filenames or format extensions:
 
-So two languages that both ship a module called `prelude` resolve to
-whichever one registered first. Nothing detects it. The artifact
-carries the language it belongs to and the import chain checks that
-language is registered, but by then the wrong module has already been
-chosen.
+```rust
+let snapshot = std::sync::Arc::new(zyntax_embed::Snapshot::load(
+    zyntax_embed::include_snapshot!("demo"),
+)?);
+runtime.install_snapshot(snapshot)?;
+```
 
-The source fallback is worse. When a module resolves to source rather
-than to an artifact, the chain tries to parse it with every registered
-grammar in turn. With one language that is a no-op. With three it is
-two wasted parses and an ambiguity, because the first grammar that
-accepts the text wins whether or not the module was written in it.
+`install_snapshot` validates compatibility, registers the grammar when present,
+reserves recorded type IDs and registers modules without decoding all their
+bodies. Keep the `Arc<Snapshot>` available for reuse across runtimes.
 
-## The shape
+For grammar-based frontends, `.grammar(grammar.to_compiled_bytes()?)` includes the
+compiled parser. Native frontends can omit it. Host resolver callbacks remain
+available for modules not packaged in the snapshot.
 
-    // build.rs
-    SnapshotBuilder::new("zynml")
-        .grammar(ZYNML_GRAMMAR)
-        .module("prelude", prelude_src)
-        .module("tensor", tensor_src)
-        .build_in(&out)?;
+## Module representations
 
-    // lib.rs
-    static SNAPSHOT: &[u8] = zyntax_embed::include_snapshot!("zynml");
+| Builder method | Saved data | Work remaining when consumed |
+| --- | --- | --- |
+| `module` / `module_ref` | Checked typed AST | Native lowering and optimization |
+| `module_with_source` | Checked AST plus original source | Same, with explicit source available for reparsing |
+| `module_lowered` | Body-free declarations, signatures/interfaces and split HIR | Decode reached bodies and execute; JIT compilation remains runtime work |
 
-    // runtime setup
-    runtime.install_snapshot(Snapshot::load(SNAPSHOT)?)?;
+`module_ref` borrows the checked program during encoding. `module_lowered`
+consumes its program and strips executable AST bodies; matching HIR is required
+for execution. Use shared `lower_for_snapshot_releasing` for library preparation,
+or `TieredRuntime::prepare_typed_program_snapshot` to prepare a linked project
+under the runtime's native policy. Preserve generic templates and use the same
+release policy as the consuming runtime.
 
-The builder owns the file name, composing it from the language name and
-the format's own extension, and the macro resolves the same name from
-`OUT_DIR`. Neither side spells the extension, so a build that writes
-one name and a load that reads another cannot happen. The extension is
-a convenience; a magic header and a schema constant are the authority,
-as compiled grammars already do.
+HIR uses the existing [bytecode encoding](BYTECODE_FORMAT_SPEC.md). A snapshot
+contains neither a live heap nor native machine code. Programs still start in
+the interpreter and may promote through the JIT tiers.
 
-`install_snapshot` is one call that registers the grammar and its
-extensions, reserves the type ids, and registers the modules. The
-ordering rule moves into the runtime, which is where it belongs, and
-every language gets it right by construction.
+### Read only what is needed
 
-## Modules become language-scoped
+- `module_interface` reads a compact interface when present; otherwise it falls
+  back to the module. `function_signature` reads a saved signature independently.
+- Split HIR keeps unused function bodies encoded. Embedded images borrow their
+  bytes; lazy modules share ownership through `Arc`.
+- `into_modules` consumes decoded programs instead of cloning them. A single
+  owned lowered module reuses its image allocation for the encoded HIR.
+- `modules` requests every module; avoid it when only selected imports are needed.
 
-A snapshot registers its modules under `(language, module)`. An import
-written inside a ZynML file resolves against ZynML's modules first, so
-existing source is unchanged and two languages can both ship a
-`prelude`. A module from another language is named explicitly, spelled
-however each grammar chooses to spell it, and resolves against that
-language's table.
+Checked programs retain their source-file metadata. `module_with_source` also
+provides text through `module_source` for hosts choosing to reparse.
 
-The source fallback stops guessing. A module registered under a
-language parses with that language's grammar and no other. Source that
-belongs to no snapshot keeps going through the callbacks below.
+## Compatibility and build inputs
 
-## What stays
+Readers check format versions and compiler fingerprints before decoding typed or
+HIR payloads. Lowered entries also validate target pointer size. Installation,
+interface/signature access and lazy body reads enforce compatibility; errors
+identify the affected module and incompatible identity.
 
-The existing callbacks stay as the layer underneath. They are how a
-host resolves a module it cannot know at build time, from a directory
-or over a network, and a snapshot does not replace that. What changes
-is that shipping a fixed standard library stops going through the
-dynamic path.
+A host can rebuild an incompatible snapshot or check its original source.
+Body-stripped declarations are not an executable source fallback. Raw AST entries
+retain their bodies and continue through normal native lowering.
 
-`CompiledImport` stays as the per-module unit inside a snapshot, so the
-wire format and its versioning carry over rather than being reinvented.
+Snapshot-generating build scripts call
+`zyntax_compiler::track_snapshot_build_inputs()` so incremental regeneration watches
+the shared compiler/type/codec inputs. Frontends must also track their own parser,
+checking policy and native primitive dependencies.
 
-## Why the grammar belongs inside
+## Validated project caching
 
-A grammar is compiled to a parsing machine before it can parse, and
-that compile currently happens when the grammar loads: about 0.8 ms for
-ZynML's 417 rules, once per runtime. In a snapshot it is a section
-written at build time, so a runtime maps it rather than building it,
-and the cost goes to zero instead of being amortised.
+`SnapshotCache` adds checked-source records to the ordinary snapshot format;
+frontends do not need another cache container.
 
-## The contract a grammar harnesses
+1. Record every checked file with `SnapshotSource`, including type-only files and
+   resolved dependency edges.
+2. Call `load` with the frontend's current resolver. It validates source hashes,
+   import resolution, options, frontend/compiler/target identity and payload
+   checksum. Missing, stale, corrupt or incompatible entries are misses.
+3. Use `store` to encode and atomically publish a complete entry. Alternatively,
+   `prepare` returns an in-memory snapshot and `publish` writes it atomically.
+   Publication failure leaves the prepared value usable by the current process.
 
-An import names a language or it does not:
+A cache hit skips only the stages represented in the artifact: checked AST skips
+parsing/checking; compatible HIR also reuses native lowering and optimization.
+Artifact validation and runtime installation still run. Treat the cache directory
+as trusted local build storage.
 
-    pub struct TypedImport {
-        /// The language the module belongs to. `None` means the
-        /// language of the file doing the importing.
-        #[serde(default)]
-        pub language: Option<InternedString>,
-        pub module_path: Vec<InternedString>,
-        pub items: Vec<TypedImportItem>,
-        pub span: Span,
-    }
-
-That field is the whole runtime-facing surface. Resolution reads it,
-falls back to the importing file's language when it is `None`, and
-looks the pair up in that language's module table. Everything above it
-belongs to the language: whether it writes `import zig::math`, `from
-zig import math`, or `@zig import math` is a matter for its grammar,
-and its action sets the field.
-
-The language goes in a field of its own rather than as the first
-segment of `module_path`, which would make a module actually named
-`zig` indistinguishable from the `zig` language. `serde(default)`
-keeps artifacts built before the field readable, since a compiled
-import is a serialised `TypedProgram`.
-
-A host that registers no second language never sees any of this. The
-field stays `None`, resolution stays within the one language
-installed, and nothing about existing source changes.
-
-## TypeScript importing Python
-
-Resolution is the easy half. TypeScript writes whatever its grammar
-says, its action sets `language: Some("python")`, and the pair lands in
-Python's module table. The question that decides whether any of this is
-usable is what the TypeScript checker sees on the other side.
-
-It sees the Python module's exported declarations, carrying the types
-Python gave them. A `def add(a, b)` arrives with parameters typed
-`Any`, because that is what the Python front end knew. TypeScript
-already has a rule for values it cannot type, so it applies its own:
-`Any` is what `any` means, and its checker decides how strict to be.
-Nothing asks TypeScript to understand Python's type system, only to
-read a signature written in the shared vocabulary.
-
-That vocabulary is what the two languages actually agree on. The
-primitives and `Any` are common ground because they are the type
-registry's, not any language's. A nominal type is not: Python's `list`
-and TypeScript's `Array` are separate entries with separate ids even
-when they mean the same thing. So a nominal type crossing the boundary
-is opaque to the importer, passable and returnable but not inspectable,
-unless both languages name the same registry entry deliberately.
-
-Values cross without conversion glue because both languages lower to
-one HIR and run on one runtime. A static caller handing a value to an
-`Any` parameter boxes it, and the same is true in reverse, which is the
-autoboxing the compiler already does within a single language. Crossing
-a language boundary is that case and not a new one.
-
-Type ids are reserved per snapshot in registration order, so a
-language's artifacts agree with the registry they were built against
-and a second language's reservations start after the first rather than
-overlapping it.
-
-Exported symbols are the part that does not work yet. `export_function`
-publishes a compiled function under a bare name for later modules to
-link against, and when a name is already exported it logs a warning and
-overwrites the pointer. A Python `add` and a TypeScript `add` in one
-runtime are therefore the same symbol, and the second one loaded wins.
-The type registry's `current_module` does not help here: it qualifies
-type names, not function symbols.
-
-That is the third flat namespace this design has to answer, after
-module resolution and the grammar the source fallback guesses at. A
-snapshot knows the language of everything it installs, so it can
-publish symbols qualified by it and resolve a bare name within the
-importing language first, the same rule modules follow. A collision
-between two languages then stops being a warning and a silent
-overwrite, which is the correct outcome: nothing about `add` in Python
-says it should replace `add` in TypeScript.
-
-Qualifying them costs more than qualifying modules did, and it is
-worth being clear why. A module is resolved by a runtime that can be
-handed a language alongside the name. A symbol is linked by name, at
-the backend, against a table that is a plain map of name to address. A
-qualified export that nothing else knows about is an export nothing
-can call: the name a call site emits has to be qualified in the same
-way, which makes this a mangling scheme reaching back into lowering
-rather than a lookup rule at the edge.
-
-So it splits in two. Refusing the collision needs only the language
-that exported each symbol, which the runtime already has when it loads
-a module, and it turns silent corruption into an error at the point of
-the second export. Qualifying the names, so two languages can both
-have an `add` and each call its own, is the mangling work and belongs
-with whatever decides how a language's symbols are spelled.
-
-Renaming an import does not stand in for either. An import item
-carries the name in the module it came from and an optional local
-alias, and the alias binds a name in the file doing the importing; the
-call still links against the name the module exported. So `add as
-pyAdd` reads like it settles which `add` is meant and settles nothing:
-both are one entry in the symbol table, and the second export replaces
-the first. That makes aliasing worth naming in the error, because it
-is the first thing anyone will reach for, and it is the case where the
-damage is hardest to see.
-
-Once names are qualified, aliasing becomes what it looks like. Two
-`add`s are two symbols, an import picks one, and a local alias is
-simply a convenience for writing it.
-
-How they get qualified is its own design, in
-[SYMBOL_IDENTITY.md](SYMBOL_IDENTITY.md).
-
-What this design does not attempt is making Python's semantics
-available to TypeScript. Calling across the boundary is a call. Whether
-the callee raises where the caller expects a rejected promise is a
-question for the languages, and the runtime's answer is the effect
-system, which is already language-neutral at HIR.
-
-## Validated project snapshots
-
-`SnapshotCache` persists checked source graphs as ordinary `.zsnap` files.
-It uses `SnapshotBuilder` and the existing module encodings. Snapshot schema 13
-adds optional input metadata to the directory: canonical entry and source
-identities, content hashes, resolved dependency edges, frontend/compiler/target
-identity, compilation options and a checksum of the payload sections.
-
-A frontend records every checked file with `SnapshotSource`, including type-only
-dependencies, and supplies its resolver to `SnapshotCache::load`. Loading checks
-source contents and resolves each recorded import again. A changed source,
-resolution, option or build produces a miss. Missing, corrupt and incompatible
-lowered artifacts also produce misses. `store` publishes a complete snapshot
-through an atomic rename. A host can fall back to source compilation on read or
-write failure.
-
-`SnapshotBuilder::module_ref` encodes a borrowed checked program, and
-`Snapshot::into_modules` moves decoded programs to their owner. Together they
-allow persistence without cloning typed function bodies. A frontend caching
-typed AST still performs native lowering and optimization at startup; skipping
-those stages requires a compatible lowered HIR section.
-
-Compiled import schema 7 records the shared compiler fingerprint before its
-typed payload. Bytecode version 10 records the same identity before its HIR
-payload. Readers check these identities before deserialization, including lazy
-and embedded reads. Changes to shared serialized types and lowering dependencies
-therefore invalidate artifacts even without a manual schema-version edit.
-Rebuild artifacts from older versions.
-
-Build scripts generating lowered snapshots call
-`zyntax_compiler::track_snapshot_build_inputs()` to watch the same source roots
-and manifests that determine the fingerprint. This keeps incremental snapshot
-generation synchronized with the compiler that will read it.
-
-## Lowered HIR, symbol and sourcemap aware
-
-A snapshot carries lowered HIR, not only the typed AST. A compile today
-lowers 462 stdlib declarations for a kernel with a handful of its own,
-because the artifact skips parsing the standard library but not
-lowering it, and that is the largest item left in a cold compile.
-
-The encoding is the bytecode format, which already exists: a versioned,
-platform-independent HIR serialisation with a documented spec, written
-for exactly this and already used by the benchmark's `.zbc` cache.
-Nothing new gets invented for the snapshot's HIR section.
-
-Two things that format needs for this use.
-
-**Symbols.** `HirModule` already carries `exports: Vec<HirExport>`, each
-a name, an internal name, and whether it is a function or a global.
-What it does not carry is which language produced it, and that is the
-field that decides whether installing two snapshots is safe. With it,
-installation publishes symbols qualified by language, resolves a bare
-name within the importing language first, and reports a real
-cross-language collision instead of the bare-name overwrite
-`export_function` does today. Without it, the collision is a log line.
-
-**Source maps.** HIR values carry `span: Option<Span>`, which is a pair
-of byte offsets into a source nobody named. Inside one compile that is
-fine, because the source is in hand. In a snapshot it is not: the
-standard library was compiled at build time and its text is not on the
-running machine. So a snapshot carries a source table per module, path
-and text or a line index, and spans resolve through it.
-
-That table is what makes the rest legible. A panic inside prelude code
-points at a prelude line rather than an offset into nothing. A
-TypeScript frame calling a Python one names both files and both
-languages. And a debugger stepping through installed code has
-somewhere to step to. A snapshot without it is faster and blind, which
-is a bad trade for a standard library, because the code a user did not
-write is exactly the code they most need named when it fails.
-
-## What the bytecode format has to promise
-
-Shipping HIR in a snapshot asks more of the bytecode format than the
-benchmark cache does, and the difference is worth being exact about.
-
-The format is agnostic in the way its spec claims: a frontend in any
-language can emit HIR without writing Rust, and the container is
-versioned, checksummed, and rejects a major mismatch. ZRTL settled the
-other boundary, the plugin ABI, with a version checked when a package
-loads.
-
-Neither of those covers this. The payload is postcard over the
-compiler's own HIR structs, and postcard is positional rather than
-self-describing, so adding a field to `HirFunction` changes the wire
-layout while the major version stays where it was. The tree already
-knows: the benchmark keeps a `CACHE_SCHEMA_VERSION` it bumps by hand,
-because, in its own words, neither the checksum nor postcard catches a
-valid old payload deserialised into a subtly incompatible new struct.
-
-A hand-bumped constant is fine for a cache one commit writes and reads.
-It is not fine for an artifact a language builds once and ships, which
-is what a snapshot is. So the format owes a schema identity that moves
-on its own when the HIR types move, derived rather than remembered, and
-checked on load. A snapshot built against a compiler whose HIR has
-since changed should be rejected on sight, not decoded into something
-that looks plausible.
-
-`module_lowered` carries typed declarations alongside HIR and strips their
-executable bodies. A mismatch in compiler identity or target pointer size is
-therefore rejected when loading the snapshot, before any typed payload is
-decoded. Runtime installation and module/interface access also validate against
-the current target. Errors identify the module and the incompatible build or
-pointer size. A host can rebuild the snapshot or check its original source;
-body-stripped declarations cannot serve as a source fallback. Raw typed-AST
-snapshots retain their bodies and continue through normal native lowering.
+See [TypeScript caching](language-integrations/typescript/architecture.md#persistent-project-cache)
+for a frontend integration. Keep measurements and work journals in git-bug.

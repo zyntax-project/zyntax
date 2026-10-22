@@ -11,6 +11,7 @@ This directory contains architectural and educational documentation for the Zynt
 - **[PLUGIN_ARCHITECTURE.md](PLUGIN_ARCHITECTURE.md)** - Plugin system architecture
 - **[tiered-compilation.md](tiered-compilation.md)** - Tiered compilation strategy
 - **[EMBEDDING_SDK.md](EMBEDDING_SDK.md)** - Embedding Zyntax in Rust applications (zyntax_embed)
+- **[SNAPSHOT_API.md](SNAPSHOT_API.md)** - Snapshot artifacts, installation and validated project caching
 
 ### Implementation Guides
 - **[HIR_BUILDER_EXAMPLE.md](HIR_BUILDER_EXAMPLE.md)** - HIR (High-level Intermediate Representation) builder examples
@@ -21,6 +22,7 @@ This directory contains architectural and educational documentation for the Zynt
 Located in [language-integrations/](language-integrations/) directory:
 - **Zyn Parser** - Zig language parser implementation
 - **[TypeScript](language-integrations/typescript/architecture.md)** - Native frontend architecture, [compatibility](language-integrations/typescript/compatibility.md) and [testing](language-integrations/typescript/testing.md)
+- **[Cross-language imports](language-integrations/cross-language-imports.md)** - Language selection, type boundaries and symbol identity
 
 ## Other Documentation
 
