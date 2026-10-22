@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2564,
+      "start": 21,
+      "length": 1,
+      "file": "error_init.ts",
+      "message": "Property 'm' has no initializer and is not definitely assigned in the constructor."
+    }
+  ],
+  "source_sha256": "87b579bea73a45642f26d37a9b406d8b2700e77ff13a72ce8f95c15d3665ec49",
+  "options": {}
+}

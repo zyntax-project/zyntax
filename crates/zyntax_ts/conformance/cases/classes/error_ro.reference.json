@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2540,
+      "start": 76,
+      "length": 1,
+      "file": "error_ro.ts",
+      "message": "Cannot assign to 'n' because it is a read-only property."
+    }
+  ],
+  "source_sha256": "e3c0b97ea4af9e25b5bec684a41c635e20b60bb46cbaac036fba787c33dd4b4b",
+  "options": {}
+}

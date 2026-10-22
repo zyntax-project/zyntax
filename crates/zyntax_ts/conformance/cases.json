@@ -1779,5 +1779,40 @@
     "id": "variables/uninitialized_optional",
     "file": "cases/variables/uninitialized_optional.ts",
     "mode": "run"
+  },
+  {
+    "id": "classes/basic",
+    "file": "cases/classes/basic.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/chain_and_interface",
+    "file": "cases/classes/chain_and_interface.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/error_priv",
+    "file": "cases/classes/error_priv.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/error_ro",
+    "file": "cases/classes/error_ro.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/error_init",
+    "file": "cases/classes/error_init.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/error_look",
+    "file": "cases/classes/error_look.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/error_args",
+    "file": "cases/classes/error_args.ts",
+    "mode": "check"
   }
 ]

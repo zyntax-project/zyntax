@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 119,
+      "length": 8,
+      "file": "error_look.ts",
+      "message": "Property 'get' is missing in type '{ n: number; }' but required in type 'A'."
+    }
+  ],
+  "source_sha256": "25907f1ab2bd6b1d566fcc9f16ba1e184252b2935b914620c04037f2bba93642",
+  "options": {}
+}

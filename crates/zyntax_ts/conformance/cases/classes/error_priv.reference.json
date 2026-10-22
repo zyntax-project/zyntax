@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2341,
+      "start": 94,
+      "length": 1,
+      "file": "error_priv.ts",
+      "message": "Property 'n' is private and only accessible within class 'A'."
+    }
+  ],
+  "source_sha256": "aa809576c829504c268b1981f8e790bf4d4c02c9d3f7efb6640fc8de66c45771",
+  "options": {}
+}
