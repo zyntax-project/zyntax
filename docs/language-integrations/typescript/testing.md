@@ -59,16 +59,34 @@ filter cases and `--out PATH` to save a JSON report.
 ## Upstream TypeScript cases
 
 ```sh
+python3 crates/zyntax_ts/conformance/fetch_upstream.py /tmp/typescript-conformance
 python3 crates/zyntax_ts/conformance/run.py \
-  --upstream /path/to/TypeScript/tests/cases/conformance \
-  --only expressions --limit 100 --profile baseline --out /tmp/ts-upstream.json
+  --upstream /tmp/typescript-conformance \
+  --upstream-pin crates/zyntax_ts/conformance/upstream.json \
+  --jobs 4 --profile baseline --out /tmp/ts-upstream.json
 ```
 
-Upstream mode reads `@filename` sections and compiler-option matrices, then
-compares type acceptance with the pinned checker. It does not compare execution.
-Multi-root projects, relaxed-checking options and unsupported directives are
-reported as `SKIP` with reasons. Missing native syntax/representations in runnable
-single-file cases report `UNSUPPORTED`. Skips are not compatibility passes.
+The fetcher verifies an immutable official revision, archive checksum and complete
+source inventory. The pin matches the reference compiler's published revision;
+the corpus lives under `tsc/testdata/tests/cases/conformance` in TypeScript 7.1.
+It excludes the separate compiler regression, project and editor test suites.
+
+Upstream mode reads case-insensitive directives, `@filename` sections and option
+matrices. It compares acceptance and diagnostic category under our strict defaults
+plus each case's explicit options, rather than reproducing upstream baselines.
+It checks types only; selecting more JIT profiles repeats the same check path.
+Use `--only TEXT` and `--limit N` for a subset. Reports retain the inventory,
+selection/completion counts, compiler options and raw outcomes.
+
+Multi-root or embedded-config projects, relaxed checking, JSX/JavaScript inputs and unsupported
+directives or wildcard option matrices report `SKIP`. Reference configuration or
+global diagnostics also skip source comparison, so removed targets cannot appear
+as native false acceptance. Declaration files are checked with `skipLibCheck=false`.
+Missing native features report `UNSUPPORTED`; other
+acceptance/category mismatches report `FAIL`. Oracle/process errors report `ERROR`
+and do not discard other cases. Skips and unsupported features are not passes.
+Exit status is 1 for compatibility failures and 2 for infrastructure errors or an
+all-skipped selection. The regular CI suite still uses the local fixtures.
 
 ## Allocation audit
 

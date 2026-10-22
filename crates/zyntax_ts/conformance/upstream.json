@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/microsoft/TypeScript",
+  "revision": "3e9236361fa97a9e6c685f4833ac457ae2d8c50a",
+  "compiler": "7.1.0-beta",
+  "archive_sha256": "2c3aa49f250e924ed28185a5b2f8c869b40a1d8e68337ee224bf14f4a46ce4ee",
+  "directory": "tsc/testdata/tests/cases/conformance",
+  "files": 5948,
+  "inventory_sha256": "f9ca7c982bb543dd13d93627aad3908c6ac7543d63245ee6fe676609590692c8"
+}

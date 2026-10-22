@@ -1,12 +1,18 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import tarfile
 import time
 import unittest
+from unittest import mock
+from types import SimpleNamespace
+
+from fetch_upstream import extract
 
 spec = importlib.util.spec_from_file_location("zynode_conformance", Path(__file__).with_name("run.py"))
 runner = importlib.util.module_from_spec(spec)
@@ -57,6 +63,80 @@ class HarnessTests(unittest.TestCase):
             path.write_text("case short\n")
             with self.assertRaises(ValueError):
                 runner.known_failures(path)
+
+    def test_upstream_directives_are_case_insensitive(self):
+        self.assertEqual(runner.option_variants({"STRICT": "true", "noemit": "true",
+                                                "noTypesAndSymbols": "true"}),
+                         [{"strict": True, "noEmit": True}])
+        with self.assertRaisesRegex(ValueError, "wildcard/exclusion"):
+            runner.option_variants({"target": "*, -es3"})
+
+    def test_reference_configuration_errors_are_not_native_mismatches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "case.ts"
+            source.write_text("const n=1;")
+            reference = {"accepted": False, "diagnostics": [{"code": 5108, "message": "removed option"}]}
+            with mock.patch.object(runner, "oracle", return_value=reference), mock.patch.object(runner, "native") as native:
+                rows = runner.execute_case(SimpleNamespace(live=True), {"id": "case"}, [source], {}, None, {})
+            self.assertEqual(rows[0]["status"], "SKIP")
+            native.assert_not_called()
+
+    def test_corpus_inventory_detects_content_and_path_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "case.ts"
+            source.write_text("const n = 1;")
+            pin = runner.inventory(root)
+            self.assertTrue(runner.verify(root, pin)["verified"])
+            source.rename(root / "renamed.ts")
+            with self.assertRaises(ValueError):
+                runner.verify(root, pin)
+            (root / "renamed.ts").rename(source)
+            source.write_text("const n = 2;")
+            with self.assertRaises(ValueError):
+                runner.verify(root, pin)
+
+    def test_corpus_archive_cannot_escape_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "sources.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                member = tarfile.TarInfo("TypeScript-revision/cases/../outside.ts")
+                member.size = 1
+                tar.addfile(member, io.BytesIO(b"x"))
+            destination = root / "corpus"
+            destination.mkdir()
+            with self.assertRaisesRegex(ValueError, "unsafe archive path"):
+                extract(archive, destination, {"revision": "revision", "directory": "cases"})
+            self.assertFalse((root / "outside.ts").exists())
+
+    def test_upstream_errors_and_skips_are_retained_per_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "case.ts"
+            source.write_text("const n = 1;")
+            args = SimpleNamespace(upstream=root)
+            with mock.patch.object(runner, "execute_case", side_effect=RuntimeError("oracle failed")):
+                result = runner.upstream_file(args, source)
+            self.assertEqual(result[0]["status"], "ERROR")
+            self.assertEqual(result[0]["reason"], "oracle failed")
+            with mock.patch.object(runner, "execute_case", side_effect=ValueError("invalid oracle JSON")):
+                result = runner.upstream_file(args, source)
+            self.assertEqual(result[0]["status"], "ERROR")
+            source.write_text("// @filename: ../outside.ts\nconst n = 1;")
+            result = runner.upstream_file(args, source)
+            self.assertEqual(result[0]["status"], "SKIP")
+            self.assertFalse((root.parent / "outside.ts").exists())
+            source.write_text('// @filename: tsconfig.json\n{"compilerOptions":{"strict":false}}\n// @filename: entry.ts\nconst n=1;')
+            with mock.patch.object(runner, "execute_case") as execute:
+                result = runner.upstream_file(args, source)
+            self.assertEqual(result[0]["status"], "SKIP")
+            self.assertIn("tsconfig", result[0]["reason"])
+            execute.assert_not_called()
+            source.write_text("// @filename: /project/main.ts\nconst n = 1;")
+            with mock.patch.object(runner, "execute_case", return_value=[]) as execute:
+                runner.upstream_file(args, source)
+            self.assertEqual(execute.call_args.args[2][0].parts[-2:], ("project", "main.ts"))
 
     def test_multifile_pins_hash_dependency_contents_and_relative_paths(self):
         with tempfile.TemporaryDirectory() as directory:
