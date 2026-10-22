@@ -24,6 +24,7 @@ use crate::{Error, ErrorKind, ModuleDependency, ModuleId, Options, Soundness};
 mod arrays;
 mod classes;
 mod generics;
+mod math;
 mod modules;
 mod namespaces;
 pub(crate) use modules::dependency_source;
@@ -1640,7 +1641,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn externs(&mut self) {
-        for (name, params, ret) in [
+        let math =
+            math::primitive_externs().map(|(name, arity)| (name, vec![number(); arity], number()));
+        let primitives = [
             ("$TS$print_number", vec![number()], unit()),
             ("$TS$pow", vec![number(), number()], number()),
             ("$TS$space", vec![], unit()),
@@ -1651,7 +1654,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$IO$format_bool", vec![boolean()], string()),
             ("$String$concat", vec![string(), string()], string()),
             ("$String$equals", vec![string(), string()], boolean()),
-        ] {
+        ]
+        .map(|(name, params, ret)| (name.to_string(), params, ret));
+        for (name, params, ret) in primitives.into_iter().chain(math) {
             let params = params
                 .into_iter()
                 .enumerate()
@@ -1668,12 +1673,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .collect();
             self.declarations.push(TypedNode::new(
                 TypedDeclaration::Function(TypedFunction {
-                    name: self.name(name),
+                    name: intern(&name),
                     params,
                     return_type: ret,
                     is_external: true,
                     calling_convention: CallingConvention::Cdecl,
-                    link_name: Some(self.name(name)),
+                    link_name: Some(intern(&name)),
                     ..Default::default()
                 }),
                 unit(),
@@ -2411,6 +2416,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
             js::Expression::NewExpression(n) => self.class_of_new(n),
+            js::Expression::ComputedMemberExpression(m) if !m.optional => {
+                self.element_view(&m.object)
+            }
             js::Expression::ThisExpression(t) => {
                 self.binding("this", t.span).ok().and_then(|b| b.view)
             }
@@ -3494,6 +3502,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if let Some(sig) = self.namespace_function(e)? {
                     return self.function_value(sig, at);
                 }
+                if let Some(constant) = self.math_constant(m) {
+                    return Ok(constant);
+                }
                 let object = self.expr(&m.object)?;
                 if element_type(&object.ty).is_some() && m.property.name == "length" {
                     return Ok(self.array_length(object, at));
@@ -3928,6 +3939,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if !m.optional {
+                if let Some(call) = self.math_call(c, m)? {
+                    return Ok(call);
+                }
                 if let Some(call) = self.method_call(c, m)? {
                     return Ok(call);
                 }

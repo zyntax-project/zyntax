@@ -106,7 +106,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(element.clone())
     }
     pub(super) fn check_array_element(&self, element: &Type, at: oxc_span::Span) -> Result<()> {
-        if is_scalar(element) || *element == string() || matches!(element, Type::TypeVar(_)) {
+        if is_scalar(element)
+            || *element == string()
+            || matches!(element, Type::TypeVar(_))
+            || self.is_class_instance(element)
+        {
             Ok(())
         } else {
             self.unsupported("arrays with this element ownership or representation", at)
@@ -326,6 +330,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .ok()
                 .and_then(|b| self.flow.integers.get(&b.name).copied()),
             js::Expression::ParenthesizedExpression(p) => self.integral(&p.expression),
+            js::Expression::BinaryExpression(b) if b.operator.as_str() == "+" => {
+                match (self.integral(&b.left)?, self.integral(&b.right)?) {
+                    (Integral::Constant(a), Integral::Constant(c))
+                        if a + c <= u64::from(u32::MAX) =>
+                    {
+                        Some(Integral::Constant(a + c))
+                    }
+                    _ => Some(Integral::Nonnegative),
+                }
+            }
             _ => None,
         }
     }
@@ -507,9 +521,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let js::BindingPattern::BindingIdentifier(id) = &d.id else {
             return None;
         };
-        if !matches!(self.integral(d.init.as_ref()?), Some(Integral::Constant(_))) {
-            return None;
-        }
+        self.integral(d.init.as_ref()?)?;
         let binding = self.binding(id.name.as_str(), id.span).ok()?;
         if !binding.mutable {
             return None;

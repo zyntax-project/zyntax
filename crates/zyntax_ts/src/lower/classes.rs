@@ -288,6 +288,30 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
+    /// The only class with this physical layout; layouts shared by several types are ambiguous.
+    pub(super) fn class_by_layout(&self, ty: &Type) -> Option<InternedString> {
+        let mut matching = self
+            .classes
+            .iter()
+            .filter(|(_, class)| class.ty == *ty)
+            .map(|(view, _)| *view);
+        let view = matching.next()?;
+        matching.next().is_none().then_some(view)
+    }
+
+    /// The class of `array[index]` when `array` is a variable of class-instance elements.
+    pub(super) fn element_view(&self, array: &js::Expression<'ast>) -> Option<InternedString> {
+        let js::Expression::Identifier(id) = array else {
+            return None;
+        };
+        let binding = self.binding(id.name.as_str(), id.span).ok()?;
+        self.class_by_layout(element_type(&binding.ty)?)
+    }
+
+    pub(super) fn is_class_instance(&self, ty: &Type) -> bool {
+        self.classes.values().any(|class| class.ty == *ty)
+    }
+
     fn class_key(&self, key: &js::PropertyKey<'ast>) -> Result<&'ast str> {
         match key {
             js::PropertyKey::StaticIdentifier(i) => Ok(i.name.as_str()),

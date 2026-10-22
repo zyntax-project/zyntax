@@ -1814,5 +1814,15 @@
     "id": "classes/error_args",
     "file": "cases/classes/error_args.ts",
     "mode": "check"
+  },
+  {
+    "id": "classes/nbody",
+    "file": "cases/classes/nbody.ts",
+    "mode": "run"
+  },
+  {
+    "id": "math/math",
+    "file": "cases/math/math.ts",
+    "mode": "run"
   }
 ]
