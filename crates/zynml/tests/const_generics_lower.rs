@@ -13,6 +13,8 @@ use zyntax_compiler::HirModule;
 use zyntax_compiler::hir::HirType;
 use zyntax_embed::ZyntaxRuntime;
 
+/// The lowered module before specialization, so a generic function nothing
+/// instantiates is still there as its template.
 fn lower(source: &str) -> HirModule {
     let grammar = Grammar2::from_source(ZYNML_GRAMMAR).expect("ZynML grammar should compile");
     let program = grammar
@@ -25,7 +27,7 @@ fn lower(source: &str) -> HirModule {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    rt.lower_typed_program(program, builtins)
+    rt.lower_typed_program_unspecialized(program, builtins)
         .expect("typed program should lower to HIR")
 }
 

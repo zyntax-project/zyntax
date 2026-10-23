@@ -416,8 +416,29 @@ impl ZyntaxRuntime {
     /// doubt.
     pub fn lower_typed_program(
         &self,
+        program: zyntax_typed_ast::TypedProgram,
+        builtins: indexmap::IndexMap<String, String>,
+    ) -> RuntimeResult<HirModule> {
+        self.lower_typed_program_with(program, builtins, true)
+    }
+
+    /// [`Self::lower_typed_program`] before specialization: generic
+    /// functions stay in the module as templates carrying their type and
+    /// const parameters, and no concrete instance is made. For inspecting
+    /// what lowering produced; the module is not ready to execute.
+    pub fn lower_typed_program_unspecialized(
+        &self,
+        program: zyntax_typed_ast::TypedProgram,
+        builtins: indexmap::IndexMap<String, String>,
+    ) -> RuntimeResult<HirModule> {
+        self.lower_typed_program_with(program, builtins, false)
+    }
+
+    fn lower_typed_program_with(
+        &self,
         mut program: zyntax_typed_ast::TypedProgram,
         builtins: indexmap::IndexMap<String, String>,
+        specialize: bool,
     ) -> RuntimeResult<HirModule> {
         use zyntax_compiler::lowering::{LoweringConfig, LoweringContext};
         use zyntax_typed_ast::{
@@ -825,6 +846,9 @@ impl ZyntaxRuntime {
 
         // Display lowering diagnostics (type inference warnings, etc.)
         lowering_ctx.display_diagnostics(&program);
+        if !specialize {
+            return Ok(hir_module);
+        }
 
         // Monomorphization
         let mono_start = web_time::Instant::now();
