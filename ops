@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792793657,"nonce":"blLQMs3qwDiEZrDZ7zidOO1FhFM=","message":"Landed in b3109ae0a7415399815f8b6537cec80dfe40cd37. gengc.lua and the isolated weak-table check pass on both tiers; Lua conformance (official, warm-up, stressed collector), Python and compiler suites pass.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792793657,"nonce":"MnOtlGSVuNkfejNxyFswbjPb03g=","status":2}]}
