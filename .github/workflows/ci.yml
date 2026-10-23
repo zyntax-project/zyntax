@@ -13,7 +13,7 @@ jobs:
   typescript-conformance:
     name: native TypeScript conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -22,19 +22,41 @@ jobs:
         with:
           node-version: '24'
       - name: Build native frontend
+        id: build
         run: cargo build -p zyntax_ts
       - name: Install pinned reference compiler
+        id: reference
         run: npm ci --prefix crates/zyntax_ts/conformance --ignore-scripts
       - name: Test harness and reference compiler API
         run: python3 -m unittest discover -s crates/zyntax_ts/conformance -p test_harness.py
       - name: Compare native execution with TypeScript and Node
         run: python3 crates/zyntax_ts/conformance/run.py --live
+      - name: Cache pinned official corpus
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.reference.outcome == 'success' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/typescript-conformance
+          key: typescript-corpus-${{ hashFiles('crates/zyntax_ts/conformance/upstream.json') }}
+      - name: Verify pinned official corpus
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.reference.outcome == 'success' }}
+        run: python3 crates/zyntax_ts/conformance/fetch_upstream.py "$RUNNER_TEMP/typescript-conformance"
+      - name: Check official TypeScript conformance regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.reference.outcome == 'success' }}
+        run: >-
+          python3 crates/zyntax_ts/conformance/run.py
+          --upstream "$RUNNER_TEMP/typescript-conformance"
+          --upstream-pin crates/zyntax_ts/conformance/upstream.json
+          --regression-baseline crates/zyntax_ts/conformance/upstream-baseline.json
+          --jobs 4 --profile baseline
+          --out "$RUNNER_TEMP/typescript-upstream-results.json"
       - name: Retain conformance report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: typescript-conformance
-          path: crates/zyntax_ts/conformance/results.json
+          path: |
+            crates/zyntax_ts/conformance/results.json
+            ${{ runner.temp }}/typescript-upstream-results.json
 
   lint:
     name: fmt + clippy

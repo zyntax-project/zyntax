@@ -244,5 +244,94 @@ class ReferenceTests(unittest.TestCase):
             self.assertIn("boom", result["stderr"])
 
 
+class OfficialRegressionTests(unittest.TestCase):
+    def report(self):
+        return {
+            "corpus": {"verified": True, "files": 2, "source_files": 2, "selected_files": 2,
+                       "completed_files": 2, "repository": "official", "revision": "pinned",
+                       "compiler": "pinned", "inventory_sha256": "inventory", "defaults": {}, "mode": "check"},
+            "profiles": ["baseline"], "live_reference": True, "reference_compiler": "pinned",
+            "results": [self.row("a.ts#0", "PASS"), self.row("b.ts#0", "UNSUPPORTED")],
+        }
+
+    def row(self, name, status):
+        return {"case": name, "status": status, "corpus_source_sha256": name,
+                "reference": {"accepted": True, "kind": "Accept", "options": {}},
+                "native_check": {"code": 0 if status == "PASS" else 3, "stderr": ""}}
+
+    def test_improvements_pass_without_baseline_refresh(self):
+        from upstream_baseline import snapshot, regressions
+        report = self.report()
+        baseline = snapshot(report)
+        report["results"][1] = self.row("b.ts#0", "PASS")
+        self.assertEqual(regressions(report, baseline), [])
+
+    def test_aggregate_improvement_does_not_hide_lost_pass(self):
+        from upstream_baseline import snapshot, regressions
+        report = self.report()
+        baseline = snapshot(report)
+        report["results"] = [self.row("a.ts#0", "UNSUPPORTED"), self.row("b.ts#0", "PASS")]
+        self.assertEqual(regressions(report, baseline), ["a.ts#0: PASS -> UNSUPPORTED"])
+
+    def test_mismatch_cannot_turn_into_false_acceptance_or_unsupported(self):
+        from upstream_baseline import snapshot, regressions
+        report = self.report()
+        row = report["results"][1]
+        row.update(status="FAIL", reference={"accepted": False, "kind": "Type", "options": {}},
+                   native_check={"code": 1, "stderr": '{"kind":"Syntax"}'})
+        baseline = snapshot(report)
+        row["native_check"]["code"] = 0
+        self.assertEqual(regressions(report, baseline), ["b.ts#0: FAIL:Syntax -> FAIL:accept"])
+        row["status"] = "UNSUPPORTED"
+        row["native_check"]["code"] = 3
+        self.assertTrue(regressions(report, baseline))
+
+    def test_partial_runs_and_wrong_profile_are_refused(self):
+        from upstream_baseline import snapshot
+        for key, value in [("selected_files", 1), ("completed_files", 1), ("verified", False)]:
+            report = self.report()
+            report["corpus"][key] = value
+            with self.assertRaises(ValueError):
+                snapshot(report)
+        report = self.report()
+        report["profiles"] = ["interpreter", "baseline"]
+        with self.assertRaises(ValueError):
+            snapshot(report)
+        report = self.report()
+        report["results"].pop()
+        with self.assertRaises(ValueError):
+            snapshot(report)
+
+    def test_crashes_errors_and_duplicate_cases_cannot_be_baselined(self):
+        from upstream_baseline import snapshot
+        for code in (None, -11, 101, 1):
+            report = self.report()
+            report["results"][1].update(status="FAIL", native_check={"code": code, "stderr": ""})
+            with self.assertRaises(ValueError):
+                snapshot(report)
+        report = self.report()
+        report["results"][1]["status"] = "ERROR"
+        with self.assertRaises(ValueError):
+            snapshot(report)
+        report = self.report()
+        report["results"].append(report["results"][0])
+        with self.assertRaises(ValueError):
+            snapshot(report)
+
+    def test_corpus_options_or_reference_changes_require_review(self):
+        from upstream_baseline import snapshot, regressions
+        for change in ("revision", "options", "reference"):
+            report = self.report()
+            baseline = snapshot(report)
+            if change == "revision":
+                report["corpus"]["revision"] = "different"
+            elif change == "options":
+                report["results"][0]["reference"]["options"]["strict"] = False
+            else:
+                report["results"][0]["reference"]["kind"] = "Type"
+            with self.assertRaises(ValueError):
+                regressions(report, baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

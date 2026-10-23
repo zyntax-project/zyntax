@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 from fetch_upstream import inventory, verify
+from upstream_baseline import regressions
 
 ROOT = Path(__file__).resolve().parent
 PROFILES = ("interpreter", "baseline", "llvm")
@@ -298,6 +299,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--upstream", type=Path, help="TypeScript repository's tests/cases/conformance directory")
     parser.add_argument("--upstream-pin", type=Path, help="verify corpus provenance against a pin (upstream.json)")
+    parser.add_argument("--regression-baseline", type=Path, help="gate a complete official run against reviewed per-case outcomes")
     parser.add_argument("--jobs", type=int, default=1, help="parallel upstream checker processes")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--out", type=Path, default=ROOT / "results.json")
@@ -306,6 +308,8 @@ def main():
         parser.error("timeout, jobs and limit must be positive")
     if args.upstream_pin and not args.upstream:
         parser.error("--upstream-pin requires --upstream")
+    if args.regression_baseline and (not args.upstream_pin or args.only or args.limit):
+        parser.error("--regression-baseline requires the complete pinned upstream corpus")
     args.profile = args.profile or ["interpreter", "baseline"]
     args.zynode = args.zynode.resolve()
     if not args.zynode.is_file():
@@ -361,12 +365,24 @@ def main():
               "counts": counts, "results": rows}
     if corpus is not None:
         report["corpus"] = corpus
+    if args.regression_baseline:
+        try:
+            report["regressions"] = regressions(report, json.loads(args.regression_baseline.read_text()))
+        except ValueError as error:
+            report["regression_error"] = str(error)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     if hashlib.sha256(args.zynode.read_bytes()).hexdigest() != binary_hash:
         raise RuntimeError("native executable changed during the conformance run")
     print(json.dumps(counts, sort_keys=True))
+    if report.get("regression_error"):
+        print("regression gate error: " + report["regression_error"], file=sys.stderr)
+        return 2
     if counts.get("ERROR") or all(row["status"] == "SKIP" for row in rows):
         return 2
+    if args.regression_baseline:
+        for regression in report["regressions"]:
+            print("REGRESSION " + regression)
+        return int(bool(report["regressions"]))
     return int(any(counts.get(name, 0) for name in ("FAIL", "UNSUPPORTED", "XPASS")))
 
 

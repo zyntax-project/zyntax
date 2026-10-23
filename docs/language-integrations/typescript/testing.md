@@ -63,6 +63,7 @@ python3 crates/zyntax_ts/conformance/fetch_upstream.py /tmp/typescript-conforman
 python3 crates/zyntax_ts/conformance/run.py \
   --upstream /tmp/typescript-conformance \
   --upstream-pin crates/zyntax_ts/conformance/upstream.json \
+  --regression-baseline crates/zyntax_ts/conformance/upstream-baseline.json \
   --jobs 4 --profile baseline --out /tmp/ts-upstream.json
 ```
 
@@ -85,8 +86,25 @@ as native false acceptance. Declaration files are checked with `skipLibCheck=fal
 Missing native features report `UNSUPPORTED`; other
 acceptance/category mismatches report `FAIL`. Oracle/process errors report `ERROR`
 and do not discard other cases. Skips and unsupported features are not passes.
-Exit status is 1 for compatibility failures and 2 for infrastructure errors or an
-all-skipped selection. The regular CI suite still uses the local fixtures.
+Without a regression baseline, exit status is 1 for compatibility failures and 2
+for infrastructure errors or an all-skipped selection.
+
+CI runs the complete pinned official corpus on every pull request and main push,
+alongside the local execution fixtures. `--regression-baseline` checks reviewed
+outcomes per case: a new pass is allowed; any other verdict change fails. Known
+failures, unsupported features and skips remain visible in the uploaded report;
+they are not compatibility passes. Crashes, timeouts, oracle errors, partial runs
+and changed corpus/options coverage cannot pass the gate. Aggregate improvements
+cannot hide a lost pass in another case.
+
+Run the complete official corpus after frontend or shared compiler changes.
+Inspect changes and record outstanding gaps in git-bug before refreshing the
+reviewed baseline. CI never refreshes it automatically:
+
+```sh
+python3 crates/zyntax_ts/conformance/upstream_baseline.py /tmp/ts-upstream.json \
+  --write-baseline crates/zyntax_ts/conformance/upstream-baseline.json
+```
 
 ## Allocation audit
 
