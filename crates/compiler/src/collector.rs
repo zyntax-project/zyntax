@@ -639,6 +639,65 @@ fn clear_stack_below_now(bytes: usize) {
     }
 }
 
+thread_local! {
+    /// Stack ranges collections do not read, by key: an interpreted
+    /// frame's own storage while it waits on a call. Its live values are
+    /// rooted exactly through its registers then; the rest of that
+    /// storage is temporaries it will not read again.
+    static HIDDEN: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static NEXT_HIDDEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Leave `lo..hi` of the calling thread's stacks out of collections
+/// until [`show_stack`] is called with the key returned. Keyed rather
+/// than nested: a fiber switch can end ranges out of order.
+pub fn hide_stack(lo: usize, hi: usize) -> usize {
+    let key = NEXT_HIDDEN.with(|n| {
+        let k = n.get();
+        n.set(k.wrapping_add(1));
+        k
+    });
+    HIDDEN.with(|h| h.borrow_mut().push((key, lo, hi)));
+    key
+}
+
+/// Read again the range [`hide_stack`] returned `key` for.
+pub fn show_stack(key: usize) {
+    HIDDEN.with(|h| {
+        let mut h = h.borrow_mut();
+        if let Some(i) = h.iter().rposition(|&(k, _, _)| k == key) {
+            h.swap_remove(i);
+        }
+    });
+}
+
+/// `windows` less the hidden ranges.
+fn without_hidden(windows: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let hidden: Vec<(usize, usize)> =
+        HIDDEN.with(|h| h.borrow().iter().map(|&(_, lo, hi)| (lo, hi)).collect());
+    let mut out = windows;
+    for (hlo, hhi) in hidden {
+        out = out
+            .into_iter()
+            .flat_map(|(lo, hi)| {
+                if hhi <= lo || hlo >= hi {
+                    return vec![(lo, hi)];
+                }
+                let mut parts = Vec::new();
+                if lo < hlo {
+                    parts.push((lo, hlo));
+                }
+                if hhi < hi {
+                    parts.push((hhi, hi));
+                }
+                parts
+            })
+            .collect();
+    }
+    out
+}
+
 /// An address just below the caller's frame.
 #[inline(never)]
 pub fn stack_mark() -> usize {
@@ -1707,6 +1766,7 @@ fn collect_from(sp: usize) {
         }
         return;
     }
+    let windows = without_hidden(windows);
     update(|l| l.collecting = true);
     let started = web_time::Instant::now();
     let mut reg = registry();

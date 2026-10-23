@@ -955,6 +955,40 @@ struct FrameView {
     cf: *const CompiledFunction,
 }
 
+/// The stack pointer of the calling function, or 0 where it cannot be
+/// read.
+#[inline(always)]
+fn stack_pointer() -> usize {
+    let sp: usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads the stack-pointer register.
+    unsafe {
+        std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reads the stack-pointer register.
+    unsafe {
+        std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        sp = 0;
+    }
+    sp
+}
+
+/// The innermost interpreted frame's storage, hidden from collections
+/// until this drops; see [`HirInterpreter::away`].
+struct Away(Option<usize>);
+
+impl Drop for Away {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            crate::collector::show_stack(key);
+        }
+    }
+}
+
 /// Storage a frame took for itself: the blocks it owns until it
 /// finishes, as a stack frame owns its slots. A block may be named by
 /// nothing else once the register that held it is reused, so the list
@@ -3157,6 +3191,9 @@ pub struct HirInterpreter {
     /// frame has taken below that.
     run_top: usize,
     frame_extent: usize,
+    /// Where each running interpreted frame's storage ends above: the
+    /// stack pointer of `run` as it calls `run_frame`, innermost last.
+    frame_tops: Vec<usize>,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
     /// The call shape of each function called so far, with the thunk
@@ -3297,6 +3334,7 @@ impl HirInterpreter {
             waiting_marks: Vec::new(),
             run_top: 0,
             frame_extent: 0,
+            frame_tops: Vec::new(),
             thunks: HashMap::new(),
             shapes: IdMap::default(),
             address_taken: HashMap::new(),
@@ -3746,7 +3784,9 @@ impl HirInterpreter {
                     _ => JitRet::Int,
                 },
             };
+            let away = self.away();
             let raw = call_jit_dispatch(dispatch, args);
+            drop(away);
             return Ok(match raw {
                 ZyntaxValue::Int(i) => value_from_i64_as(&sig.ret, i),
                 other => other,
@@ -3785,11 +3825,13 @@ impl HirInterpreter {
         // SAFETY: the thunk was compiled for exactly this shape, `words`
         // holds one word per parameter, and `out_ptr` has room for the
         // result the shape describes.
+        let away = self.away();
         unsafe {
             let f: extern "C" fn(*const u8, *const u64, *mut u8) =
                 core::mem::transmute(thunk as *const u8);
             f(entry, words.as_ptr(), out_ptr);
         }
+        drop(away);
         if trace_enabled() {
             eprintln!("[interp] native {entry:?} {sig:?} {args:?}");
         }
@@ -4117,7 +4159,9 @@ impl HirInterpreter {
             crate::collector::clear_stack_below(self.frame_extent);
             self.run_top = crate::collector::stack_mark();
         }
+        self.frame_tops.push(stack_pointer());
         let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
+        self.frame_tops.pop();
         if let Err(e) = &result
             && trace_enabled()
         {
@@ -4192,6 +4236,25 @@ impl HirInterpreter {
                 "ZYNTAX_CHECK_ERROR_FLAG: `{name}` entered with the error flag set ({value:#x})"
             );
             std::process::abort();
+        }
+    }
+
+    /// Hide the innermost interpreted frame's storage, from the caller's
+    /// stack pointer up, while control is away in a call. The frame's
+    /// live values are rooted exactly through its registers then, and a
+    /// temporary left in its storage would hold what the program dropped.
+    /// Only where stale words are visible to the program (weak entries,
+    /// finalizers); call it right at the transfer, after any argument is
+    /// made, so nothing new is only held there.
+    #[inline(always)]
+    fn away(&self) -> Away {
+        if !crate::collector::clears_dead_frames() {
+            return Away(None);
+        }
+        let sp = stack_pointer();
+        match self.frame_tops.last() {
+            Some(&top) if sp != 0 && sp < top => Away(Some(crate::collector::hide_stack(sp, top))),
+            _ => Away(None),
         }
     }
 
@@ -5239,7 +5302,9 @@ impl HirInterpreter {
                         }
                         _ => core::ptr::null_mut(),
                     };
+                    let away = self.away();
                     let ret = self.call_by_id(module, *fn_id, arg_vals, callee_dest);
+                    drop(away);
                     crate::collector::clear_dead_frames();
                     for b in boxes {
                         self.memory.free(b);
@@ -5435,7 +5500,10 @@ impl HirInterpreter {
                     // A host dispatcher (wasm) resolves the handle itself;
                     // otherwise the handle is native code.
                     let result = if let Some(target) = own {
-                        self.call_by_id(module, target, arg_vals, core::ptr::null_mut())?
+                        let away = self.away();
+                        let ret = self.call_by_id(module, target, arg_vals, core::ptr::null_mut());
+                        drop(away);
+                        ret?
                     } else if let Some(dispatcher) = self.indirect_call_dispatcher.as_mut() {
                         dispatcher(handle, arg_vals)?
                     } else {

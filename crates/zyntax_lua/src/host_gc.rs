@@ -367,6 +367,23 @@ fn report_survivors(s: &State, m: &dyn Marking) {
             }
         }
     }
+    // A weak value the program no longer holds stays only if something
+    // else reached it.
+    for (&t, w) in &s.weak {
+        if w.mode & WEAK_VALUES == 0 || !m.is_marked(t) {
+            continue;
+        }
+        // SAFETY: reached, so live; the world is stopped.
+        let t = unsafe { &*(t as *const TableHeader) };
+        if let Some(list) = unsafe { list_of(t.arr) } {
+            for &v in unsafe { elements(list) }.iter() {
+                // SAFETY: an element of a reached table is null or a live box.
+                if let Some(r) = unsafe { referent(v) } {
+                    report("weak value", r);
+                }
+            }
+        }
+    }
 }
 
 /// The last step: dead keys become tombstones, and weak values of
