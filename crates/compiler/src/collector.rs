@@ -1690,12 +1690,21 @@ pub fn collect() {
 #[inline(never)]
 fn collect_from(sp: usize) {
     let host_top = host_stack_top();
-    if host_top <= sp {
-        // No way to bound the stack; leave the heap as it is.
+    // The stacks to read: the host's from where its code stopped, and
+    // each running fiber's, which may lie anywhere in the address space.
+    let backend = crate::fiber_backend::installed_fiber_backend();
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    match backend {
+        Some(backend) => backend.stack_windows(sp, host_top, &mut |lo, hi| windows.push((lo, hi))),
+        None => windows.push((sp, host_top)),
+    }
+    if !windows.iter().any(|&(lo, hi)| hi == host_top && lo < hi) {
+        // No way to bound the host's stack; leave the heap as it is. The
+        // budget stays spent, so the next allocation that needs fresh
+        // storage asks again, from wherever it runs then.
         if trace() {
             eprintln!("[gc] skipped: the stack's extent is unknown");
         }
-        update(|l| l.budget = usize::MAX);
         return;
     }
     update(|l| l.collecting = true);
@@ -1721,13 +1730,8 @@ fn collect_from(sp: usize) {
         let free_walked_at = started.elapsed();
 
         // Roots: the stacks, the globals, what the fiber runtime holds.
-        let mut windows: Vec<(usize, usize)> = Vec::new();
-        match crate::fiber_backend::installed_fiber_backend() {
-            Some(backend) => {
-                backend.stack_windows(sp, host_top, &mut |lo, hi| windows.push((lo, hi)));
-                backend.held_addresses(&mut |a| marker.consider(a));
-            }
-            None => windows.push((sp, host_top)),
+        if let Some(backend) = backend {
+            backend.held_addresses(&mut |a| marker.consider(a));
         }
         if trace_detail() {
             eprintln!(

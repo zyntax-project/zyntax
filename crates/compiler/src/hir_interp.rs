@@ -639,6 +639,9 @@ pub enum Op {
         payload_ty: u32,
         tag: u64,
         tag_ty: Option<u32>,
+        /// The frame's block this op writes each time it runs, or
+        /// `u32::MAX` for fresh storage at every run.
+        slot: u32,
     },
     UnionPayload {
         dst: Reg,
@@ -918,6 +921,9 @@ pub struct CompiledFunction {
     /// Which function each `FuncRef` result names, so a call that
     /// hands one straight to a runtime entry can name the callee.
     pub func_refs: HashMap<HirId, HirId>,
+    /// Blocks a frame keeps for the unions it rebuilds in place, one per
+    /// `MakeUnion` with a slot.
+    pub union_slots: u32,
 }
 
 /// Bytes of stack [`clear_stack_below`] zeroes.
@@ -1434,6 +1440,9 @@ pub fn compile_function_with(
         set_bit(&mut always, *r as usize);
     }
     let mut read_sets = live_across_calls(func, &reg_of, &always);
+    let union_slot_of: HashMap<HirId, u32> =
+        confined_unions(func).into_iter().zip(0u32..).collect();
+    cf.union_slots = union_slot_of.len() as u32;
     // Each call's ops, with the read set in force while they run.
     let mut call_ops: Vec<(usize, usize, u32)> = Vec::new();
 
@@ -1478,7 +1487,7 @@ pub fn compile_function_with(
         // Lower each instruction.
         for (i, inst) in block.instructions.iter().enumerate() {
             let first = cf.code.len();
-            lower_inst(inst, &mut cf, &reg_of, &const_ints)?;
+            lower_inst(inst, &mut cf, &reg_of, &const_ints, &union_slot_of)?;
             if let Some(read) = read_sets.remove(&(*bid, i)) {
                 call_ops.push((first, cf.code.len(), cf.read_sets.len() as u32));
                 cf.read_sets.push(read);
@@ -1739,6 +1748,72 @@ fn live_across_calls(
     sets
 }
 
+/// The unions made in `func` whose value never outlives the run of the
+/// op that made it: read only for its tag and payload, directly or
+/// through a `select` read only that way. Nothing holds one past its
+/// last read, so the op can rebuild it in the same storage each time it
+/// runs; a union that reaches a phi, a call, a store or a terminator
+/// takes fresh storage instead.
+fn confined_unions(func: &HirFunction) -> Vec<HirId> {
+    enum Use {
+        Read,
+        Select(HirId),
+        Escapes,
+    }
+    let mut uses: HashMap<HirId, Vec<Use>> = HashMap::new();
+    let mut made = Vec::new();
+    for block in func.blocks.values() {
+        for phi in &block.phis {
+            for (v, _) in &phi.incoming {
+                uses.entry(*v).or_default().push(Use::Escapes);
+            }
+        }
+        for inst in &block.instructions {
+            match inst {
+                HirInstruction::CreateUnion { result, value, .. } => {
+                    made.push(*result);
+                    uses.entry(*value).or_default().push(Use::Escapes);
+                }
+                HirInstruction::GetUnionDiscriminant { union_val, .. }
+                | HirInstruction::ExtractUnionValue { union_val, .. } => {
+                    uses.entry(*union_val).or_default().push(Use::Read);
+                }
+                HirInstruction::Select {
+                    result,
+                    condition,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    uses.entry(*condition).or_default().push(Use::Escapes);
+                    uses.entry(*true_val)
+                        .or_default()
+                        .push(Use::Select(*result));
+                    uses.entry(*false_val)
+                        .or_default()
+                        .push(Use::Select(*result));
+                }
+                other => other.for_each_operand(|v| uses.entry(v).or_default().push(Use::Escapes)),
+            }
+        }
+        block
+            .terminator
+            .for_each_operand(|v| uses.entry(v).or_default().push(Use::Escapes));
+    }
+    fn confined(v: HirId, uses: &HashMap<HirId, Vec<Use>>, depth: u32) -> bool {
+        depth < 8
+            && uses.get(&v).is_none_or(|us| {
+                us.iter().all(|u| match u {
+                    Use::Read => true,
+                    Use::Select(r) => confined(*r, uses, depth + 1),
+                    Use::Escapes => false,
+                })
+            })
+    }
+    made.retain(|u| confined(*u, &uses, 0));
+    made
+}
+
 fn inst_result(inst: &HirInstruction) -> Option<HirId> {
     match inst {
         HirInstruction::Binary { result, .. }
@@ -1782,6 +1857,7 @@ fn lower_inst(
     cf: &mut CompiledFunction,
     reg_of: &HashMap<HirId, Reg>,
     const_ints: &HashMap<HirId, i64>,
+    union_slot_of: &HashMap<HirId, u32>,
 ) -> Result<(), InterpError> {
     let reg = |id: HirId| -> Result<Reg, InterpError> {
         reg_of
@@ -1958,6 +2034,7 @@ fn lower_inst(
                 payload_ty,
                 tag: variant.discriminant,
                 tag_ty,
+                slot: union_slot_of.get(result).copied().unwrap_or(u32::MAX),
             });
         }
         HirInstruction::GetUnionDiscriminant { result, union_val } => {
@@ -4148,6 +4225,8 @@ impl HirInterpreter {
         // The registers hold pointers the collector cannot see on any
         // stack; they are a root for as long as the frame runs here.
         let mut roots = FrameRoots::new(&regs, cf);
+        // The storage each slotted `MakeUnion` rewrites, taken at its first run.
+        let mut union_blocks = vec![std::ptr::null_mut::<u8>(); cf.union_slots as usize];
 
         // Bind params into regs[0..n_params].
         for (i, a) in args.into_iter().enumerate() {
@@ -4537,8 +4616,20 @@ impl HirInterpreter {
                     payload_ty,
                     tag,
                     tag_ty,
+                    slot,
                 } => {
-                    let ptr = self.frame_alloc(scratch, *size as usize);
+                    let ptr = match union_blocks.get_mut(*slot as usize) {
+                        Some(held) if !held.is_null() => {
+                            // SAFETY: the frame took `size` bytes for this op.
+                            unsafe { std::ptr::write_bytes(*held, 0, *size as usize) };
+                            *held
+                        }
+                        Some(held) => {
+                            *held = self.frame_alloc(scratch, *size as usize);
+                            *held
+                        }
+                        None => self.frame_alloc(scratch, *size as usize),
+                    };
                     if let Some(ty) = tag_ty {
                         unsafe {
                             write_typed(ptr, &ZyntaxValue::UInt(*tag), &cf.type_pool[*ty as usize]);

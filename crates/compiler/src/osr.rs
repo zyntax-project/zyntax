@@ -1617,6 +1617,9 @@ fn layout_supports(inst: &crate::hir::HirInstruction) -> bool {
             | I::Select { .. }
             | I::ExtractValue { .. }
             | I::InsertValue { .. }
+            | I::CreateUnion { .. }
+            | I::GetUnionDiscriminant { .. }
+            | I::ExtractUnionValue { .. }
             | I::Call { .. }
             | I::CallClosure { .. }
             | I::VectorSplat { .. }

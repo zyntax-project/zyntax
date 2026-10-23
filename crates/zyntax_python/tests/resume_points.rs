@@ -81,6 +81,33 @@ fn a_frame_leaves_an_inner_loop_the_outer_pass_reads_around() {
     );
 }
 
+/// A loop whose passes make and read optional values, here the next
+/// item of a generator it drains, still has a resume point, and the
+/// frame leaves the interpreter through it.
+#[test]
+fn a_loop_draining_a_generator_leaves_the_interpreter() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generator_loop.py");
+    let output = Command::new(env!("CARGO_BIN_EXE_zypy"))
+        .arg("run")
+        .arg(script)
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .output()
+        .expect("zypy starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "600030000");
+    assert!(
+        stderr.contains("[interp] transfer site="),
+        "the frame never left through a resume point:\n{}",
+        stderr
+            .lines()
+            .filter(|l| l.contains("header"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// The frame resumed into the outlined region moves on to the
 /// optimizing tier mid-loop: the region is compiled there too, and its
 /// resume points answer the probes of the region's baseline code.
