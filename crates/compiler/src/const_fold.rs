@@ -91,9 +91,7 @@ pub fn fold_function(func: &mut HirFunction) -> FoldStats {
     stats
 }
 
-/// A select on a known condition is the value it picks, and a boolean
-/// `and` or `or` with one known operand is that operand or the other:
-/// every use reads that value instead, and the instruction goes.
+/// Identity casts and decided boolean operations forward their operands.
 fn forward_decided(func: &mut HirFunction) -> usize {
     let known = |id: HirId| match func.values.get(&id).map(|v| &v.kind) {
         Some(HirValueKind::Constant(HirConstant::Bool(b))) => Some(*b),
@@ -104,6 +102,14 @@ fn forward_decided(func: &mut HirFunction) -> usize {
     for block in func.blocks.values() {
         for inst in &block.instructions {
             let pick = match inst {
+                HirInstruction::Cast {
+                    op: CastOp::Bitcast,
+                    result,
+                    operand,
+                    ty,
+                } if func.values.get(operand).is_some_and(|v| &v.ty == ty) => {
+                    Some((*result, *operand))
+                }
                 HirInstruction::Select {
                     result,
                     condition,
@@ -758,6 +764,56 @@ mod tests {
     fn push(f: &mut HirFunction, inst: HirInstruction) {
         let entry = f.entry_block;
         f.blocks.get_mut(&entry).unwrap().instructions.push(inst);
+    }
+
+    #[test]
+    fn forwarding_identity_casts_preserves_real_bitcasts() {
+        let mut f = mk_func(HirType::I64);
+        let operand = HirId::new();
+        f.signature.params.push(crate::hir::HirParam {
+            id: operand,
+            name: InternedString::new_global("value"),
+            ty: HirType::F64,
+            attributes: Default::default(),
+            ownership: Default::default(),
+        });
+        f.values.insert(
+            operand,
+            HirValue {
+                id: operand,
+                ty: HirType::F64,
+                kind: HirValueKind::Parameter(0),
+                span: None,
+            },
+        );
+        let same = add_inst_result(&mut f, HirType::F64);
+        let bits = add_inst_result(&mut f, HirType::I64);
+        push(
+            &mut f,
+            HirInstruction::Cast {
+                op: CastOp::Bitcast,
+                result: same,
+                operand,
+                ty: HirType::F64,
+            },
+        );
+        push(
+            &mut f,
+            HirInstruction::Cast {
+                op: CastOp::Bitcast,
+                result: bits,
+                operand: same,
+                ty: HirType::I64,
+            },
+        );
+        f.blocks.get_mut(&f.entry_block).unwrap().terminator =
+            HirTerminator::Return { values: vec![bits] };
+        fold_function(&mut f);
+        let instructions = &f.blocks[&f.entry_block].instructions;
+        assert_eq!(instructions.len(), 1);
+        assert!(
+            matches!(&instructions[0], HirInstruction::Cast { op: CastOp::Bitcast, operand: source, ty: HirType::I64, .. } if *source == operand)
+        );
     }
 
     #[test]

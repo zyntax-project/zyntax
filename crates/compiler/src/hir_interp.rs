@@ -5599,7 +5599,15 @@ fn eval_cast(op: CastOp, o: ZyntaxValue, ty: &HirType) -> Result<ZyntaxValue, In
             (_, Some(n)) => Ok(ZyntaxValue::Pointer(n as *mut u8)),
             _ => Ok(o),
         },
-        CastOp::Trunc | CastOp::ZExt | CastOp::SExt | CastOp::Bitcast => {
+        CastOp::Bitcast => {
+            let bits = match &o {
+                ZyntaxValue::Float(value) => Some(value.to_bits() as i64),
+                ZyntaxValue::F32(value) => Some(value.to_bits() as i64),
+                _ => raw_i64,
+            };
+            Ok(bits.map_or(o, |bits| value_from_i64_as(ty, bits)))
+        }
+        CastOp::Trunc | CastOp::ZExt | CastOp::SExt => {
             if let Some(n) = raw_i64 {
                 Ok(value_from_i64_as(ty, n))
             } else {
@@ -6451,6 +6459,54 @@ mod tests {
     };
     use std::collections::HashSet;
     use zyntax_typed_ast::InternedString;
+
+    #[test]
+    fn float_bitcasts_preserve_bits_and_identity() {
+        for bits in [
+            0,
+            (-0.0_f64).to_bits(),
+            1.5_f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            0x7ff8_1234_5678_9abc,
+        ] {
+            let value = ZyntaxValue::Float(f64::from_bits(bits));
+            let ZyntaxValue::Float(same) =
+                eval_cast(CastOp::Bitcast, value.clone(), &HirType::F64).unwrap()
+            else {
+                panic!("expected float")
+            };
+            assert_eq!(same.to_bits(), bits);
+            assert_eq!(
+                eval_cast(CastOp::Bitcast, value, &HirType::U64).unwrap(),
+                ZyntaxValue::UInt(bits)
+            );
+            let ZyntaxValue::Float(back) =
+                eval_cast(CastOp::Bitcast, ZyntaxValue::UInt(bits), &HirType::F64).unwrap()
+            else {
+                panic!("expected float")
+            };
+            assert_eq!(back.to_bits(), bits);
+        }
+        for bits in [
+            0,
+            (-0.0_f32).to_bits(),
+            1.5_f32.to_bits(),
+            f32::INFINITY.to_bits(),
+            0x7fc0_1234,
+        ] {
+            let value = ZyntaxValue::F32(f32::from_bits(bits));
+            let ZyntaxValue::F32(same) =
+                eval_cast(CastOp::Bitcast, value.clone(), &HirType::F32).unwrap()
+            else {
+                panic!("expected float")
+            };
+            assert_eq!(same.to_bits(), bits);
+            assert_eq!(
+                eval_cast(CastOp::Bitcast, value, &HirType::U32).unwrap(),
+                ZyntaxValue::U32(bits)
+            );
+        }
+    }
 
     fn mk_fn(name: &str, params: Vec<HirType>, returns: Vec<HirType>) -> HirFunction {
         let sig = HirFunctionSignature {
