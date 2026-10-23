@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2554,
+      "start": 56,
+      "length": 1,
+      "file": "optional_count_error.ts",
+      "message": "Expected 1-2 arguments, but got 0."
+    }
+  ],
+  "source_sha256": "d91b35100a6ca87e5c5d75de0c905617e4163f6ac9c07b7498603ebcaca42625",
+  "options": {}
+}

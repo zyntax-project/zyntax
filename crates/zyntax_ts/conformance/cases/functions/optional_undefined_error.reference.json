@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 18048,
+      "start": 40,
+      "length": 1,
+      "file": "optional_undefined_error.ts",
+      "message": "'b' is possibly 'undefined'."
+    }
+  ],
+  "source_sha256": "fdd4a9315194590c6ab8105c4ab2e9bb2453e7ca45d9f46361ff7e45f771f98f",
+  "options": {}
+}

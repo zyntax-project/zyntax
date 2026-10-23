@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1016,
+      "start": 23,
+      "length": 1,
+      "file": "required_after_optional_error.ts",
+      "message": "A required parameter cannot follow an optional parameter."
+    }
+  ],
+  "source_sha256": "86c2435a6bf32dd1fba01f441a9dc72a11013526d4473ab9825e6a90b62e1c66",
+  "options": {}
+}

@@ -524,6 +524,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 interface.views.insert(name, Arc::clone(view));
             }
         }
+        if interface
+            .functions
+            .values()
+            .any(|f| self.arities.contains_key(&f.native))
+        {
+            return self.unsupported(
+                "exported functions with optional, default or rest parameters",
+                program.span,
+            );
+        }
         let public: FxHashSet<_> = interface
             .functions
             .iter()

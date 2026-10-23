@@ -280,6 +280,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if !signature.type_params.is_empty() {
             return self.unsupported("generic function values", at);
         }
+        if self.arities.contains_key(&signature.native) {
+            return self.unsupported(
+                "function values with optional, default or rest parameters",
+                at,
+            );
+        }
         let ret = signature
             .ret
             .as_ref()

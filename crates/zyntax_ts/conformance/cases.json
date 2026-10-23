@@ -2469,5 +2469,40 @@
     "id": "objects/string_keys",
     "file": "cases/objects/string_keys.ts",
     "mode": "run"
+  },
+  {
+    "id": "functions/optional_parameters",
+    "file": "cases/functions/optional_parameters.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/default_parameters",
+    "file": "cases/classes/default_parameters.ts",
+    "mode": "run"
+  },
+  {
+    "id": "functions/optional_count_error",
+    "file": "cases/functions/optional_count_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "functions/default_count_error",
+    "file": "cases/functions/default_count_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "functions/optional_undefined_error",
+    "file": "cases/functions/optional_undefined_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "functions/rest_argument_error",
+    "file": "cases/functions/rest_argument_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "functions/required_after_optional_error",
+    "file": "cases/functions/required_after_optional_error.ts",
+    "mode": "check"
   }
 ]

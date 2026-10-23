@@ -31,6 +31,7 @@ mod globals;
 mod math;
 mod modules;
 mod namespaces;
+mod params;
 mod statements;
 mod timing;
 pub(crate) use modules::dependency_source;
@@ -804,6 +805,7 @@ const CHECKER_GRAMMAR_ERRORS: &[&str] = &[
     "An index signature must have a type annotation",
     "A rest element must be last in a destructuring pattern",
     "A required element cannot follow an optional element",
+    "A required parameter cannot follow an optional parameter",
     "modifier can only appear on",
     "cannot have an implementation because it is marked",
     "modifier cannot be used with",
@@ -855,6 +857,8 @@ struct Lowerer<'ast, 'program> {
     layouts: FxHashMap<Vec<(InternedString, PrimitiveType)>, TypeId>,
     compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
     signatures: FxHashMap<InternedString, Arc<Signature>>,
+    /// Signatures whose callers may omit or add arguments, by native name.
+    arities: FxHashMap<InternedString, params::Arity>,
     active_types: SmallVec<[(InternedString, Type); 2]>,
     active_type_rules: Option<Arc<[CheckerTypeParameter]>>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
@@ -930,6 +934,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             layouts: FxHashMap::default(),
             compatible_layouts: FxHashMap::default(),
             signatures: FxHashMap::default(),
+            arities: FxHashMap::default(),
             active_types: SmallVec::new(),
             active_type_rules: None,
             functions: FxHashMap::default(),
@@ -1574,12 +1579,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         component: &str,
         role: FunctionRole,
     ) -> Result<()> {
-        if f.r#async
-            || f.generator
-            || f.params.rest.is_some()
-            || f.this_param.is_some()
-            || f.body.is_none()
-        {
+        if f.r#async || f.generator || f.this_param.is_some() || f.body.is_none() {
             return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
         if self.signatures.contains_key(&key) {
@@ -1608,17 +1608,34 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             params.push(self.this_parameter(view));
         }
         let mut names = FxHashSet::default();
-        for p in &f.params.items {
+        let mut required = 0;
+        let mut optional = false;
+        for (index, p) in f.params.items.iter().enumerate() {
             let js::BindingPattern::BindingIdentifier(name) = &p.pattern else {
                 return self.unsupported("destructuring parameters", p.span);
             };
-            if p.optional || p.initializer.is_some() {
-                return self.unsupported("optional or default parameters", p.span);
-            }
-            let Some(annotation) = &p.type_annotation else {
-                return self.error(ErrorKind::Type, "parameter implicitly has type any", p.span);
+            let omittable = p.optional || p.initializer.is_some();
+            let (ty, view) = if omittable {
+                optional |= p.optional;
+                self.omittable_parameter(p)?
+            } else {
+                if optional {
+                    return self.error(
+                        ErrorKind::Type,
+                        "a required parameter cannot follow an optional parameter",
+                        p.span,
+                    );
+                }
+                required = index + 1;
+                let Some(annotation) = &p.type_annotation else {
+                    return self.error(
+                        ErrorKind::Type,
+                        "parameter implicitly has type any",
+                        p.span,
+                    );
+                };
+                self.ty(&annotation.type_annotation)?
             };
-            let (ty, view) = self.ty(&annotation.type_annotation)?;
             if !names.insert(self.name(name.name.as_str())) {
                 return self.error(ErrorKind::Type, "duplicate parameter", p.span);
             }
@@ -1629,6 +1646,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 ownership: ParamOwnership::Borrowed,
             });
         }
+        let rest = match &f.params.rest {
+            Some(rest) => {
+                let (name, ty) = self.rest_parameter(rest)?;
+                if !names.insert(name) {
+                    return self.error(ErrorKind::Type, "duplicate parameter", rest.span);
+                }
+                params.push(CheckerParameter {
+                    name,
+                    ty,
+                    view: None,
+                    ownership: ParamOwnership::Borrowed,
+                });
+                true
+            }
+            None => false,
+        };
+        let arity =
+            (rest || required < f.params.items.len()).then_some(params::Arity { required, rest });
         let (ret, ret_view) = match (&f.return_type, role) {
             (_, FunctionRole::Constructor(view)) => {
                 (Some(self.classes[&view].ty.clone()), Some(view))
@@ -1645,6 +1680,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.name_buffer.push_str("fn$");
         crate::modules::append_component(&mut self.name_buffer, component);
         let native = intern(&self.name_buffer);
+        if let Some(arity) = arity {
+            self.arities.insert(native, arity);
+        }
         self.signatures.insert(
             name,
             Arc::new(Signature {
@@ -1714,37 +1752,85 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             },
         );
         let mut params = vec![];
+        let mut prologue = vec![];
         let has_this = matches!(role, FunctionRole::Method(_));
         if let FunctionRole::Method(view) = role {
             params.push(self.bind_this(view, f.span));
         }
-        for (parameter_type, parameter) in sig
+        let symbols = f
+            .params
+            .items
+            .iter()
+            .map(|p| match &p.pattern {
+                js::BindingPattern::BindingIdentifier(id) => (id.name.as_str(), id.symbol_id.get()),
+                _ => unreachable!(),
+            })
+            .chain(f.params.rest.iter().map(|rest| match &rest.rest.argument {
+                js::BindingPattern::BindingIdentifier(id) => (id.name.as_str(), id.symbol_id.get()),
+                _ => unreachable!(),
+            }));
+        let defaults = f
+            .params
+            .items
+            .iter()
+            .map(|p| p.initializer.as_deref())
+            .chain(f.params.rest.iter().map(|_| None));
+        for ((parameter_type, (source, symbol)), default) in sig
             .params
             .iter()
             .skip(usize::from(has_this))
-            .zip(&f.params.items)
+            .zip(symbols)
+            .zip(defaults)
         {
             let CheckerParameter { name, ty, view, .. } = parameter_type;
-            let js::BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
-                unreachable!()
+            let unique = self.fresh(source);
+            let mut param =
+                TypedParameter::regular(unique, ty.clone(), Mutability::Mutable, span(f.span));
+            param.ownership = ParamOwnership::Borrowed;
+            params.push(param);
+            // A default sees the parameters before it, and replaces `undefined` on entry.
+            let (bound, bound_type) = match default {
+                Some(default) => {
+                    let Type::Optional(inner) = ty else {
+                        unreachable!("defaulted parameters are optional slots")
+                    };
+                    let at = default.span();
+                    let value = self.expr_expected(default, inner)?;
+                    self.expect(self.source_type(default, &value.ty), inner, at)?;
+                    let value = self.adapt_value(value, inner, at)?;
+                    let resolved = self.fresh(source);
+                    let chosen = self.optional_match(
+                        var(unique, ty.clone(), at),
+                        |_, present| Ok(present),
+                        Some(value),
+                        inner.as_ref().clone(),
+                        at,
+                    )?;
+                    prologue.push(stmt(
+                        TypedStatement::Let(TypedLet {
+                            name: resolved,
+                            ty: inner.as_ref().clone(),
+                            mutability: Mutability::Mutable,
+                            initializer: Some(Box::new(chosen)),
+                            span: span(at),
+                        }),
+                        at,
+                    ));
+                    (resolved, inner.as_ref().clone())
+                }
+                None => (unique, ty.clone()),
             };
-            let unique = self.fresh(id.name.as_str());
-            let source_name = *name;
             self.scopes.last_mut().unwrap().insert(
-                source_name,
+                *name,
                 Binding {
-                    name: unique,
-                    symbol: id.symbol_id.get(),
-                    ty: ty.clone(),
+                    name: bound,
+                    symbol,
+                    ty: bound_type,
                     view: *view,
                     mutable: true,
                     initialized: true,
                 },
             );
-            let mut param =
-                TypedParameter::regular(unique, ty.clone(), Mutability::Mutable, span(f.span));
-            param.ownership = ParamOwnership::Borrowed;
-            params.push(param);
         }
         let array_parameters = params
             .iter()
@@ -1762,7 +1848,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             array_result: None,
             unproven_string: false,
         });
-        let mut statements = vec![];
+        let mut statements = prologue;
         let outer_class = std::mem::replace(&mut self.current_class, role.class());
         let outer_constructor = std::mem::replace(
             &mut self.in_constructor,
@@ -4651,9 +4737,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         receiver: Option<Expr>,
         at: oxc_span::Span,
     ) -> Result<Expr> {
-        if arguments.len() != sig.params.len() {
+        let arity = self.arities.get(&sig.native).copied();
+        let rest = arity.is_some_and(|a| a.rest);
+        let fixed = sig.params.len() - usize::from(rest);
+        let required = arity.map_or(fixed, |a| a.required);
+        if arguments.len() < required || (!rest && arguments.len() > fixed) {
             return self.error(ErrorKind::Type, "wrong argument count", at);
         }
+        let (arguments, extra) = arguments.split_at(arguments.len().min(fixed));
         let mut types: SmallVec<[Option<(Type, Option<InternedString>)>; 2]> =
             std::iter::repeat_n(None, sig.type_params.len()).collect();
         let explicit = type_arguments.is_some();
@@ -4732,6 +4823,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.adapt_value(arg, &expected, at)
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut args = args;
+        // Omitted arguments are `undefined`; a rest parameter collects the remaining ones.
+        for parameter in &sig.params[args.len()..fixed] {
+            let (expected, _) =
+                self.instantiate_type(&parameter.ty, parameter.view, &sig.type_params, &types, at)?;
+            let undefined = var(self.name("None"), undefined(), at);
+            args.push(self.adapt_value(undefined, &expected, at)?);
+        }
+        if rest {
+            let parameter = sig.params.last().unwrap();
+            let (expected, _) =
+                self.instantiate_type(&parameter.ty, parameter.view, &sig.type_params, &types, at)?;
+            if element_type(&expected).is_some_and(|e| matches!(e, Type::TypeVar(_))) {
+                return self.unsupported("generic rest parameters", at);
+            }
+            args.push(self.rest_arguments(extra, &expected, at)?);
+        }
         let ret = sig.ret.clone().ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
@@ -4964,6 +5072,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .map_or(&target.ty, |view| &view.ty)
             .clone();
         let op = a.operator.as_str();
+        if matches!(op, "??=" | "||=" | "&&=") {
+            return self.unsupported("logical assignment operators", a.span);
+        }
         let read = if op == "=" {
             None
         } else {

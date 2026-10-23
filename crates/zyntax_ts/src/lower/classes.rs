@@ -212,6 +212,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let js::BindingPattern::BindingIdentifier(parameter) = &p.pattern else {
                     return self.unsupported("destructuring parameter properties", p.span);
                 };
+                if p.optional {
+                    return self.unsupported("optional parameter properties", p.span);
+                }
                 let Some(annotation) = &p.type_annotation else {
                     return self.error(
                         ErrorKind::Type,
