@@ -756,12 +756,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::StringLiteral(s) if !s.lone_surrogates => {
                 Static::Text(self.name(s.value.as_str()))
             }
-            js::Expression::TemplateLiteral(t) if t.expressions.is_empty() => t.quasis[0]
-                .value
-                .cooked
-                .as_ref()
-                .filter(|_| !t.quasis[0].lone_surrogates)
-                .map_or(Static::Other, |text| Static::Text(self.name(text.as_str()))),
+            js::Expression::TemplateLiteral(_) => match constants::literal_text(e) {
+                Some(text) => Static::Text(intern(&text)),
+                None => Static::Other,
+            },
             js::Expression::ParenthesizedExpression(p) => self.static_value(&p.expression),
             js::Expression::TSNonNullExpression(n) => self.static_value(&n.expression),
             js::Expression::AssignmentExpression(a) if a.operator.as_str() == "=" => {
@@ -1018,44 +1016,52 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     /// Narrows an enum binding compared by `===`/`!==` with a member or literal.
     pub(super) fn narrow_enum(&mut self, b: &js::BinaryExpression<'ast>, equality: bool) {
-        for (target, other) in [(&b.left, &b.right), (&b.right, &b.left)] {
-            let js::Expression::Identifier(id) = target else {
-                continue;
-            };
-            let Ok(binding) = self.binding(id.name.as_str(), id.span) else {
-                continue;
-            };
-            let (name, view) = (binding.name, binding.view);
-            let Some(enumeration) = self.enum_of(view) else {
-                continue;
-            };
-            if !enumeration.union() {
-                continue;
-            }
-            let count = enumeration.members.len();
-            let current = self
-                .flow
-                .members(name)
-                .cloned()
-                .or_else(|| self.declared_members(view?))
-                .unwrap_or_else(|| enumeration.all());
-            let compared = match self.static_value(other) {
-                Static::Enum { view, members } if view == enumeration.view => members,
-                Static::Number(n) => enumeration.valued(Value::Number(n)),
-                Static::Text(s) => enumeration.valued(Value::Text(s)),
-                _ => continue,
-            };
-            let narrowed = if equality {
-                current.intersect(&compared)
-            } else if compared.len() == 1 {
-                current.without(&compared)
-            } else {
-                continue;
-            };
-            debug_assert!(narrowed.0.len() == Members::none(count).0.len());
-            self.flow.set_members(name, narrowed);
-            return;
+        if !self.narrow_equal(&b.left, &b.right, equality) {
+            self.narrow_equal(&b.right, &b.left, equality);
         }
+    }
+
+    /// Narrows `target`, an enum binding, by its equality (or inequality) with `other`.
+    pub(super) fn narrow_equal(
+        &mut self,
+        target: &js::Expression<'ast>,
+        other: &js::Expression<'ast>,
+        equality: bool,
+    ) -> bool {
+        let js::Expression::Identifier(id) = target else {
+            return false;
+        };
+        let Ok(binding) = self.binding(id.name.as_str(), id.span) else {
+            return false;
+        };
+        let (name, view) = (binding.name, binding.view);
+        let Some(enumeration) = self.enum_of(view) else {
+            return false;
+        };
+        if !enumeration.union() {
+            return false;
+        }
+        let current = self
+            .flow
+            .members(name)
+            .cloned()
+            .or_else(|| self.declared_members(view?))
+            .unwrap_or_else(|| enumeration.all());
+        let compared = match self.static_value(other) {
+            Static::Enum { view, members } if view == enumeration.view => members,
+            Static::Number(n) => enumeration.valued(Value::Number(n)),
+            Static::Text(s) => enumeration.valued(Value::Text(s)),
+            _ => return false,
+        };
+        let narrowed = if equality {
+            current.intersect(&compared)
+        } else if compared.len() == 1 {
+            current.without(&compared)
+        } else {
+            return false;
+        };
+        self.flow.set_members(name, narrowed);
+        true
     }
 
     /// The type a computed member's initializer has, when it can be told without lowering it.

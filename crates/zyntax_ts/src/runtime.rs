@@ -163,6 +163,14 @@ extern "C" fn enum_check(ready: bool, name: zrtl::StringConstPtr) {
     exit_process(1);
 }
 
+/// A switch over an enum whose cases cover every member received a number that is not one.
+extern "C" fn switch_trap() {
+    eprintln!(
+        "TypeError: no case matches the switch value; TypeScript would run past the switch with undefined results"
+    );
+    exit_process(1);
+}
+
 /// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
 extern "C" fn to_int32_slow(value: f64) -> i64 {
     if !value.is_finite() {
@@ -212,6 +220,7 @@ zrtl::zrtl_plugin! {
         ("$TS$binding_check", binding_check),
         ("$TS$assigned_check", assigned_check),
         ("$TS$enum_check", enum_check),
+        ("$TS$switch_trap", switch_trap),
         ("$TS$date_now", date_now),
         ("$TS$performance_now", performance_now),
         ("$TS$to_int32_slow", to_int32_slow),

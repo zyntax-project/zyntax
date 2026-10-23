@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2366,
+      "start": 37,
+      "length": 6,
+      "file": "switch_missing_return_error.ts",
+      "message": "Function lacks ending return statement and return type does not include 'undefined'."
+    }
+  ],
+  "source_sha256": "dd4192449ccbe36e4ce77aa124ccbb6da6ebf674da84af28e93e56b217e37d42",
+  "options": {}
+}

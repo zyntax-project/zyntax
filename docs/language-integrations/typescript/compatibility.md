@@ -11,7 +11,7 @@ gaps against TypeScript rather than treating them as compatibility passes.
 
 | Area | Implemented | Remaining gaps |
 | --- | --- | --- |
-| Values and control flow | Numbers, booleans, strings, primitive aliases, operators, branches and loops; module bindings that functions read and write | Full JavaScript coercion and string behavior; module bindings holding unions or computed strings |
+| Values and control flow | Numbers, booleans, strings, primitive aliases, operators, branches and loops; `switch` with fall-through, `do`/`while`, labeled `break` and `continue`; module bindings that functions read and write | Full JavaScript coercion and string behavior; module bindings holding unions or computed strings |
 | Functions and inference | Typed parameters; forward calls; primitive, object and void return inference; annotated recursive groups; direct recursive returns inferred from base cases | Arithmetic and mutual inference cycles need annotations; recursive function-value types and broader contextual inference |
 | Generics | Inferred and explicit arguments, trailing defaults, dependent constraints, scalar-bound operations, nested calls, recursion and cached native specializations | Generic aliases/interfaces, const parameters, richer inference and layout-dependent aggregate operations |
 | Function values | Capture-free arrows, named references, contextual parameter types and higher-order scalar signatures | Captures, function object identity/properties, parameter-count adaptation and aggregate callback signatures |
@@ -28,6 +28,13 @@ literal constants that nothing can observe early are substituted. A function rea
 binding that may still hold `undefined` (declared without a value, or a `var` read before
 its declaration) is checked and traps, as an array index TypeScript would read as
 `undefined` does.
+
+A `switch` evaluates its case tests in order with strict equality and falls through between
+clauses. Case values must be comparable with the discriminant, and an enum discriminant is
+narrowed in each clause. When the clauses cover every member of an enum, a number outside
+the enum traps instead of running past the switch, since TypeScript treats that path as
+unreachable. Clauses that share block-scoped declarations, and switches over unions, report
+`Unsupported`.
 
 An enum value is its native number or string; enum identity and the members a binding may
 hold are checker facts, so comparisons that cannot overlap and assignments of other enums or

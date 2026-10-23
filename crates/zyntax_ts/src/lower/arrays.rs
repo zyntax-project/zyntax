@@ -923,6 +923,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if !matches!(kind, "let" | "const") {
             return self.unsupported("for-of over a var binding", at);
         }
+        self.open_jump(statements::JumpKind::Loop);
         self.scopes.push(FxHashMap::default());
         let result = self.for_of_scoped(f, declaration, id, kind);
         self.pop_scope();
@@ -1026,6 +1027,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.clear_written_flow(f.span);
         self.flow.restore_assigned(assigned);
         let mut body = body?;
+        let mut after = vec![];
+        self.close_jump(Some(&mut body), &mut after, at);
         let read = node(
             TypedExpression::Index(TypedIndex {
                 object: Box::new(array_value()),
@@ -1036,7 +1039,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         );
         body.statements
             .insert(0, let_(unique, &element, Mutability::Mutable, read));
-        Ok(vec![stmt(
+        let mut out = vec![stmt(
             TypedStatement::ForCStyle(TypedForCStyle {
                 init: Some(Box::new(stmt(
                     TypedStatement::Block(TypedBlock {
@@ -1051,7 +1054,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 span: span(at),
             }),
             at,
-        )])
+        )];
+        out.extend(after);
+        Ok(out)
     }
     /// `new Array(n).fill(x)` and `Array(n).fill(x)`: `n` copies of `x`. A bare `new Array(n)`
     /// has holes TypeScript reads as `undefined`, which a native element cannot hold, so only the

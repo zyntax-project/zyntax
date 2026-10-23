@@ -2379,5 +2379,65 @@
     "id": "enums/strings",
     "file": "cases/enums/strings.ts",
     "mode": "run"
+  },
+  {
+    "id": "statements/do_while",
+    "file": "cases/statements/do_while.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/labels",
+    "file": "cases/statements/labels.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/nested_breaks",
+    "file": "cases/statements/nested_breaks.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_comparable_error",
+    "file": "cases/statements/switch_comparable_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "statements/switch_definite",
+    "file": "cases/statements/switch_definite.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_enum",
+    "file": "cases/statements/switch_enum.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_fallthrough",
+    "file": "cases/statements/switch_fallthrough.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_missing_return_error",
+    "file": "cases/statements/switch_missing_return_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "statements/switch_narrowed_error",
+    "file": "cases/statements/switch_narrowed_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "statements/switch_scoped",
+    "file": "cases/statements/switch_scoped.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_shared_declaration",
+    "file": "cases/statements/switch_shared_declaration.ts",
+    "mode": "run"
+  },
+  {
+    "id": "statements/switch_strings",
+    "file": "cases/statements/switch_strings.ts",
+    "mode": "run"
   }
 ]

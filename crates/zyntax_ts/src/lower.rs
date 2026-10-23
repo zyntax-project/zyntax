@@ -31,6 +31,7 @@ mod globals;
 mod math;
 mod modules;
 mod namespaces;
+mod statements;
 mod timing;
 pub(crate) use modules::dependency_source;
 mod unions;
@@ -746,6 +747,12 @@ struct Lowerer<'ast, 'program> {
     declarations: Vec<TypedNode<TypedDeclaration>>,
     returns: Option<ReturnContext>,
     loop_depth: usize,
+    /// Enclosing loops, switches and labeled statements that a jump can leave.
+    jumps: Vec<statements::Jump<'ast>>,
+    /// A label waiting for the statement it names.
+    pending_label: Option<&'ast str>,
+    /// Switches whose clauses cover every member their discriminant may hold.
+    exhaustive_switches: FxHashSet<u32>,
     next_name: usize,
     next_array_identity: usize,
 }
@@ -805,6 +812,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             declarations: vec![],
             returns: None,
             loop_depth: 0,
+            jumps: vec![],
+            pending_label: None,
+            exhaustive_switches: FxHashSet::default(),
             next_name: 0,
             next_array_identity: 0,
         }
@@ -1594,7 +1604,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             None if !context.value_returned => (unit(), None),
             None => context.inferred.unwrap_or((unit(), None)),
         };
-        let complete = constructed.is_some() || Self::returns(&f.body.as_ref().unwrap().statements);
+        let complete = constructed.is_some() || self.returns(&f.body.as_ref().unwrap().statements);
         if let Some(this) = constructed {
             statements.push(stmt(
                 TypedStatement::Return(Some(Box::new(var(this, ret.clone(), f.span)))),
@@ -1760,14 +1770,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
     }
 
-    fn returns(statements: &[js::Statement<'ast>]) -> bool {
+    fn returns(&self, statements: &[js::Statement<'ast>]) -> bool {
         statements.iter().any(|s| match s {
             js::Statement::ReturnStatement(_) => true,
-            js::Statement::BlockStatement(b) => Self::returns(&b.body),
+            js::Statement::BlockStatement(b) => self.returns(&b.body),
             js::Statement::IfStatement(i) => i.alternate.as_ref().is_some_and(|other| {
-                Self::returns(std::slice::from_ref(&i.consequent))
-                    && Self::returns(std::slice::from_ref(other))
+                self.returns(std::slice::from_ref(&i.consequent))
+                    && self.returns(std::slice::from_ref(other))
             }),
+            js::Statement::SwitchStatement(sw) => self.switch_returns(sw),
+            js::Statement::DoWhileStatement(d) => {
+                self.returns(std::slice::from_ref(&d.body))
+                    || (is_true(&d.test) && !Self::may_break(std::slice::from_ref(&d.body)))
+            }
             js::Statement::WhileStatement(w) => {
                 is_true(&w.test) && !Self::may_break(std::slice::from_ref(&w.body))
             }
@@ -1843,6 +1858,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$binding_check", vec![boolean(), string()], unit()),
             ("$TS$assigned_check", vec![boolean(), string()], unit()),
             ("$TS$enum_check", vec![boolean(), string()], unit()),
+            ("$TS$switch_trap", vec![], unit()),
             ("$TS$date_now", vec![], number()),
             ("$TS$performance_now", vec![], number()),
             (
@@ -2785,11 +2801,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let then_flow = std::mem::replace(&mut self.flow, before);
                 self.narrow(&i.test, false);
                 let else_block = i.alternate.as_ref().map(|s| self.block(s)).transpose()?;
-                let then_returns = Self::returns(std::slice::from_ref(&i.consequent));
+                let then_returns = self.returns(std::slice::from_ref(&i.consequent));
                 let else_returns = i
                     .alternate
                     .as_ref()
-                    .is_some_and(|s| Self::returns(std::slice::from_ref(s)));
+                    .is_some_and(|s| self.returns(std::slice::from_ref(s)));
                 if else_returns {
                     self.flow = then_flow;
                 } else if !then_returns {
@@ -2810,25 +2826,31 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.clear_written_flow(w.span);
                 let condition = self.condition(&w.test)?;
                 self.narrow(&w.test, true);
+                self.open_jump(statements::JumpKind::Loop);
                 self.loop_depth += 1;
-                let body = self.block(&w.body)?;
+                let mut body = self.block(&w.body)?;
                 self.loop_depth -= 1;
+                let mut after = vec![];
+                self.close_jump(Some(&mut body), &mut after, at);
                 self.clear_written_flow(w.span);
                 self.flow.restore_assigned(assigned);
                 if !Self::may_break(std::slice::from_ref(&w.body)) {
                     self.narrow(&w.test, false);
                 }
-                vec![stmt(
+                let mut out = vec![stmt(
                     TypedStatement::While(TypedWhile {
                         condition: Box::new(condition),
                         body,
                         span: span(at),
                     }),
                     at,
-                )]
+                )];
+                out.extend(after);
+                out
             }
             js::Statement::ForStatement(f) => {
                 let assigned = self.flow.assigned();
+                self.open_jump(statements::JumpKind::Loop);
                 self.scopes.push(FxHashMap::default());
                 let mut init = vec![];
                 if let Some(value) = &f.init {
@@ -2873,12 +2895,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     self.narrow(test, true);
                 }
                 self.loop_depth += 1;
-                let body = self.block(&f.body)?;
+                let mut body = self.block(&f.body)?;
                 self.loop_depth -= 1;
+                let mut after = vec![];
+                self.close_jump(Some(&mut body), &mut after, at);
                 self.clear_written_flow(repeated);
                 self.pop_scope();
                 self.flow.restore_assigned(assigned);
-                vec![stmt(
+                if let Some(test) = &f.test
+                    && !Self::may_break(std::slice::from_ref(&f.body))
+                {
+                    self.narrow(test, false);
+                }
+                let mut out = vec![stmt(
                     TypedStatement::ForCStyle(TypedForCStyle {
                         init: Some(Box::new(stmt(
                             TypedStatement::Block(TypedBlock {
@@ -2893,18 +2922,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         span: span(at),
                     }),
                     at,
-                )]
+                )];
+                out.extend(after);
+                out
             }
             js::Statement::ForOfStatement(f) => self.for_of(f)?,
             js::Statement::ClassDeclaration(c) => {
                 return self.unsupported("class declarations in nested scopes", c.span);
             }
-            js::Statement::BreakStatement(b) if b.label.is_none() && self.loop_depth > 0 => {
-                vec![stmt(TypedStatement::Break(None), at)]
-            }
-            js::Statement::ContinueStatement(c) if c.label.is_none() && self.loop_depth > 0 => {
-                vec![stmt(TypedStatement::Continue, at)]
-            }
+            js::Statement::BreakStatement(b) => self.break_statement(b.label.as_ref(), at)?,
+            js::Statement::ContinueStatement(c) => self.continue_statement(c.label.as_ref(), at)?,
+            js::Statement::DoWhileStatement(d) => self.do_while(d)?,
+            js::Statement::SwitchStatement(sw) => self.switch(sw)?,
+            js::Statement::LabeledStatement(l) => self.labeled(l)?,
             _ => return self.unsupported("this statement", at),
         })
     }
@@ -3483,6 +3513,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             unproven_string: false,
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
+        let outer_jumps = std::mem::take(&mut self.jumps);
+        let outer_label = self.pending_label.take();
         let outer_top = std::mem::replace(&mut self.top_level, false);
         let outer_flow = self.flow.clone();
         self.flow.forget_global_members(&self.globals);
@@ -3552,7 +3584,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     statements.extend(self.statement(statement)?);
                 }
                 statements.splice(0..0, std::mem::take(&mut self.vars.hoisted));
-                Self::returns(&body.statements)
+                self.returns(&body.statements)
             } else {
                 let e = arrow.body.as_expression().unwrap();
                 let hint = self
@@ -3603,6 +3635,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.scope_floor = outer_floor;
         self.top_level = outer_top;
         self.flow = outer_flow;
+        self.jumps = outer_jumps;
+        self.pending_label = outer_label;
         self.loop_depth = outer_loop;
         self.returns = outer_returns;
         let (params, statements, ret, ty) = result?;

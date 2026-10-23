@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2678,
+      "start": 52,
+      "length": 3,
+      "file": "switch_comparable_error.ts",
+      "message": "Type 'string' is not comparable to type 'number'."
+    }
+  ],
+  "source_sha256": "c91eaa322d94bf44c4f5155e6e7269ce9d0290c98cb96beebcdbc3127052e4a5",
+  "options": {}
+}
