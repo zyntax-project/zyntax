@@ -863,6 +863,406 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.flow.integers.insert(name, Integral::Nonnegative);
         }
     }
+    /// `for (const x of array) body`: an index loop over a binding of the array, which reads the
+    /// length each time round as the iterator does.
+    pub(super) fn for_of(&mut self, f: &js::ForOfStatement<'ast>) -> Result<Vec<Stmt>> {
+        let at = f.span;
+        if f.r#await {
+            return self.unsupported("for await", at);
+        }
+        let js::ForStatementLeft::VariableDeclaration(declaration) = &f.left else {
+            return self.unsupported("for-of over an assignment target", at);
+        };
+        let kind = declaration.kind.as_str();
+        let [declarator] = &declaration.declarations[..] else {
+            return self.error(ErrorKind::Type, "for-of requires one binding", at);
+        };
+        let js::BindingPattern::BindingIdentifier(id) = &declarator.id else {
+            return self.unsupported("destructuring in for-of", at);
+        };
+        if declarator.type_annotation.is_some() || declarator.init.is_some() {
+            return self.error(
+                ErrorKind::Type,
+                "for-of binding cannot have a type annotation or initializer",
+                declarator.span,
+            );
+        }
+        if !matches!(kind, "let" | "const") {
+            return self.unsupported("for-of over a var binding", at);
+        }
+        self.scopes.push(FxHashMap::default());
+        let result = self.for_of_scoped(f, declaration, id, kind);
+        self.pop_scope();
+        result
+    }
+
+    fn for_of_scoped(
+        &mut self,
+        f: &js::ForOfStatement<'ast>,
+        declaration: &js::VariableDeclaration<'ast>,
+        id: &js::BindingIdentifier<'ast>,
+        kind: &str,
+    ) -> Result<Vec<Stmt>> {
+        let at = f.span;
+        self.reserve_variables(declaration)?;
+        let iterable = self.expr(&f.right)?;
+        if element_type(&iterable.ty).is_none()
+            && (iterable.ty == string() || self.is_class_instance(&iterable.ty))
+        {
+            return self.unsupported("for-of over non-array iterator protocols", f.right.span());
+        }
+        let element = self.array_element(&iterable.ty, f.right.span())?;
+        if matches!(element, Type::TypeVar(_)) {
+            return self.unsupported(
+                "generic array iteration before element ownership is known",
+                at,
+            );
+        }
+        let integer = Type::Primitive(PrimitiveType::I64);
+        let array_ty = iterable.ty.clone();
+        let array = self.fresh("iterable");
+        let position = self.fresh("position");
+        let array_value = || var(array, array_ty.clone(), at);
+        let position_value = || var(position, integer.clone(), at);
+        let let_ = |name: InternedString, ty: &Type, mutability: Mutability, value: Expr| {
+            stmt(
+                TypedStatement::Let(TypedLet {
+                    name,
+                    ty: ty.clone(),
+                    mutability,
+                    initializer: Some(Box::new(value)),
+                    span: span(at),
+                }),
+                at,
+            )
+        };
+        let init = vec![
+            let_(array, &array_ty, Mutability::Immutable, iterable),
+            let_(
+                position,
+                &integer,
+                Mutability::Mutable,
+                node(
+                    TypedExpression::Literal(TypedLiteral::Integer(0)),
+                    integer.clone(),
+                    at,
+                ),
+            ),
+        ];
+        let length = node(
+            TypedExpression::MethodCall(TypedMethodCall::positional(
+                array_value(),
+                self.name("len"),
+                vec![],
+            )),
+            integer.clone(),
+            at,
+        );
+        let condition = binary(BinaryOp::Lt, position_value(), length, boolean(), at);
+        let one = node(
+            TypedExpression::Literal(TypedLiteral::Integer(1)),
+            integer.clone(),
+            at,
+        );
+        let next = binary(BinaryOp::Add, position_value(), one, integer.clone(), at);
+        let update = binary(BinaryOp::Assign, position_value(), next, unit(), at);
+
+        let assigned = self.flow.assigned();
+        let name = self.name(id.name.as_str());
+        let unique = self.fresh(id.name.as_str());
+        let view = self.class_by_layout(&element);
+        self.scopes.last_mut().unwrap().insert(
+            name,
+            Binding {
+                name: unique,
+                symbol: id.symbol_id.get(),
+                ty: element.clone(),
+                view,
+                mutable: kind == "let",
+                initialized: true,
+            },
+        );
+        self.clear_written_flow(f.span);
+        self.set_induction(None);
+        if element == string() {
+            self.flow.strings.insert(unique);
+        }
+        self.loop_depth += 1;
+        let body = self.block(&f.body);
+        self.loop_depth -= 1;
+        self.clear_written_flow(f.span);
+        self.flow.restore_assigned(assigned);
+        let mut body = body?;
+        let read = node(
+            TypedExpression::Index(TypedIndex {
+                object: Box::new(array_value()),
+                index: Box::new(position_value()),
+            }),
+            element.clone(),
+            at,
+        );
+        body.statements
+            .insert(0, let_(unique, &element, Mutability::Mutable, read));
+        Ok(vec![stmt(
+            TypedStatement::ForCStyle(TypedForCStyle {
+                init: Some(Box::new(stmt(
+                    TypedStatement::Block(TypedBlock {
+                        statements: init,
+                        span: span(at),
+                    }),
+                    at,
+                ))),
+                condition: Some(Box::new(condition)),
+                update: Some(Box::new(update)),
+                body,
+                span: span(at),
+            }),
+            at,
+        )])
+    }
+    /// `new Array(n).fill(x)` and `Array(n).fill(x)`: `n` copies of `x`. A bare `new Array(n)`
+    /// has holes TypeScript reads as `undefined`, which a native element cannot hold, so only the
+    /// filled form is lowered. An array element is shared, as in JavaScript.
+    pub(super) fn array_fill(
+        &mut self,
+        c: &js::CallExpression<'ast>,
+        m: &js::StaticMemberExpression<'ast>,
+        hint: Option<&Type>,
+    ) -> Result<Option<Expr>> {
+        if m.optional || c.optional || m.property.name != "fill" {
+            return Ok(None);
+        }
+        let (callee, arguments, type_arguments) = match &m.object {
+            js::Expression::NewExpression(n) => {
+                (&n.callee, &n.arguments, n.type_arguments.as_deref())
+            }
+            js::Expression::CallExpression(k) if !k.optional => {
+                (&k.callee, &k.arguments, k.type_arguments.as_deref())
+            }
+            _ => return Ok(None),
+        };
+        let js::Expression::Identifier(id) = callee else {
+            return Ok(None);
+        };
+        let global = self.name("Array");
+        if id.name != "Array"
+            || self.scopes.iter().any(|s| s.contains_key(&global))
+            || self.class_names.contains_key(&global)
+            || self.imported_exports.contains_key(&global)
+            || self.signatures.contains_key(&global)
+            || self.constants.contains_key(&global)
+            || self.namespace_references.contains_key(&id.node_id.get())
+        {
+            return Ok(None);
+        }
+        let at = c.span;
+        if c.type_arguments.is_some() {
+            return self.error(ErrorKind::Type, "fill takes no type arguments", at);
+        }
+        let ([length], [fill]) = (&arguments[..], &c.arguments[..]) else {
+            return self.unsupported(
+                "Array construction other than new Array(length).fill(value)",
+                at,
+            );
+        };
+        let (Some(length), Some(fill)) = (length.as_expression(), fill.as_expression()) else {
+            return self.unsupported("spread array arguments", at);
+        };
+        let (declared, declared_view) = match type_arguments {
+            Some(arguments) => match &arguments.params[..] {
+                [element] => {
+                    let (ty, view) = self.ty(element)?;
+                    (Some(ty), view)
+                }
+                _ => return self.error(ErrorKind::Type, "Array takes one type argument", at),
+            },
+            None => (hint.and_then(element_type).cloned(), None),
+        };
+        let length_value = self.expr(length)?;
+        if length_value.ty != number() {
+            return self.unsupported(
+                "Array construction with a non-numeric length",
+                length.span(),
+            );
+        }
+        let fill_value = match &declared {
+            Some(element) => self.expr_expected(fill, element)?,
+            None => self.expr(fill)?,
+        };
+        let element = declared.unwrap_or_else(|| fill_value.ty.clone());
+        self.expect(&fill_value.ty, &element, fill.span())?;
+        self.check_view(self.view_of(fill), declared_view, fill.span())?;
+        self.check_array_element(&element, at)?;
+        if matches!(element, Type::TypeVar(_)) {
+            return self.unsupported(
+                "generic array construction before element ownership is known",
+                at,
+            );
+        }
+        if element == string() && !self.immortal_string(fill) {
+            return self.unsupported(
+                "array storage of strings without a proven static lifetime",
+                fill.span(),
+            );
+        }
+        let zero_bytes = match fill.get_inner_expression() {
+            js::Expression::NumericLiteral(n) => {
+                element == number() && n.value == 0.0 && n.value.is_sign_positive()
+            }
+            js::Expression::BooleanLiteral(b) => element == boolean() && !b.value,
+            _ => false,
+        };
+
+        let integer = Type::Primitive(PrimitiveType::I64);
+        let literal = |value: i64| {
+            node(
+                TypedExpression::Literal(TypedLiteral::Integer(i128::from(value))),
+                integer.clone(),
+                at,
+            )
+        };
+        let cast = |value: Expr, ty: &Type| {
+            node(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(value),
+                    target_type: ty.clone(),
+                }),
+                ty.clone(),
+                at,
+            )
+        };
+        let let_ = |name: InternedString, ty: &Type, mutability: Mutability, value: Expr| {
+            stmt(
+                TypedStatement::Let(TypedLet {
+                    name,
+                    ty: ty.clone(),
+                    mutability,
+                    initializer: Some(Box::new(value)),
+                    span: span(at),
+                }),
+                at,
+            )
+        };
+        let written = self.fresh("length");
+        let count = self.fresh("count");
+        let array_ty = array_type(element.clone());
+        let array = self.fresh("filled");
+        let written_value = || var(written, number(), at);
+        let count_value = || var(count, integer.clone(), at);
+        let mut statements = vec![
+            let_(written, &number(), Mutability::Immutable, length_value),
+            let_(
+                count,
+                &integer,
+                Mutability::Immutable,
+                cast(written_value(), &integer),
+            ),
+        ];
+        // A length is a whole number from 0 to 2^32 - 1; the saturating conversion sends NaN and
+        // out-of-range values to a count that fails the round trip or the bounds.
+        let whole = binary(
+            BinaryOp::Eq,
+            cast(count_value(), &number()),
+            written_value(),
+            boolean(),
+            at,
+        );
+        let in_range = binary(
+            BinaryOp::And,
+            binary(BinaryOp::Ge, count_value(), literal(0), boolean(), at),
+            binary(
+                BinaryOp::Le,
+                count_value(),
+                literal(4_294_967_295),
+                boolean(),
+                at,
+            ),
+            boolean(),
+            at,
+        );
+        let valid = binary(BinaryOp::And, whole, in_range, boolean(), at);
+        let invalid = node(
+            TypedExpression::Unary(TypedUnary {
+                op: UnaryOp::Not,
+                operand: Box::new(valid),
+            }),
+            boolean(),
+            at,
+        );
+        let trap = self.call("$TS$array_length_trap", vec![written_value()], unit(), at);
+        statements.push(stmt(
+            TypedStatement::If(TypedIf {
+                condition: Box::new(invalid),
+                then_block: TypedBlock {
+                    statements: vec![expression(trap)],
+                    span: span(at),
+                },
+                else_block: None,
+                span: span(at),
+            }),
+            at,
+        ));
+        statements.push(let_(
+            array,
+            &array_ty,
+            Mutability::Immutable,
+            node(TypedExpression::Array(vec![]), array_ty.clone(), at),
+        ));
+        let array_value = || var(array, array_ty.clone(), at);
+        let (push, resize_filled) = (self.name("push"), self.name("resize_filled"));
+        let (fill_name, position) = (self.fresh("fill"), self.fresh("position"));
+        let method = |name: InternedString, args: Vec<Expr>| {
+            expression(node(
+                TypedExpression::MethodCall(TypedMethodCall::positional(array_value(), name, args)),
+                unit(),
+                at,
+            ))
+        };
+        if zero_bytes {
+            statements.push(method(resize_filled, vec![count_value(), literal(0)]));
+        } else {
+            let position_value = || var(position, integer.clone(), at);
+            statements.push(let_(fill_name, &element, Mutability::Immutable, fill_value));
+            statements.push(let_(position, &integer, Mutability::Mutable, literal(0)));
+            let next = binary(
+                BinaryOp::Add,
+                position_value(),
+                literal(1),
+                integer.clone(),
+                at,
+            );
+            let advance = binary(BinaryOp::Assign, position_value(), next, unit(), at);
+            statements.push(stmt(
+                TypedStatement::While(TypedWhile {
+                    condition: Box::new(binary(
+                        BinaryOp::Lt,
+                        position_value(),
+                        count_value(),
+                        boolean(),
+                        at,
+                    )),
+                    body: TypedBlock {
+                        statements: vec![
+                            method(push, vec![var(fill_name, element.clone(), at)]),
+                            expression(advance),
+                        ],
+                        span: span(at),
+                    },
+                    span: span(at),
+                }),
+                at,
+            ));
+        }
+        statements.push(expression(array_value()));
+        Ok(Some(node(
+            TypedExpression::Block(TypedBlock {
+                statements,
+                span: span(at),
+            }),
+            array_ty,
+            at,
+        )))
+    }
     pub(super) fn array_method(
         &mut self,
         c: &js::CallExpression<'ast>,

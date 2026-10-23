@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2558,
+      "start": 35,
+      "length": 6,
+      "file": "fill_type_argument.ts",
+      "message": "Expected 0 type arguments, but got 1."
+    }
+  ],
+  "source_sha256": "1f9ba5e7b9c4dc44d7ca0abe8b126afcb733fd576a8de11b487fb5da910db229",
+  "options": {}
+}

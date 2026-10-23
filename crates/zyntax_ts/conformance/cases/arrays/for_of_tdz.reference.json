@@ -1,0 +1,23 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 7022,
+      "start": 25,
+      "length": 2,
+      "file": "for_of_tdz.ts",
+      "message": "'xs' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer."
+    },
+    {
+      "code": 2448,
+      "start": 31,
+      "length": 2,
+      "file": "for_of_tdz.ts",
+      "message": "Block-scoped variable 'xs' used before its declaration."
+    }
+  ],
+  "source_sha256": "e55598aa7616b38fa37d9ba6e02f935ea60aaced71242ae584817df5e7e8ceda",
+  "options": {}
+}

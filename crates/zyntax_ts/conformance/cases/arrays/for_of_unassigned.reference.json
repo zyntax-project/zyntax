@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2454,
+      "start": 48,
+      "length": 1,
+      "file": "for_of_unassigned.ts",
+      "message": "Variable 'n' is used before being assigned."
+    }
+  ],
+  "source_sha256": "5148705e10db4225987e85f3959a3d7d21cf46407419229170c515ea89475fa1",
+  "options": {}
+}

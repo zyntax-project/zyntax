@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2588,
+      "start": 21,
+      "length": 1,
+      "file": "for_of_const.ts",
+      "message": "Cannot assign to 'n' because it is a constant."
+    }
+  ],
+  "source_sha256": "e2d0cd874e795a62555c3ec789ac4c4881ec62ffd7f1c233c6141849aeefb5bc",
+  "options": {}
+}

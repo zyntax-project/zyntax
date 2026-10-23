@@ -16,14 +16,20 @@ gaps against TypeScript rather than treating them as compatibility passes.
 | Generics | Inferred and explicit arguments, nested calls, recursion and cached native specializations | Constraints, defaults, const parameters and operations on unresolved generic operands |
 | Function values | Capture-free arrows, named references, contextual parameter types and higher-order scalar signatures | Captures, function object identity/properties, parameter-count adaptation and aggregate callback signatures |
 | Objects | Scalar fields, reference identity, aliases, source-order initializers, readonly views and excess-property checks | Reference-valued fields, general layout adaptation and assignments that change concrete layout |
-| Arrays | Dense `number[]`, `boolean[]`, `string[]`, `Array<T>`, proven index access, length and push | Sparse extension, length mutation, other methods and reads that may yield `undefined` |
+| Arrays | Dense numbers, booleans, static strings, class instances and nested arrays; typed indexing, length, push, array `for…of`, and filled length constructors | Sparse extension, length mutation, other methods, optional reads and general iterator protocols |
 | Unions | Scalar alternatives among number, boolean and string; number/boolean with `undefined`; narrowing, equality, truthiness and formatting | Owned/reference payloads, broader nullable combinations and optional callback signatures |
 | Modules | Named/default/type-only/side-effect imports; static namespace calls, function references and qualified types; function/type/interface exports; default function declarations and bindings; aliases; named and star re-exports; relative filesystem projects | Other default values, namespace object values/re-exports and runtime indexing, exported variables/live bindings, cycles/TDZ and package resolution |
 
 String arrays and string union payloads require a proven static string lifetime.
-Generic element mutation and owned reference containers need additional lifetime
-analysis. Classes, capturing closures and reference-bearing unions are not yet
-implemented. `void` and `undefined` remain distinct.
+Generic element mutation, capturing closures and broader reference-bearing unions
+need additional implementation. `void` and `undefined` remain distinct.
+
+Array `for…of` supports `let` and `const` identifier bindings, observes growth and
+keeps iterating the original array if its source variable is reassigned. Numeric
+length constructors support `new Array<T>(n).fill(value)` and `Array<T>(n).fill(value)`;
+reference elements share identity. Invalid lengths fail before evaluating the fill
+argument. Bare length constructors, fill ranges, destructuring, `var` loop bindings
+and asynchronous/custom iterators remain unsupported.
 
 Local object views can expose a subset of fields without copying. Calls and
 annotated returns require matching native offsets for every exposed field.

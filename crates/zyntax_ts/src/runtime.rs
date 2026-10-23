@@ -124,6 +124,12 @@ extern "C" fn index_trap(index: f64, length: f64) {
     exit_process(1);
 }
 
+/// A length `new Array(n)` rejects: negative, fractional, NaN or past 2^32 - 1.
+extern "C" fn array_length_trap(_length: f64) {
+    eprintln!("RangeError: Invalid array length");
+    exit_process(1);
+}
+
 /// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
 extern "C" fn to_int32_slow(value: f64) -> i64 {
     if !value.is_finite() {
@@ -169,6 +175,7 @@ zrtl::zrtl_plugin! {
         ("$TS$number_to_string", number_to_string),
         ("$TS$pow", number_pow),
         ("$TS$index_trap", index_trap),
+        ("$TS$array_length_trap", array_length_trap),
         ("$TS$date_now", date_now),
         ("$TS$performance_now", performance_now),
         ("$TS$to_int32_slow", to_int32_slow),

@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2304,
+      "start": 48,
+      "length": 1,
+      "file": "for_of_scope.ts",
+      "message": "Cannot find name 'n'."
+    }
+  ],
+  "source_sha256": "19766bdf6a8541cf8860a063436fc7c78d1a34fae911e490ffc6f24c0a42f353",
+  "options": {}
+}

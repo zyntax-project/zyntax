@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 150,
+      "length": 8,
+      "file": "fill_class_brand.ts",
+      "message": "Argument of type 'B' is not assignable to parameter of type 'A'.\n  Types have separate declarations of a private property 'x'."
+    }
+  ],
+  "source_sha256": "81e9bf93f1f2d923e8fbc556c7705d634dfaa517cecd9d833fc0f360436a9a9a",
+  "options": {}
+}

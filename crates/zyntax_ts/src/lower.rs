@@ -1718,6 +1718,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$print_number", vec![number()], unit()),
             ("$TS$pow", vec![number(), number()], number()),
             ("$TS$index_trap", vec![number(), number()], unit()),
+            ("$TS$array_length_trap", vec![number()], unit()),
             ("$TS$date_now", vec![], number()),
             ("$TS$performance_now", vec![], number()),
             (
@@ -2753,6 +2754,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     at,
                 )]
             }
+            js::Statement::ForOfStatement(f) => self.for_of(f)?,
             js::Statement::ClassDeclaration(c) => {
                 return self.unsupported("class declarations in nested scopes", c.span);
             }
@@ -3213,6 +3215,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::Expression::ArrowFunctionExpression(a) => self.arrow(a, Some(expected)),
             js::Expression::ParenthesizedExpression(p) => {
                 self.expr_expected(&p.expression, expected)
+            }
+            js::Expression::CallExpression(c) if !c.optional => {
+                let filled = if let js::Expression::StaticMemberExpression(m) = &c.callee {
+                    self.array_fill(c, m, Some(expected))?
+                } else {
+                    None
+                };
+                match filled {
+                    Some(filled) => Ok(filled),
+                    None => self.expr(e),
+                }
             }
             _ => self.expr(e),
         }?;
@@ -3995,6 +4008,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
         let at = c.span;
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
+            if let Some(filled) = self.array_fill(c, m, None)? {
+                return Ok(filled);
+            }
+        }
+        if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if let js::Expression::Identifier(receiver) = &m.object {
                 self.require_value(receiver.name.as_str(), receiver.span)?;
                 if receiver.name == "console"
@@ -4030,6 +4048,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if is_array && !m.optional {
                 return self.array_method(c, m);
             }
+            // An array reached by an element access, as in `grid[i].push(x)`.
+            if !m.optional && matches!(m.object, js::Expression::ComputedMemberExpression(_)) {
+                let receiver = self.expr(&m.object)?;
+                if element_type(&receiver.ty).is_some() {
+                    return self.array_method_on(c, m, None, receiver);
+                }
+            }
         }
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if !m.optional {
@@ -4041,13 +4066,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 if let Some(call) = self.method_call(c, m)? {
                     return Ok(call);
-                }
-            }
-            // An array reached by an element access, as in `grid[i].push(x)`.
-            if !m.optional && matches!(m.object, js::Expression::ComputedMemberExpression(_)) {
-                let receiver = self.expr(&m.object)?;
-                if element_type(&receiver.ty).is_some() {
-                    return self.array_method_on(c, m, None, receiver);
                 }
             }
         }

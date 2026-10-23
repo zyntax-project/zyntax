@@ -1924,5 +1924,120 @@
     "id": "loops/counters",
     "file": "cases/loops/counters.ts",
     "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_scalars",
+    "file": "cases/arrays/for_of_scalars.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_control",
+    "file": "cases/arrays/for_of_control.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_live",
+    "file": "cases/arrays/for_of_live.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_owned",
+    "file": "cases/arrays/for_of_owned.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_scalars",
+    "file": "cases/arrays/fill_scalars.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_alias",
+    "file": "cases/arrays/fill_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_order",
+    "file": "cases/arrays/fill_order.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_tdz",
+    "file": "cases/arrays/for_of_tdz.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/for_of_const",
+    "file": "cases/arrays/for_of_const.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/for_of_scope",
+    "file": "cases/arrays/for_of_scope.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/for_of_unassigned",
+    "file": "cases/arrays/for_of_unassigned.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/fill_type_argument",
+    "file": "cases/arrays/fill_type_argument.ts",
+    "mode": "check"
+  },
+  {
+    "id": "arrays/fill_length_negative",
+    "file": "cases/arrays/fill_length_negative.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_fraction",
+    "file": "cases/arrays/fill_length_fraction.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_nan",
+    "file": "cases/arrays/fill_length_nan.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_infinity",
+    "file": "cases/arrays/fill_length_infinity.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_negative_infinity",
+    "file": "cases/arrays/fill_length_negative_infinity.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_too_large",
+    "file": "cases/arrays/fill_length_too_large.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_length_huge",
+    "file": "cases/arrays/fill_length_huge.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_shadowed_class",
+    "file": "cases/arrays/fill_shadowed_class.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_shadowed_function",
+    "file": "cases/arrays/fill_shadowed_function.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/for_of_return",
+    "file": "cases/arrays/for_of_return.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/fill_class_brand",
+    "file": "cases/arrays/fill_class_brand.ts",
+    "mode": "check"
   }
 ]
