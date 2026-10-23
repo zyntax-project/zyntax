@@ -505,7 +505,7 @@ impl TieredRuntime {
         // them can transfer into tier-1 code. Applied at construction so
         // consumers reaching the backend through other entry points get the
         // same setting.
-        backend.set_emit_osr_probes(config.enable_osr);
+        backend.set_emit_osr_probes(loop_probes(&config));
 
         // The boxing runtime the upper tier calls into. The ground tier
         // builds dynamic boxes inline and never needs these; a tier that
@@ -810,7 +810,7 @@ impl TieredRuntime {
 
         // A joining module stays at its tier, so it asks for no other.
         self.backend
-            .set_emit_osr_probes(self.config.enable_osr && !joining);
+            .set_emit_osr_probes(loop_probes(&self.config) && !joining);
 
         // Reachability is read after the optimisers, since inlining
         // removes calls and the set has to describe the module codegen
@@ -850,7 +850,7 @@ impl TieredRuntime {
             joining,
         );
         // What the running module compiles later asks as it always has.
-        self.backend.set_emit_osr_probes(self.config.enable_osr);
+        self.backend.set_emit_osr_probes(loop_probes(&self.config));
         compiled?;
         self.refresh_error_flags();
         // The backend owns the optimized HIR and native global slots. Bind
@@ -3265,6 +3265,31 @@ impl TieredRuntime {
     /// Check if a function is defined
     pub fn has_function(&self, name: &str) -> bool {
         self.function_ids.contains_key(name)
+    }
+}
+
+/// Whether compiled loops carry a back-edge probe. A probe is how a running loop moves to the
+/// tier above, so it pays only where that tier exists and publishes code: LLVM selected as the
+/// top tier. A ladder that ends at the Cranelift baseline would execute a load and a branch per
+/// iteration for nothing. `ZYNTAX_BASELINE_OSR_PROBES=1` keeps the probes whatever the ladder;
+/// safe to run with.
+fn loop_probes(config: &TieredConfig) -> bool {
+    if !config.enable_osr {
+        return false;
+    }
+    if std::env::var_os("ZYNTAX_BASELINE_OSR_PROBES").is_some() {
+        return true;
+    }
+    #[cfg(feature = "llvm-backend")]
+    {
+        matches!(
+            config.tier2_backend,
+            zyntax_compiler::tiered_backend::Tier2Backend::LLVM
+        )
+    }
+    #[cfg(not(feature = "llvm-backend"))]
+    {
+        false
     }
 }
 

@@ -141,8 +141,8 @@ pub struct TieredConfig {
     /// workload needs: a worker or serverless invocation is often a single
     /// long call, and warming up first is not an option.
     ///
-    /// Costs a load and a not-taken branch per back-edge while no helper
-    /// exists, measured at under 1% across the bench kernels.
+    /// Compiled loops carry the probe only when a tier above can publish a helper for them
+    /// (LLVM selected as the top tier); each probe is a load and a branch per iteration.
     pub enable_osr: bool,
     /// Route calls between compiled functions through reload cells so
     /// `reload_module` can replace a function under running code.
