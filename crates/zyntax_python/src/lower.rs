@@ -11838,6 +11838,12 @@ impl<'m> Lowerer<'m> {
                     };
                     let node = match args.first() {
                         None => self.new_table(set_ty, span),
+                        // Its elements go straight into the set, as a set
+                        // comprehension's do.
+                        Some(py::Expr::Generator(g)) => {
+                            self.comprehension(&g.generators, Produce::Set(set_ty, &g.elt), span)?
+                                .node
+                        }
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             self.set_from(v, set_ty, span)
@@ -11857,6 +11863,12 @@ impl<'m> Lowerer<'m> {
                         Ty::List(e) => e,
                         _ => Elem::Object,
                     };
+                    // A comprehension's list is made here and named by
+                    // nothing else, so it is the fresh list itself.
+                    let fresh = matches!(
+                        args.first(),
+                        Some(py::Expr::Generator(_) | py::Expr::ListComp(_))
+                    );
                     let source = match args.first() {
                         None => {
                             let empty = self.list_of(Vec::new(), target_elem, span);
@@ -11899,6 +11911,13 @@ impl<'m> Lowerer<'m> {
                                 ty: Ty::List(Elem::Int),
                             }
                         }
+                        // A tuple holds dynamic values: the elements are
+                        // made as such.
+                        Some(py::Expr::Generator(g)) if name == "tuple" => self.comprehension(
+                            &g.generators,
+                            Produce::List(Elem::Object, &g.elt),
+                            span,
+                        )?,
                         Some(a) => {
                             let v = self.consumed(a, span)?;
                             match v.ty {
@@ -11976,7 +11995,11 @@ impl<'m> Lowerer<'m> {
                     };
                     // Every form returns a fresh list.
                     let mut statements = Vec::new();
-                    let copy = call(&list_fn("copy", e), vec![source.node], Ty::List(e), span);
+                    let copy = if fresh {
+                        source.node
+                    } else {
+                        call(&list_fn("copy", e), vec![source.node], Ty::List(e), span)
+                    };
                     let held = self.hold(
                         Val {
                             node: copy,
