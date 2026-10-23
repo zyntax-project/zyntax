@@ -2039,5 +2039,35 @@
     "id": "arrays/fill_class_brand",
     "file": "cases/arrays/fill_class_brand.ts",
     "mode": "check"
+  },
+  {
+    "id": "strings/literal_template_disjoint",
+    "file": "cases/strings/literal_template_disjoint.ts",
+    "mode": "check"
+  },
+  {
+    "id": "strings/literal_template_reverse",
+    "file": "cases/strings/literal_template_reverse.ts",
+    "mode": "check"
+  },
+  {
+    "id": "strings/literal_strings_disjoint",
+    "file": "cases/strings/literal_strings_disjoint.ts",
+    "mode": "check"
+  },
+  {
+    "id": "strings/literal_template_boolean",
+    "file": "cases/strings/literal_template_boolean.ts",
+    "mode": "run"
+  },
+  {
+    "id": "strings/literal_template_negative",
+    "file": "cases/strings/literal_template_negative.ts",
+    "mode": "check"
+  },
+  {
+    "id": "strings/literal_template_overlap",
+    "file": "cases/strings/literal_template_overlap.ts",
+    "mode": "run"
   }
 ]

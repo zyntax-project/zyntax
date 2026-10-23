@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 14,
+      "length": 22,
+      "file": "literal_template_disjoint.ts",
+      "message": "This comparison appears to be unintentional because the types '\"abc0abc\"' and '\"abc\"' have no overlap."
+    }
+  ],
+  "source_sha256": "764f05fa41ade69c32e2abcd100a4d596c5df1530dcae90cbb31110adc680f80",
+  "options": {}
+}

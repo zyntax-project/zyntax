@@ -3740,6 +3740,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let right = self.expr(&b.right)?;
         let op = b.operator.as_str();
         if matches!(op, "===" | "!==" | "==" | "!=")
+            && left.ty == string()
+            && right.ty == string()
+            && let (Some(left), Some(right)) = (
+                constants::literal_text(&b.left),
+                constants::literal_text(&b.right),
+            )
+            && left != right
+        {
+            return self.error(ErrorKind::Type, "comparison has no overlapping types", at);
+        }
+        if matches!(op, "===" | "!==" | "==" | "!=")
             && (matches!(left.ty, Type::Optional(_))
                 || matches!(right.ty, Type::Optional(_))
                 || left.ty == unit()

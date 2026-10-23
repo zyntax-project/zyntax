@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 14,
+      "length": 22,
+      "file": "literal_template_reverse.ts",
+      "message": "This comparison appears to be unintentional because the types '\"abc\"' and '\"abc0abc\"' have no overlap."
+    }
+  ],
+  "source_sha256": "0f19c558b2e3f924bd6397eed80f68ffecb5c2d7abed641acf97a1efbecf13ec",
+  "options": {}
+}

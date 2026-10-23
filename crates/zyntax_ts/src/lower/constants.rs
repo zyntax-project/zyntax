@@ -1,6 +1,57 @@
 //! Top-level `const` declarations with compile-time values are substituted where used.
 
 use super::*;
+use std::borrow::Cow;
+
+/// Syntactic literal types only; evaluating an expression does not make its type literal.
+pub(super) fn literal_text<'a>(source: &'a js::Expression<'_>) -> Option<Cow<'a, str>> {
+    match source {
+        js::Expression::StringLiteral(s) if !s.lone_surrogates => {
+            Some(Cow::Borrowed(s.value.as_str()))
+        }
+        js::Expression::ParenthesizedExpression(p) => literal_text(&p.expression),
+        js::Expression::TemplateLiteral(t) => {
+            let mut text = String::new();
+            for (index, quasi) in t.quasis.iter().enumerate() {
+                if quasi.lone_surrogates {
+                    return None;
+                }
+                text.push_str(quasi.value.cooked.as_ref()?.as_str());
+                if let Some(expression) = t.expressions.get(index) {
+                    text.push_str(&literal_interpolation(expression)?);
+                }
+            }
+            Some(Cow::Owned(text))
+        }
+        _ => None,
+    }
+}
+
+fn literal_interpolation<'a>(source: &'a js::Expression<'_>) -> Option<Cow<'a, str>> {
+    let number = match source {
+        js::Expression::NumericLiteral(n) => Some(n.value),
+        js::Expression::UnaryExpression(u) if matches!(u.operator.as_str(), "+" | "-") => {
+            let js::Expression::NumericLiteral(n) = &u.argument else {
+                return None;
+            };
+            Some(if u.operator.as_str() == "-" {
+                -n.value
+            } else {
+                n.value
+            })
+        }
+        js::Expression::ParenthesizedExpression(p) => return literal_interpolation(&p.expression),
+        _ => return literal_text(source),
+    }?;
+    if !number.is_finite() {
+        return None;
+    }
+    Some(Cow::Owned(if number == 0.0 {
+        "0".to_owned()
+    } else {
+        dragonbox_ecma::Buffer::new().format(number).to_owned()
+    }))
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Constant {

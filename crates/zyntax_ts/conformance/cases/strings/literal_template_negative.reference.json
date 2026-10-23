@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 14,
+      "length": 17,
+      "file": "literal_template_negative.ts",
+      "message": "This comparison appears to be unintentional because the types '\"n-1\"' and '\"n1\"' have no overlap."
+    }
+  ],
+  "source_sha256": "5489f370a150e6d43007ea8d377ac40b132888eb105804ffc8ac53bc4d65d311",
+  "options": {}
+}
