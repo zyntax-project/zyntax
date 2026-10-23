@@ -736,3 +736,53 @@ fn llvm_and_mixed_native_calls_keep_union_values() {
         assert_eq!(unsafe { native() }, expected, "LLVM caller / LLVM echo");
     }
 }
+
+#[test]
+fn the_interpreter_stores_an_integer_into_an_address_payload() {
+    let address = HirType::Ptr(std::sync::Arc::new(HirType::I8));
+    let ty = union(HirType::U32, address.clone(), false);
+    let mut main = function("addressPayload", vec![], vec![HirType::I64]);
+    let bits = value(
+        &mut main,
+        HirType::I64,
+        HirValueKind::Constant(HirConstant::I64(4096)),
+    );
+    let made = value(&mut main, ty.clone(), HirValueKind::Instruction);
+    emit(
+        &mut main,
+        HirInstruction::CreateUnion {
+            result: made,
+            union_ty: ty,
+            variant_index: 1,
+            value: bits,
+        },
+    );
+    let held = value(&mut main, address.clone(), HirValueKind::Instruction);
+    emit(
+        &mut main,
+        HirInstruction::ExtractUnionValue {
+            result: held,
+            ty: address,
+            union_val: made,
+            variant_index: 1,
+        },
+    );
+    let back = value(&mut main, HirType::I64, HirValueKind::Instruction);
+    emit(
+        &mut main,
+        HirInstruction::Cast {
+            op: CastOp::PtrToInt,
+            result: back,
+            ty: HirType::I64,
+            operand: held,
+        },
+    );
+    ret(&mut main, back);
+    let mut module = HirModule::new(InternedString::new_global("address_payload"));
+    module.functions.insert(main.id, main);
+    let mut interp = zyntax_compiler::hir_interp::HirInterpreter::new();
+    assert_eq!(
+        interp.call(&module, "addressPayload", vec![]).unwrap(),
+        zyntax_compiler::value::ZyntaxValue::Int(4096)
+    );
+}

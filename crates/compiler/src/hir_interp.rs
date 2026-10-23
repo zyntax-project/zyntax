@@ -5782,11 +5782,16 @@ unsafe fn write_typed(ptr: *mut u8, v: &ZyntaxValue, ty: &HirType) {
                 *(ptr as *mut f64) = f;
             }
         }
-        HirType::Ptr(_) => {
-            if let ZyntaxValue::Pointer(p) = v {
-                *(ptr as *mut *mut u8) = *p;
+        // An address arrives as a pointer, or as the integer bit arithmetic on
+        // one produced.
+        HirType::Ptr(_) => match v {
+            ZyntaxValue::Pointer(p) => *(ptr as *mut *mut u8) = *p,
+            other => {
+                if let Some(n) = value_to_i64(other) {
+                    *(ptr as *mut usize) = n as usize;
+                }
             }
-        }
+        },
         HirType::Struct(s) if crate::abi::struct_carried_as_its_field(s).is_some() => {
             write_typed(ptr, v, &s.fields[0]);
         }
