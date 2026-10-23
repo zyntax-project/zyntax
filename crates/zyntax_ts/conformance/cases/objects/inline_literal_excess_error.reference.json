@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2353,
+      "start": 63,
+      "length": 1,
+      "file": "inline_literal_excess_error.ts",
+      "message": "Object literal may only specify known properties, and 'y' does not exist in type '{ x: number; }'."
+    }
+  ],
+  "source_sha256": "49d0e71ed00fa14162a9ecb69a331d9a0c3cea20dd31ab02a3151b1bc004d7e4",
+  "options": {}
+}

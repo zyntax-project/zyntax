@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 6,
+      "length": 1,
+      "file": "inline_literal_missing_error.ts",
+      "message": "Property 'y' is missing in type '{ x: number; }' but required in type '{ x: number; y: number; }'."
+    }
+  ],
+  "source_sha256": "8ffbcd954c6d3254e6fe8246deb488e910b24642757c966376bd4a270ff1b4d0",
+  "options": {}
+}

@@ -2439,5 +2439,35 @@
     "id": "statements/switch_strings",
     "file": "cases/statements/switch_strings.ts",
     "mode": "run"
+  },
+  {
+    "id": "objects/inline_literal",
+    "file": "cases/objects/inline_literal.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/inline_literal_alias",
+    "file": "cases/objects/inline_literal_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/inline_literal_excess_error",
+    "file": "cases/objects/inline_literal_excess_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "objects/inline_literal_readonly_error",
+    "file": "cases/objects/inline_literal_readonly_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "objects/inline_literal_missing_error",
+    "file": "cases/objects/inline_literal_missing_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "objects/string_keys",
+    "file": "cases/objects/string_keys.ts",
+    "mode": "run"
   }
 ]

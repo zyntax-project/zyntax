@@ -63,6 +63,155 @@ fn undefined() -> Type {
 fn is_undefined(ty: &Type) -> bool {
     matches!(ty, Type::Optional(inner) if **inner == Type::Never)
 }
+/// Types the standard and DOM libraries declare, which the frontend does not model yet.
+fn library_type(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "Object",
+        "Function",
+        "String",
+        "Number",
+        "Boolean",
+        "Symbol",
+        "BigInt",
+        "Date",
+        "RegExp",
+        "Error",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "AggregateError",
+        "Array",
+        "ReadonlyArray",
+        "Map",
+        "Set",
+        "ReadonlyMap",
+        "ReadonlySet",
+        "WeakMap",
+        "WeakSet",
+        "WeakRef",
+        "Promise",
+        "PromiseLike",
+        "Iterable",
+        "Iterator",
+        "IterableIterator",
+        "IteratorResult",
+        "AsyncIterable",
+        "AsyncIterator",
+        "AsyncIterableIterator",
+        "Generator",
+        "AsyncGenerator",
+        "GeneratorFunction",
+        "ArrayLike",
+        "Record",
+        "Partial",
+        "Required",
+        "Readonly",
+        "Pick",
+        "Omit",
+        "Exclude",
+        "Extract",
+        "NonNullable",
+        "ReturnType",
+        "Parameters",
+        "ConstructorParameters",
+        "InstanceType",
+        "ThisParameterType",
+        "OmitThisParameter",
+        "ThisType",
+        "Awaited",
+        "Uppercase",
+        "Lowercase",
+        "Capitalize",
+        "Uncapitalize",
+        "ArrayBuffer",
+        "SharedArrayBuffer",
+        "ArrayBufferLike",
+        "ArrayBufferView",
+        "DataView",
+        "Int8Array",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float32Array",
+        "Float64Array",
+        "BigInt64Array",
+        "BigUint64Array",
+        "JSON",
+        "Math",
+        "Intl",
+        "Atomics",
+        "Reflect",
+        "ProxyHandler",
+        "PropertyKey",
+        "PropertyDescriptor",
+        "PropertyDescriptorMap",
+        "TemplateStringsArray",
+        "IArguments",
+        "CallableFunction",
+        "NewableFunction",
+        "ObjectConstructor",
+        "FunctionConstructor",
+        "StringConstructor",
+        "NumberConstructor",
+        "BooleanConstructor",
+        "ArrayConstructor",
+        "DateConstructor",
+        "RegExpConstructor",
+        "ErrorConstructor",
+        "SymbolConstructor",
+        "PromiseConstructor",
+        "MapConstructor",
+        "SetConstructor",
+        "RegExpMatchArray",
+        "RegExpExecArray",
+        "Console",
+        "Window",
+        "Document",
+        "Element",
+        "Node",
+        "NodeList",
+        "Event",
+        "EventTarget",
+        "HTMLCollection",
+        "CSSStyleDeclaration",
+        "Storage",
+        "Location",
+        "Navigator",
+        "Response",
+        "Request",
+        "Headers",
+        "URL",
+        "URLSearchParams",
+        "Blob",
+        "File",
+        "FormData",
+        "AbortController",
+        "AbortSignal",
+        "TextEncoder",
+        "TextDecoder",
+        "Worker",
+        "MessageEvent",
+        "KeyboardEvent",
+        "MouseEvent",
+        "CustomEvent",
+        "XMLHttpRequest",
+        "WebSocket",
+        "Image",
+        "Audio",
+        "Text",
+        "Comment",
+        "DocumentFragment",
+        "MutationObserver",
+        "IntersectionObserver",
+    ];
+    NAMES.contains(&name) || name.starts_with("HTML") || name.starts_with("SVG")
+}
 fn is_true(test: &js::Expression<'_>) -> bool {
     matches!(test, js::Expression::BooleanLiteral(b) if b.value)
 }
@@ -697,6 +846,8 @@ struct Lowerer<'ast, 'program> {
     prefix_len: usize,
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
+    /// Inline object type literals with known layouts, by source offset.
+    type_literals: FxHashMap<u32, (Type, Option<InternedString>)>,
     imported_exports: FxHashMap<InternedString, CheckerExport>,
     namespaces: Vec<namespaces::Namespace>,
     namespace_references: FxHashMap<oxc_semantic::NodeId, usize>,
@@ -771,6 +922,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             prefix_len,
             registry,
             aliases: FxHashMap::default(),
+            type_literals: FxHashMap::default(),
             imported_exports: FxHashMap::default(),
             namespaces: vec![],
             namespace_references: FxHashMap::default(),
@@ -890,6 +1042,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         // Enum initializers may name constants; types may name enums.
         self.collect_constants(program);
         self.declare_enums(program)?;
+        self.inline_type_literals(program);
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -922,6 +1075,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             pending = next;
         }
+        // Literals whose fields name aliases resolve once the aliases do.
+        self.inline_type_literals(program);
         self.collect_constants(program);
         for item in &program.body {
             if let Some(f) = modules::function(item) {
@@ -1145,6 +1300,36 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
+    /// Registers every inline object type literal whose fields are known, so an annotation
+    /// anywhere names its layout. A literal that needs a generic parameter or another
+    /// unsupported field stays unregistered and reports Unsupported where it is used.
+    fn inline_type_literals(&mut self, program: &'program js::Program<'ast>) {
+        struct Literals<'l, 'ast, 'program> {
+            lowerer: &'l mut Lowerer<'ast, 'program>,
+        }
+        impl<'ast> Visit<'ast> for Literals<'_, 'ast, '_> {
+            fn visit_ts_type_literal(&mut self, it: &js::TSTypeLiteral<'ast>) {
+                self.lowerer.register_type_literal(it);
+                walk::walk_ts_type_literal(self, it);
+            }
+        }
+        Literals { lowerer: self }.visit_program(program);
+    }
+
+    fn register_type_literal(&mut self, literal: &js::TSTypeLiteral<'ast>) {
+        if self.type_literals.contains_key(&literal.span.start) {
+            return;
+        }
+        let Ok(fields) = self.fields(&literal.members) else {
+            return;
+        };
+        let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
+        let label = format!("literal{}", literal.span.start);
+        let view = self.record_view(&label, &ty, fields);
+        self.type_literals
+            .insert(literal.span.start, (ty, Some(view)));
+    }
+
     fn fields(&mut self, members: &[js::TSSignature<'ast>]) -> Result<Fields<'ast>> {
         let mut fields = Fields::new();
         for member in members {
@@ -1349,18 +1534,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if let Some(enumeration) = self.enum_type(name, r.span) {
                     return enumeration;
                 }
-                self.aliases.get(&name).cloned().ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::Type,
-                        format!(
-                            "unknown type `{}`",
-                            name.resolve_global().unwrap_or_default()
-                        ),
-                        r.span,
-                    )
-                })?
+                if let Some(found) = self.aliases.get(&name) {
+                    return Ok(found.clone());
+                }
+                let source = name.resolve_global().unwrap_or_default();
+                if library_type(&source) {
+                    return self.unsupported(&format!("library type `{source}`"), r.span);
+                }
+                return self.error(ErrorKind::Type, format!("unknown type `{source}`"), r.span);
             }
             js::TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
+            js::TSType::TSTypeLiteral(literal) => match self.type_literals.get(&literal.span.start)
+            {
+                Some(found) => found.clone(),
+                None => return self.unsupported("this type representation", ty.span()),
+            },
             _ => return self.unsupported("this type representation", ty.span()),
         })
     }
@@ -3903,24 +4091,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if let Some(constant) = self.math_constant(m) {
                     return Ok(constant);
                 }
-                let object = self.expr(&m.object)?;
-                if element_type(&object.ty).is_some() && m.property.name == "length" {
-                    return Ok(self.array_length(object, at));
-                }
-                self.check_field_access(&m.object, m.property.name.as_str(), at)?;
-                let ty = self.field_type(
-                    self.source_type(&m.object, &object.ty),
-                    m.property.name.as_str(),
-                    at,
-                )?;
-                node(
-                    TypedExpression::Field(TypedFieldAccess {
-                        object: Box::new(object),
-                        field: self.name(m.property.name.as_str()),
-                    }),
-                    ty,
-                    at,
-                )
+                self.field_read(&m.object, m.property.name.as_str(), at)?
             }
             js::Expression::ArrayExpression(a) => self.array_literal(a, None)?,
             js::Expression::ComputedMemberExpression(m) if !m.optional => {
@@ -3929,6 +4100,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 if let Some(sig) = self.namespace_function(e)? {
                     return self.function_value(sig, at);
+                }
+                if let Some(key) = Self::string_key(&m.expression) {
+                    return self.field_read(&m.object, key, at);
                 }
                 self.array_index(&m.object, &m.expression, at)?
             }
@@ -4215,6 +4389,47 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.expect(&left.ty, &number(), at)?;
         }
         Ok(binary(operator, left, right, ty, at))
+    }
+
+    /// `object.name`, or `object["name"]`, which names the same property.
+    fn field_read(
+        &mut self,
+        receiver: &js::Expression<'ast>,
+        name: &'ast str,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let object = self.expr(receiver)?;
+        if element_type(&object.ty).is_some() && name == "length" {
+            return Ok(self.array_length(object, at));
+        }
+        self.check_field_access(receiver, name, at)?;
+        let ty = self.field_type(self.source_type(receiver, &object.ty), name, at)?;
+        Ok(node(
+            TypedExpression::Field(TypedFieldAccess {
+                object: Box::new(object),
+                field: self.name(name),
+            }),
+            ty,
+            at,
+        ))
+    }
+
+    /// The property a computed member names with a string literal.
+    fn string_key(key: &js::Expression<'ast>) -> Option<&'ast str> {
+        match key {
+            js::Expression::StringLiteral(s) if !s.lone_surrogates => Some(s.value.as_str()),
+            js::Expression::TemplateLiteral(t) if t.expressions.is_empty() => {
+                let quasi = &t.quasis[0];
+                quasi
+                    .value
+                    .cooked
+                    .as_ref()
+                    .filter(|_| !quasi.lone_surrogates)
+                    .map(|text| text.as_str())
+            }
+            js::Expression::ParenthesizedExpression(p) => Self::string_key(&p.expression),
+            _ => None,
+        }
     }
 
     fn field_type(&self, ty: &Type, field: &'ast str, at: oxc_span::Span) -> Result<Type> {
@@ -4634,7 +4849,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.require_native(name, at)?;
                 Ok(var(name, ty, at))
             }
-            js::SimpleAssignmentTarget::StaticMemberExpression(m) => self.field_target(m),
+            js::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                self.field_target(&m.object, m.property.name.as_str(), m.span)
+            }
+            js::SimpleAssignmentTarget::ComputedMemberExpression(m)
+                if !m.optional && Self::string_key(&m.expression).is_some() =>
+            {
+                let key = Self::string_key(&m.expression).unwrap();
+                self.field_target(&m.object, key, m.span)
+            }
             js::SimpleAssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
                 self.check_namespace_write(&m.object, at)?;
                 self.array_index(&m.object, &m.expression, at)
@@ -4643,53 +4866,50 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
     }
 
-    fn field_target(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
-        self.check_namespace_write(&m.object, m.span)?;
-        if let js::Expression::Identifier(id) = &m.object {
+    fn field_target(
+        &mut self,
+        receiver: &js::Expression<'ast>,
+        name: &'ast str,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        self.check_namespace_write(receiver, at)?;
+        if let js::Expression::Identifier(id) = receiver {
             if self
                 .binding(id.name.as_str(), id.span)
                 .is_ok_and(|b| element_type(&b.ty).is_some())
             {
                 return self.unsupported(
                     "array property mutation, including sparse length changes",
-                    m.span,
+                    at,
                 );
             }
         }
-        self.check_field_access(&m.object, m.property.name.as_str(), m.span)?;
-        if !self.readonly_field_write_allowed(&m.object)
+        self.check_field_access(receiver, name, at)?;
+        if !self.readonly_field_write_allowed(receiver)
             && self
-                .view_of(&m.object)
+                .view_of(receiver)
                 .and_then(|n| self.views.get(&n))
-                .and_then(|view| view.field(self.name(m.property.name.as_str())))
+                .and_then(|view| view.field(self.name(name)))
                 .is_some_and(|f| f.readonly)
         {
-            return self.error(
-                ErrorKind::Type,
-                "cannot assign to readonly property",
-                m.span,
-            );
+            return self.error(ErrorKind::Type, "cannot assign to readonly property", at);
         }
         // Assignment receivers currently require a lexical reference view.
         if !matches!(
-            m.object,
+            receiver,
             js::Expression::Identifier(_) | js::Expression::ThisExpression(_)
         ) {
-            return self.unsupported("assignment through a computed receiver", m.span);
+            return self.unsupported("assignment through a computed receiver", at);
         }
-        let object = self.expr(&m.object)?;
-        let ty = self.field_type(
-            self.source_type(&m.object, &object.ty),
-            m.property.name.as_str(),
-            m.span,
-        )?;
+        let object = self.expr(receiver)?;
+        let ty = self.field_type(self.source_type(receiver, &object.ty), name, at)?;
         Ok(node(
             TypedExpression::Field(TypedFieldAccess {
                 object: Box::new(object),
-                field: self.name(m.property.name.as_str()),
+                field: self.name(name),
             }),
             ty,
-            m.span,
+            at,
         ))
     }
 
@@ -4704,7 +4924,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.require_native(name, a.span)?;
                 var(name, ty, a.span)
             }
-            js::AssignmentTarget::StaticMemberExpression(m) => self.field_target(m)?,
+            js::AssignmentTarget::StaticMemberExpression(m) => {
+                self.field_target(&m.object, m.property.name.as_str(), m.span)?
+            }
+            js::AssignmentTarget::ComputedMemberExpression(m)
+                if !m.optional && Self::string_key(&m.expression).is_some() =>
+            {
+                let key = Self::string_key(&m.expression).unwrap();
+                self.field_target(&m.object, key, m.span)?
+            }
             js::AssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
                 self.check_namespace_write(&m.object, a.span)?;
                 self.array_index(&m.object, &m.expression, a.span)?
