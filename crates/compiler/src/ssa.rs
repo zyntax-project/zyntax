@@ -7614,17 +7614,22 @@ impl SsaBuilder {
     /// evaluation ended. An expression that creates control flow (a
     /// conditional, a short-circuit, a match) finishes in a merge block
     /// rather than the one it started in, and whatever its parent emits
-    /// next belongs there.
+    /// next belongs there. A report already pending belongs to an enclosing
+    /// expression, so the operand reads only the one its own evaluation
+    /// makes and leaves the other in place.
     fn translate_operand(
         &mut self,
         block: &mut HirId,
         expr: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
-        let value = self.translate_expression(*block, expr)?;
-        if let Some(cont) = self.continuation_block.take() {
+        let pending = self.continuation_block.take();
+        let value = self.translate_expression(*block, expr);
+        let own = self.continuation_block.take();
+        self.continuation_block = pending;
+        if let Some(cont) = own {
             *block = cont;
         }
-        Ok(value)
+        value
     }
 
     /// Tell the parent where evaluation ended, when it moved. The
