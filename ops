@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792779421,"nonce":"zagBj6gBACoO6EuD/N+9VCy4cIk=","message":"Landed in 6cf3a22cd52749c9c9602c14152b63f1b7e6a0f5. hot_reload_loop_boundary, hot_reload_fibers and hot_reload_effect_fibers pass on the NUC (release).","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792779421,"nonce":"eqMuOZTiS9zRU6uLxoxcpddAfOc=","status":2}]}
