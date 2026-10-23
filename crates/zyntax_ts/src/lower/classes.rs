@@ -127,15 +127,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         (Some(annotation), _) => {
                             let (ty, view) = self.ty(&annotation.type_annotation)?;
                             self.plain_enum(view, "enum-typed fields", p.span)?;
-                            let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) =
-                                ty
-                            else {
+                            let Some(ty) = field_primitive(&ty) else {
                                 return self.unsupported("reference-valued object fields", p.span);
                             };
                             ty
                         }
                         (None, Some(js::Expression::NumericLiteral(_))) => PrimitiveType::F64,
                         (None, Some(js::Expression::BooleanLiteral(_))) => PrimitiveType::Bool,
+                        (None, Some(js::Expression::StringLiteral(_))) => PrimitiveType::String,
                         _ => return self.unsupported("class field type inference", p.span),
                     };
                     if fields.iter().any(|f| f.name == field) {
@@ -224,7 +223,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 };
                 let (ty, view) = self.ty(&annotation.type_annotation)?;
                 self.plain_enum(view, "enum-typed fields", p.span)?;
-                let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
+                let Some(ty) = field_primitive(&ty) else {
                     return self.unsupported("reference-valued object fields", p.span);
                 };
                 if fields.iter().any(|f| f.name == parameter.name.as_str()) {
@@ -448,14 +447,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .iter()
             .map(|field| TypedFieldInit {
                 name: self.name(field.name),
-                value: Box::new(if field.ty == PrimitiveType::Bool {
-                    node(
+                value: Box::new(match field.ty {
+                    PrimitiveType::Bool => node(
                         TypedExpression::Literal(TypedLiteral::Bool(false)),
                         boolean(),
                         at,
-                    )
-                } else {
-                    num(0.0, at)
+                    ),
+                    PrimitiveType::String => node(
+                        TypedExpression::Literal(TypedLiteral::String(self.name(""))),
+                        string(),
+                        at,
+                    ),
+                    _ => num(0.0, at),
                 }),
             })
             .collect();
@@ -505,6 +508,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         field.unwrap(),
                     )
                 };
+                if field.ty == PrimitiveType::String {
+                    return self
+                        .unsupported("string fields without a proven static lifetime", p.span);
+                }
                 statements
                     .push(self.field_assignment(this, &ty, field.name, field.ty, value, p.span));
             }
@@ -516,6 +523,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let expected = Type::Primitive(field.ty);
             let value = self.expr_expected(initializer, &expected)?;
             self.expect(&value.ty, &expected, field.span)?;
+            if field.ty == PrimitiveType::String && !self.immortal_string(initializer) {
+                return self
+                    .unsupported("string fields without a proven static lifetime", field.span);
+            }
             statements
                 .push(self.field_assignment(this, &ty, field.name, field.ty, value, field.span));
         }

@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 30,
+      "length": 4,
+      "file": "string_field_type_error.ts",
+      "message": "Type 'number' is not assignable to type 'string'."
+    }
+  ],
+  "source_sha256": "6a4d86cc40946b9b80440b899ab7ecc6c208e81d23401a852496c6a064bc6863",
+  "options": {}
+}

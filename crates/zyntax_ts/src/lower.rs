@@ -213,6 +213,15 @@ fn library_type(name: &str) -> bool {
     ];
     NAMES.contains(&name) || name.starts_with("HTML") || name.starts_with("SVG")
 }
+/// The native type of a record or class field: a number, boolean or string.
+fn field_primitive(ty: &Type) -> Option<PrimitiveType> {
+    match ty {
+        Type::Primitive(
+            ty @ (PrimitiveType::F64 | PrimitiveType::Bool | PrimitiveType::String),
+        ) => Some(*ty),
+        _ => None,
+    }
+}
 fn is_true(test: &js::Expression<'_>) -> bool {
     matches!(test, js::Expression::BooleanLiteral(b) if b.value)
 }
@@ -768,7 +777,49 @@ pub(crate) fn with_parsed<T, E>(
     if declaration && let Some(diagnostic) = crate::ambient::check(&parsed.program) {
         return Err(error(diagnostic));
     }
+    if let Some(at) = missing_member_separator(&parsed.program, source) {
+        return Err(error(Error::new(ErrorKind::Syntax, "';' expected", at)));
+    }
     lower(&parsed.program, &semantic.semantic)
+}
+
+/// Type members on one line need a `;` or `,` between them, which the parser does not require.
+fn missing_member_separator(program: &js::Program<'_>, source: &str) -> Option<oxc_span::Span> {
+    struct Members<'s> {
+        source: &'s str,
+        found: Option<oxc_span::Span>,
+    }
+    impl Members<'_> {
+        fn check(&mut self, members: &[js::TSSignature<'_>]) {
+            for pair in members.windows(2) {
+                let (end, start) = (pair[0].span().end as usize, pair[1].span().start as usize);
+                let own = &self.source[pair[0].span().start as usize..end];
+                let between = self.source.get(end..start).unwrap_or("");
+                if self.found.is_none()
+                    && !own.ends_with([';', ','])
+                    && !between.contains([';', ',', '\n', '\r'])
+                {
+                    self.found = Some(pair[1].span());
+                }
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Members<'_> {
+        fn visit_ts_type_literal(&mut self, it: &js::TSTypeLiteral<'a>) {
+            self.check(&it.members);
+            walk::walk_ts_type_literal(self, it);
+        }
+        fn visit_ts_interface_body(&mut self, it: &js::TSInterfaceBody<'a>) {
+            self.check(&it.body);
+            walk::walk_ts_interface_body(self, it);
+        }
+    }
+    let mut members = Members {
+        source,
+        found: None,
+    };
+    members.visit_program(program);
+    members.found
 }
 
 // Grammar rules oxc enforces while parsing but TypeScript reports from its checker.
@@ -1350,7 +1401,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             };
             let (ty, view) = self.ty(&annotation.type_annotation)?;
             self.plain_enum(view, "enum-typed fields", p.span)?;
-            let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
+            let Some(ty) = field_primitive(&ty) else {
                 return self.unsupported("reference-valued object fields", p.span);
             };
             fields.push((
@@ -2436,7 +2487,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .chain(definition.fields.iter().map(|field| match field.ty {
                         Type::Primitive(PrimitiveType::F64) => HirType::F64,
                         Type::Primitive(PrimitiveType::Bool) => HirType::Bool,
-                        _ => unreachable!("TS records have scalar fields"),
+                        Type::Primitive(PrimitiveType::String) => {
+                            HirType::Ptr(std::sync::Arc::new(HirType::I8))
+                        }
+                        _ => unreachable!("TS record fields are numbers, booleans or strings"),
                     }))
                     .collect();
                 object_header::field_layout(&fields).0
@@ -3596,6 +3650,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
     }
 
+    /// `&&` and `||` select one of their operands; only boolean operands are lowered so far.
+    fn logical_operand(&self, ty: &Type, at: oxc_span::Span) -> Result<()> {
+        if *ty == unit() {
+            return self.error(
+                ErrorKind::Type,
+                "an expression of type void cannot be tested for truthiness",
+                at,
+            );
+        }
+        if *ty != boolean() {
+            return self.unsupported(
+                "value-selecting logical operations on non-boolean values",
+                at,
+            );
+        }
+        Ok(())
+    }
+
     fn condition(&mut self, e: &js::Expression<'ast>) -> Result<Expr> {
         let value = self.expr(e)?;
         self.truthy(value, e.span())
@@ -3948,7 +4020,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 string(),
                 at,
             ),
-            js::Expression::TemplateLiteral(template) => self.template(template)?,
+            // A template of literal parts is a static string, as TypeScript types it.
+            js::Expression::TemplateLiteral(template) => match constants::literal_text(e) {
+                Some(text) => node(
+                    TypedExpression::Literal(TypedLiteral::String(intern(&text))),
+                    string(),
+                    at,
+                ),
+                None => self.template(template)?,
+            },
             js::Expression::Identifier(i) => {
                 if self.namespace_references.contains_key(&i.node_id.get()) {
                     return self.unsupported("namespace objects as values", at);
@@ -4000,6 +4080,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     }
                     match i.name.as_str() {
                         "undefined" => var(self.name("None"), undefined(), at),
+                        "console" if !self.imported_exports.contains_key(&self.name("console")) => {
+                            return self.unsupported("the console object as a value", at);
+                        }
                         "NaN" => num(f64::NAN, at),
                         "Infinity" => num(f64::INFINITY, at),
                         name if self.constant_expr(name, at).is_some() => {
@@ -4092,7 +4175,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             at,
                         );
                     }
-                    self.expect(&left.ty, &boolean(), at)?;
+                    self.logical_operand(&left.ty, at)?;
                     self.narrow(&l.left, op == "&&");
                     let right = self.expr(&l.right)?;
                     if matches!(right.ty, Type::Optional(_)) {
@@ -4101,7 +4184,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             at,
                         );
                     }
-                    self.expect(&right.ty, &boolean(), at)?;
+                    self.logical_operand(&right.ty, at)?;
                     self.merge_flow(&before);
                     let op = match op {
                         "&&" => BinaryOp::And,
@@ -4555,11 +4638,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let name = self.key(&p.key)?;
             let value = self.expr(&p.value)?;
             self.plain_enum(self.view_of(&p.value), "enum-valued object fields", p.span)?;
-            if !matches!(
-                value.ty,
-                Type::Primitive(PrimitiveType::F64 | PrimitiveType::Bool)
-            ) {
+            if field_primitive(&value.ty).is_none() {
                 return self.unsupported("reference-valued object fields", p.span);
+            }
+            if value.ty == string() && !self.immortal_string(&p.value) {
+                return self.unsupported("string fields without a proven static lifetime", p.span);
             }
             let temporary = self.fresh("field");
             let ty = value.ty.clone();
@@ -4646,8 +4729,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if let js::Expression::Identifier(receiver) = &m.object {
                 self.require_value(receiver.name.as_str(), receiver.span)?;
-                if receiver.name == "console"
-                    && m.property.name == "log"
+                let console = receiver.name == "console"
                     && !self
                         .namespace_references
                         .contains_key(&receiver.node_id.get())
@@ -4655,8 +4737,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     && !self
                         .scopes
                         .iter()
-                        .any(|s| s.contains_key(&self.name("console")))
-                {
+                        .any(|s| s.contains_key(&self.name("console")));
+                if console && m.property.name != "log" {
+                    return self.unsupported("console methods other than log", at);
+                }
+                if console {
                     if c.type_arguments.is_some() {
                         return self.error(
                             ErrorKind::Type,
@@ -5140,6 +5225,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 "array storage of strings without a proven static lifetime",
                 a.span,
             );
+        }
+        if matches!(target.node, TypedExpression::Field(_))
+            && target.ty == string()
+            && (op != "=" || !self.immortal_string(&a.right))
+        {
+            return self.unsupported("string fields without a proven static lifetime", a.span);
         }
         if let TypedExpression::Variable(name) = target.node
             && self.globals.contains_key(&name)

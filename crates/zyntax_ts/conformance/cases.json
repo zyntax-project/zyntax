@@ -2504,5 +2504,25 @@
     "id": "functions/required_after_optional_error",
     "file": "cases/functions/required_after_optional_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "objects/string_fields",
+    "file": "cases/objects/string_fields.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/string_fields_loop",
+    "file": "cases/objects/string_fields_loop.ts",
+    "mode": "run"
+  },
+  {
+    "id": "objects/string_field_type_error",
+    "file": "cases/objects/string_field_type_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/string_field_error",
+    "file": "cases/classes/string_field_error.ts",
+    "mode": "check"
   }
 ]

@@ -800,41 +800,47 @@ fn warm_snapshots_preserve_native_layouts_release_sites_and_real_promotions() {
             assert!(signature.attributes.optimized);
             assert!(signature.blocks.is_empty());
             let body = hir.function(signature.id).unwrap();
-            let instructions: Vec<_> = body.blocks.values().flat_map(|b| &b.instructions).collect();
-            assert!(instructions.iter().any(|i|matches!(i,HirInstruction::GetElementPtr{ty:HirType::Ptr(t),..} if **t==HirType::F64)));
-            let mut paths = vec![(body.entry_block, 0, 0)];
+            // An array that escapes into a call keeps its typed element layout: `pick` reads
+            // its parameter's elements. `score` itself may scalarize the arrays it makes.
+            assert!(hir.functions().any(|(_, f)| {
+                f.blocks.values().flat_map(|b| &b.instructions).any(|i| {
+                    matches!(i, HirInstruction::GetElementPtr { ty: HirType::Ptr(t), .. } if **t == HirType::F64)
+                })
+            }));
+            let intrinsic = |i: &HirInstruction, wanted: Intrinsic| matches!(i, HirInstruction::Call { callee: HirCallable::Intrinsic(found), .. } if *found == wanted);
+            let mut paths = vec![(body.entry_block, 0, 0, 0)];
             let mut returns = 0;
-            while let Some((id, releases, depth)) = paths.pop() {
+            while let Some((id, allocations, releases, depth)) = paths.pop() {
                 assert!(depth < body.blocks.len(), "unexpected cycle in score");
                 let block = &body.blocks[&id];
+                let allocations = allocations
+                    + block
+                        .instructions
+                        .iter()
+                        .filter(|i| intrinsic(i, Intrinsic::Malloc))
+                        .count();
                 let releases = releases
                     + block
                         .instructions
                         .iter()
-                        .filter(|i| {
-                            matches!(
-                                i,
-                                HirInstruction::Call {
-                                    callee: HirCallable::Intrinsic(Intrinsic::Free),
-                                    ..
-                                }
-                            )
-                        })
+                        .filter(|i| intrinsic(i, Intrinsic::Free))
                         .count();
                 match block.terminator {
-                    HirTerminator::Branch { target } => paths.push((target, releases, depth + 1)),
+                    HirTerminator::Branch { target } => {
+                        paths.push((target, allocations, releases, depth + 1))
+                    }
                     HirTerminator::CondBranch {
                         true_target,
                         false_target,
                         ..
                     } => {
-                        paths.push((true_target, releases, depth + 1));
-                        paths.push((false_target, releases, depth + 1));
+                        paths.push((true_target, allocations, releases, depth + 1));
+                        paths.push((false_target, allocations, releases, depth + 1));
                     }
                     HirTerminator::Return { .. } => {
                         assert_eq!(
-                            releases, 3,
-                            "object, array header and array buffer released once per path"
+                            releases, allocations,
+                            "every allocation score makes is released once per path"
                         );
                         returns += 1;
                     }

@@ -1,0 +1,10 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "box/3 t1 true none:anon\nnone:renamed crate/3 2 renamed\n",
+  "exit": 0,
+  "source_sha256": "af65decd3a7e1650012917dce49a6532b64a6457daf22ca4d7d5c46b5078ed09",
+  "options": {}
+}

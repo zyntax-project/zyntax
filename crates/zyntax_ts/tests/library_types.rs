@@ -4,7 +4,10 @@
 fn library_types_are_gaps_and_unknown_names_are_errors() {
     for (source, kind) in [
         ("let o: Object;", zyntax_ts::ErrorKind::Unsupported),
-        ("function f(s: String): void {}", zyntax_ts::ErrorKind::Unsupported),
+        (
+            "function f(s: String): void {}",
+            zyntax_ts::ErrorKind::Unsupported,
+        ),
         ("let e: HTMLElement;", zyntax_ts::ErrorKind::Unsupported),
         ("let x: Missing;", zyntax_ts::ErrorKind::Type),
     ] {

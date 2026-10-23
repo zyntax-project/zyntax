@@ -198,6 +198,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn immortal_string(&self, source: &js::Expression<'ast>) -> bool {
         match source {
             js::Expression::StringLiteral(s) => !s.lone_surrogates,
+            js::Expression::TemplateLiteral(_) => constants::literal_text(source).is_some(),
             js::Expression::Identifier(i) if self.constant_text(i.name.as_str()) => true,
             js::Expression::Identifier(i) => self.binding(i.name.as_str(), i.span).is_ok_and(|b| {
                 self.flow.strings.contains(&b.name)
@@ -205,6 +206,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         && self.flow.get(&b.name) == Some(&ScalarFlow::String))
             }),
             js::Expression::ParenthesizedExpression(p) => self.immortal_string(&p.expression),
+            // Every write to a string field stores a static string.
+            js::Expression::StaticMemberExpression(m) if !m.optional => {
+                self.enum_view_of_member(&m.object).is_some()
+                    || self.string_field(&m.object, m.property.name.as_str())
+            }
+            js::Expression::ComputedMemberExpression(m) if !m.optional => {
+                Self::string_key(&m.expression).is_some_and(|key| self.string_field(&m.object, key))
+            }
             js::Expression::CallExpression(c) => self
                 .array_call(c)
                 .and_then(|(_, argument)| argument)
@@ -214,6 +223,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             _ => false,
         }
+    }
+    /// Whether `object.name` is a string field of a record or class.
+    fn string_field(&self, object: &js::Expression<'ast>, name: &'ast str) -> bool {
+        let Some(view) = self.view_of(object).and_then(|v| self.views.get(&v)) else {
+            return false;
+        };
+        view.field(self.name(name))
+            .is_some_and(|f| f.ty == string())
     }
     fn array_source(&self, source: &js::Expression<'ast>) -> Option<ArrayFact> {
         match source {
