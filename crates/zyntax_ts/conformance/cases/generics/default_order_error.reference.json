@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2706,
+      "start": 23,
+      "length": 1,
+      "file": "default_order_error.ts",
+      "message": "Required type parameters may not follow optional type parameters."
+    }
+  ],
+  "source_sha256": "4a923f8be9b89fba75a9b39a32000b593d1bdd2ce0bf136bab1bad11ba36bf2f",
+  "options": {}
+}

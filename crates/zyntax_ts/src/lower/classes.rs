@@ -54,8 +54,6 @@ pub(super) struct Class<'ast, 'program> {
         &'program js::Function<'ast>,
         FunctionRole,
     )>,
-    /// Instance members beyond fields make the type nominal.
-    pub nominal: bool,
     pub span: oxc_span::Span,
 }
 
@@ -256,6 +254,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         layout.sort_by_key(|(name, _)| *name);
         let ty = self.layout(layout.iter().map(|(name, field)| (*name, field.ty)));
         let view = self.record_view(source, &ty, layout);
+        Arc::get_mut(self.views.get_mut(&view).unwrap())
+            .unwrap()
+            .nominal = nominal;
         let bodies = bodies
             .into_iter()
             .map(|(key, component, f, is_static)| {
@@ -281,7 +282,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 methods,
                 statics,
                 bodies,
-                nominal,
                 span: class.span,
             },
         );
@@ -342,6 +342,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         Arc::new(Signature {
                             native,
                             type_params: vec![],
+                            type_rules: None,
                             params: vec![],
                             ret: Some(ty),
                             ret_view: Some(view),
@@ -783,7 +784,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         at: oxc_span::Span,
     ) -> Result<()> {
         if let Some(to) = to {
-            if self.classes.get(&to).is_some_and(|c| c.nominal) && from != Some(to) {
+            if self.views.get(&to).is_some_and(|v| v.nominal) && from != Some(to) {
                 return self.error(
                     ErrorKind::Type,
                     "value is missing members required by the class type",

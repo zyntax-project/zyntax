@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2344,
+      "start": 33,
+      "length": 6,
+      "file": "default_constraint_error.ts",
+      "message": "Type 'string' does not satisfy the constraint 'number'."
+    }
+  ],
+  "source_sha256": "64787b0ef430960df45bfa23c7e432de6445d2557c415096ae94b9b7ffc810f6",
+  "options": {}
+}

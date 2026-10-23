@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2744,
+      "start": 16,
+      "length": 1,
+      "file": "default_self_error.ts",
+      "message": "Type parameter defaults can only reference previously declared type parameters."
+    }
+  ],
+  "source_sha256": "8be5eec2c47039def36110c28d03b2da65bf91af0283f75d1fa9a6c5509fdbea",
+  "options": {}
+}

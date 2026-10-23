@@ -11,7 +11,7 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType};
 use zyntax_typed_ast::checker_interface::{
     CheckerExport, CheckerField, CheckerFunction as Signature, CheckerInterface, CheckerParameter,
-    CheckerType, CheckerView,
+    CheckerType, CheckerTypeParameter, CheckerView,
 };
 use zyntax_typed_ast::typed_ast::*;
 use zyntax_typed_ast::{
@@ -673,6 +673,7 @@ struct Lowerer<'ast, 'program> {
     compatible_layouts: FxHashMap<(TypeId, TypeId), bool>,
     signatures: FxHashMap<InternedString, Arc<Signature>>,
     active_types: SmallVec<[(InternedString, Type); 2]>,
+    active_type_rules: Option<Arc<[CheckerTypeParameter]>>,
     functions: FxHashMap<InternedString, &'program js::Function<'ast>>,
     lowered: FxHashSet<InternedString>,
     self_recursive: FxHashSet<InternedString>,
@@ -720,6 +721,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             compatible_layouts: FxHashMap::default(),
             signatures: FxHashMap::default(),
             active_types: SmallVec::new(),
+            active_type_rules: None,
             functions: FxHashMap::default(),
             lowered: FxHashSet::default(),
             self_recursive: FxHashSet::default(),
@@ -1105,6 +1107,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Arc::new(CheckerView {
                 ty: ty.clone(),
                 fields,
+                nominal: false,
             }),
         );
         name
@@ -1291,12 +1294,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("function overloads", f.span);
         }
         self.active_types.clear();
+        self.active_type_rules = None;
         let mut type_params = vec![];
         if let Some(parameters) = &f.type_parameters {
             for p in &parameters.params {
-                if p.constraint.is_some() || p.default.is_some() || p.r#const {
-                    return self
-                        .unsupported("constrained, default or const type parameters", p.span);
+                if p.r#const {
+                    return self.unsupported("const type parameters", p.span);
                 }
                 let name = self.name(p.name.name.as_str());
                 if self.active_types.iter().any(|(n, _)| *n == name) {
@@ -1306,6 +1309,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.active_types.push((name, ty.clone()));
                 type_params.push((name, ty));
             }
+            self.active_type_rules = self.type_parameter_rules(parameters)?;
         }
         let mut params = vec![];
         if let FunctionRole::Method(view) = role {
@@ -1354,6 +1358,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Arc::new(Signature {
                 native,
                 type_params,
+                type_rules: self.active_type_rules.clone(),
                 params,
                 ret,
                 ret_view,
@@ -1361,6 +1366,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
         );
         self.active_types.clear();
+        self.active_type_rules = None;
         Ok(())
     }
 
@@ -1405,6 +1411,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let sig = self.signatures[&name].clone();
         self.active_types.clear();
         self.active_types.extend(sig.type_params.iter().cloned());
+        self.active_type_rules = sig.type_rules.clone();
         self.scopes.push(FxHashMap::default());
         let outer_vars = std::mem::replace(
             &mut self.vars,
@@ -1524,8 +1531,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let type_params = sig
             .type_params
             .iter()
-            .map(|(name, _)| TypedTypeParam {
+            .enumerate()
+            .map(|(index, (name, _))| TypedTypeParam {
                 name: *name,
+                bounds: sig
+                    .type_rules()
+                    .get(index)
+                    .and_then(|r| r.constraint.as_ref())
+                    .map(|c| vec![TypedTypeBound::Subtype(c.ty.clone())])
+                    .unwrap_or_default(),
+                default: sig
+                    .type_rules()
+                    .get(index)
+                    .and_then(|r| r.default.as_ref())
+                    .map(|d| d.ty.clone()),
                 span: span(f.span),
                 ..Default::default()
             })
@@ -1538,6 +1557,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         sig.array_result = array_result;
         self.pop_scope();
         self.active_types.clear();
+        self.active_type_rules = None;
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
                 name: native,
@@ -1833,6 +1853,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn expect(&self, actual: &Type, expected: &Type, at: oxc_span::Span) -> Result<()> {
+        if actual != expected && matches!(actual, Type::TypeVar(_)) {
+            let constrained = self.constraint_type(actual);
+            if constrained != actual {
+                return self.expect(constrained, expected, at);
+            }
+        }
         if actual == expected
             || unions::accepts(actual, expected)
             || (is_undefined(actual) && *expected == unit())
@@ -2479,22 +2505,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         .iter()
                         .position(|(_, ty)| Some(ty) == sig.ret.as_ref())
                     {
-                        if let Some(arguments) = &c.type_arguments {
-                            return arguments
-                                .params
-                                .get(index)
-                                .and_then(|ty| self.ty(ty).ok())
-                                .and_then(|(_, view)| view);
-                        }
-                        let arg = sig
-                            .params
-                            .iter()
-                            .position(|p| Some(&p.ty) == sig.ret.as_ref())?;
-                        return c
-                            .arguments
-                            .get(arg)
-                            .and_then(|a| a.as_expression())
-                            .and_then(|e| self.view_of(e));
+                        return self.type_argument_view(sig, c, index);
                     }
                     sig.ret_view
                 } else {
@@ -2867,6 +2878,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     /// String conversion for `+` and template literals; other types stay unsupported.
     fn text_of(&mut self, value: Expr, at: oxc_span::Span) -> Result<Expr> {
+        let value = self.constrained_scalar(value, at);
         let ty = value.ty.clone();
         if ty == string() {
             Ok(value)
@@ -3560,11 +3572,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let condition = self.condition(&c.test)?;
                 let before = self.flow.clone();
                 self.narrow(&c.test, true);
-                let a = self.expr(&c.consequent)?;
+                let mut a = self.expr(&c.consequent)?;
                 let a_static = a.ty != string() || self.immortal_string(&c.consequent);
                 let then_flow = std::mem::replace(&mut self.flow, before);
                 self.narrow(&c.test, false);
-                let b = self.expr(&c.alternate)?;
+                let mut b = self.expr(&c.alternate)?;
                 let b_static = b.ty != string() || self.immortal_string(&c.alternate);
                 self.merge_flow(&then_flow);
                 if a.ty != b.ty
@@ -3573,7 +3585,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self
                         .unsupported("conditional objects with different physical layouts", at);
                 }
-                let joined = optional_join(&a.ty, &b.ty);
+                let mut joined = optional_join(&a.ty, &b.ty);
+                if joined.is_none()
+                    && (matches!(a.ty, Type::TypeVar(_)) || matches!(b.ty, Type::TypeVar(_)))
+                {
+                    a = self.constrained_scalar(a, c.consequent.span());
+                    b = self.constrained_scalar(b, c.alternate.span());
+                    joined = optional_join(&a.ty, &b.ty);
+                    if joined.is_none() {
+                        return self.unsupported("conditional unions of generic parameters", at);
+                    }
+                }
                 if joined.is_none() {
                     self.expect(&b.ty, &a.ty, at)?;
                 }
@@ -3738,6 +3760,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let at = b.span;
         let left = self.expr(&b.left)?;
         let right = self.expr(&b.right)?;
+        let left = self.constrained_scalar(left, b.left.span());
+        let right = self.constrained_scalar(right, b.right.span());
         let op = b.operator.as_str();
         if matches!(op, "===" | "!==" | "==" | "!=")
             && left.ty == string()
@@ -4124,12 +4148,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             std::iter::repeat_n(None, sig.type_params.len()).collect();
         let explicit = type_arguments.is_some();
         if let Some(arguments) = &type_arguments {
-            if arguments.params.len() != types.len() {
+            let required = sig
+                .type_rules()
+                .iter()
+                .position(|r| r.default.is_some())
+                .unwrap_or(types.len());
+            if arguments.params.len() < required || arguments.params.len() > types.len() {
                 return self.error(ErrorKind::Type, "wrong type argument count", at);
             }
             for (slot, ty) in types.iter_mut().zip(&arguments.params) {
                 *slot = Some(self.ty(ty)?);
             }
+            self.complete_type_arguments(&sig, &mut types, at)?;
         }
         let hints: SmallVec<[Type; 4]> = sig
             .params
@@ -4162,7 +4192,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     &mut types,
                 );
             }
+            self.complete_type_arguments(&sig, &mut types, at)?;
         }
+        self.check_type_arguments(&sig, &types, at)?;
         let args = args
             .into_iter()
             .zip(arguments)

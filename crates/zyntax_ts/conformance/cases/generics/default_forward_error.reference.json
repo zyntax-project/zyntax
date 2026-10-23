@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2744,
+      "start": 16,
+      "length": 1,
+      "file": "default_forward_error.ts",
+      "message": "Type parameter defaults can only reference previously declared type parameters."
+    }
+  ],
+  "source_sha256": "e01a2fdacbd96346cf9e097f973e11d33fc7f8fdcf34abf18c19b06475a953f9",
+  "options": {}
+}

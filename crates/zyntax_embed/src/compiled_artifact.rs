@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use zyntax_typed_ast::{InternedString, TypedProgram};
 
 const MAGIC: &[u8; 4] = b"ZAST";
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const VERSION_END: usize = MAGIC.len() + std::mem::size_of::<u32>();
 const HEADER_LEN: usize = VERSION_END + zyntax_compiler::BUILD_ID_BYTES.len();
 

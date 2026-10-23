@@ -560,3 +560,67 @@ fn a_bare_import_evaluates_the_snapshot_initializer() {
     assert!(error.to_string().contains("unreachable"), "{error}");
     runtime.stop();
 }
+
+#[test]
+fn generic_bounds_defaults_and_views_survive_body_free_imports() {
+    let source = parse_module(
+        r#"
+        type Read={readonly x:number};
+        export function bounded<T extends number=number>(x:T):T{return x;}
+        export function pick<T,U extends T=T>(x:T,y:U):U{return y;}
+        export function readonlyDefault<T,U=Read>(x:T,y:U):U{return y;}
+        class A {private x:number;constructor(n:number){this.x=n;}}
+        class B {private x:number;constructor(n:number){this.x=n;}}
+        export function makeA(n:number):A{return new A(n);}
+        export function makeB(n:number):B{return new B(n);}
+        export function branded<T extends A>(x:T):T{return x;}
+        "#,
+        "library.ts",
+        ModuleId::new("library"),
+        Options::default(),
+    )
+    .unwrap();
+    let artifact = CompiledImport::decode(
+        &CompiledImport::new("typescript", "library", source.clone())
+            .encode()
+            .unwrap(),
+    )
+    .unwrap();
+    let saved = snapshot(source.clone());
+    let compact = saved.module_interface("library").unwrap().unwrap();
+    for dependency in [&source, artifact.program(), compact.program()] {
+        let good = client(
+            "import {bounded,pick} from './library';const n=bounded(3);pick<number>(n,4);",
+            dependency,
+            Options::default(),
+        )
+        .unwrap();
+        assert!(
+            good.declarations
+                .iter()
+                .any(|d| matches!(d.node, TypedDeclaration::Initializer(_)))
+        );
+        client(
+            "import {makeA,branded} from './library';branded(makeA(1));",
+            dependency,
+            Options::default(),
+        )
+        .unwrap();
+        for text in [
+            "import {makeB,branded} from './library';branded(makeB(1));",
+            "import {bounded} from './library';bounded(true);",
+            "import {bounded} from './library';bounded<string>('bad');",
+            "import {pick} from './library';pick<number>(1,'bad');",
+            "import {readonlyDefault} from './library';const q=readonlyDefault<number>(0,{x:1});q.x=2;",
+        ] {
+            assert_eq!(
+                client(text, dependency, Options::default())
+                    .err()
+                    .unwrap_or_else(|| panic!("unexpected acceptance: {text}"))
+                    .kind,
+                ErrorKind::Type,
+                "{text}"
+            );
+        }
+    }
+}

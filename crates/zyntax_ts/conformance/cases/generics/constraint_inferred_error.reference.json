@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 55,
+      "length": 4,
+      "file": "constraint_inferred_error.ts",
+      "message": "Argument of type 'boolean' is not assignable to parameter of type 'number'."
+    }
+  ],
+  "source_sha256": "16e136922e474b65a216fb4bf6d768650b203145dea90634323ef0e17eaf8341",
+  "options": {}
+}

@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2345,
+      "start": 170,
+      "length": 8,
+      "file": "constraint_private_error.ts",
+      "message": "Argument of type 'B' is not assignable to parameter of type 'A'.\n  Types have separate declarations of a private property 'x'."
+    }
+  ],
+  "source_sha256": "c7c2589fba6886f0ab24854e91712ec6499331ba8318781d893124f945bb8edf",
+  "options": {}
+}

@@ -32,6 +32,8 @@ pub struct CheckerType {
 pub struct CheckerView {
     pub ty: Type,
     pub fields: Vec<CheckerField>,
+    #[serde(default)]
+    pub nominal: bool,
 }
 
 impl CheckerView {
@@ -51,11 +53,25 @@ pub struct CheckerField {
 pub struct CheckerFunction {
     pub native: InternedString,
     pub type_params: Vec<(InternedString, Type)>,
+    #[serde(default)]
+    pub type_rules: Option<Arc<[CheckerTypeParameter]>>,
     pub params: Vec<CheckerParameter>,
     /// `None` only while a frontend is resolving an inferred signature.
     pub ret: Option<Type>,
     pub ret_view: Option<InternedString>,
     pub array_result: Option<ArrayReturn>,
+}
+
+impl CheckerFunction {
+    pub fn type_rules(&self) -> &[CheckerTypeParameter] {
+        self.type_rules.as_deref().unwrap_or(&[])
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckerTypeParameter {
+    pub constraint: Option<CheckerType>,
+    pub default: Option<CheckerType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

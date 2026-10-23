@@ -1,0 +1,23 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2313,
+      "start": 24,
+      "length": 1,
+      "file": "constraint_cycle_error.ts",
+      "message": "Type parameter 'T' has a circular constraint."
+    },
+    {
+      "code": 2313,
+      "start": 36,
+      "length": 1,
+      "file": "constraint_cycle_error.ts",
+      "message": "Type parameter 'U' has a circular constraint."
+    }
+  ],
+  "source_sha256": "a0ad2df7571749ffefd2466ab190d831ac99022166a884e1a7f2e1665733b27d",
+  "options": {}
+}

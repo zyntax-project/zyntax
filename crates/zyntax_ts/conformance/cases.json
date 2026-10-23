@@ -2069,5 +2069,90 @@
     "id": "strings/literal_template_overlap",
     "file": "cases/strings/literal_template_overlap.ts",
     "mode": "run"
+  },
+  {
+    "id": "generics/type_defaults",
+    "file": "cases/generics/type_defaults.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/dependent_defaults",
+    "file": "cases/generics/dependent_defaults.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/default_arrays",
+    "file": "cases/generics/default_arrays.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/scalar_constraints",
+    "file": "cases/generics/scalar_constraints.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/array_constraints",
+    "file": "cases/generics/array_constraints.ts",
+    "mode": "run"
+  },
+  {
+    "id": "generics/constraint_inferred_error",
+    "file": "cases/generics/constraint_inferred_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/constraint_explicit_error",
+    "file": "cases/generics/constraint_explicit_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/constraint_dependent_error",
+    "file": "cases/generics/constraint_dependent_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_constraint_error",
+    "file": "cases/generics/default_constraint_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_order_error",
+    "file": "cases/generics/default_order_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_forward_error",
+    "file": "cases/generics/default_forward_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_self_error",
+    "file": "cases/generics/default_self_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/constraint_cycle_error",
+    "file": "cases/generics/constraint_cycle_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_argument_error",
+    "file": "cases/generics/default_argument_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_readonly_error",
+    "file": "cases/generics/default_readonly_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/constraint_private_error",
+    "file": "cases/generics/constraint_private_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "generics/default_partial_readonly_error",
+    "file": "cases/generics/default_partial_readonly_error.ts",
+    "mode": "check"
   }
 ]

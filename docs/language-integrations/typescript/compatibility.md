@@ -13,7 +13,7 @@ gaps against TypeScript rather than treating them as compatibility passes.
 | --- | --- | --- |
 | Values and control flow | Numbers, booleans, strings, primitive aliases, operators, branches and loops | Full JavaScript coercion and string behavior |
 | Functions and inference | Typed parameters; forward calls; primitive, object and void return inference; annotated recursive groups; direct recursive returns inferred from base cases | Arithmetic and mutual inference cycles need annotations; recursive function-value types and broader contextual inference |
-| Generics | Inferred and explicit arguments, nested calls, recursion and cached native specializations | Constraints, defaults, const parameters and operations on unresolved generic operands |
+| Generics | Inferred and explicit arguments, trailing defaults, dependent constraints, scalar-bound operations, nested calls, recursion and cached native specializations | Generic aliases/interfaces, const parameters, richer inference and layout-dependent aggregate operations |
 | Function values | Capture-free arrows, named references, contextual parameter types and higher-order scalar signatures | Captures, function object identity/properties, parameter-count adaptation and aggregate callback signatures |
 | Objects | Scalar fields, reference identity, aliases, source-order initializers, readonly views and excess-property checks | Reference-valued fields, general layout adaptation and assignments that change concrete layout |
 | Arrays | Dense numbers, booleans, static strings, class instances and nested arrays; typed indexing, length, push, array `for…of`, and filled length constructors | Sparse extension, length mutation, other methods, optional reads and general iterator protocols |

@@ -35,6 +35,8 @@ promotion. To enable LLVM, build with `--features llvm-backend` and run with
 - `parse_module_with_dependencies` checks imports against exported checker interfaces.
   `TypedProgram::checker_interface` retains signatures, readonly views, generic
   parameters, layouts, borrow facts and array result summaries without bodies.
+- Generic function constraints and defaults share optional immutable rule metadata.
+  Imported checker views retain nominal class identity and readonly properties.
 - Static namespace members resolve by semantic symbol to those same signatures.
   A borrowed AST pass indexes namespace uses; only referenced functions enter
   shared linking, and no namespace object is allocated for these accesses.

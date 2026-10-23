@@ -31,7 +31,7 @@ pub use cache::{SnapshotCache, SnapshotDependency, SnapshotSource};
 pub use preparation::SnapshotPreparation;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 

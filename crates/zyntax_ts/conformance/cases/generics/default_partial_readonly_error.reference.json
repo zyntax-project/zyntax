@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2540,
+      "start": 119,
+      "length": 1,
+      "file": "default_partial_readonly_error.ts",
+      "message": "Cannot assign to 'x' because it is a read-only property."
+    }
+  ],
+  "source_sha256": "c83cd085bcc376e32966495dea20630eb8ddc253830ea012faff7b89b12a01d4",
+  "options": {}
+}

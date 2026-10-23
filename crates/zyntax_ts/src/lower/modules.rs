@@ -503,10 +503,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
         }
         let views = interface.types.values().filter_map(|t| t.view).chain(
-            interface
-                .functions
-                .values()
-                .flat_map(|f| f.params.iter().filter_map(|p| p.view).chain(f.ret_view)),
+            interface.functions.values().flat_map(|f| {
+                f.params
+                    .iter()
+                    .filter_map(|p| p.view)
+                    .chain(f.ret_view)
+                    .chain(
+                        f.type_rules()
+                            .iter()
+                            .flat_map(|r| r.constraint.iter().chain(r.default.iter()))
+                            .filter_map(|t| t.view),
+                    )
+            }),
         );
         for name in views {
             if let Some(view) = self.views.get(&name) {
