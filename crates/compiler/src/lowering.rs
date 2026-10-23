@@ -5328,7 +5328,14 @@ impl LoweringContext {
             }
             return Ok(());
         }
-        let hir_type = self.convert_type(&var.ty);
+        // A list global holds its header's address, as a list element does,
+        // so every function names the one list and sees it grow.
+        let hir_type = match &var.ty {
+            Type::Array { size: None, .. } => {
+                HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type()))
+            }
+            ty => self.convert_type(ty),
+        };
 
         // Evaluate initializer expression if present
         let initializer = if let Some(init_expr) = &var.initializer {
