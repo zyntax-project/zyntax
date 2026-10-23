@@ -112,6 +112,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             || self.is_class_instance(element)
         {
             Ok(())
+        } else if let Some(inner) = element_type(element) {
+            self.check_array_element(inner, at)
         } else {
             self.unsupported("arrays with this element ownership or representation", at)
         }
@@ -428,9 +430,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if self.options.indexing == Indexing::Proven {
             return self.unsupported(REASON, at);
         }
-        if !matches!(object.node, TypedExpression::Variable(_)) {
-            return self.unsupported("unproven array indexing on this receiver", at);
-        }
         let integer = Type::Primitive(PrimitiveType::I64);
         let unsigned = Type::Primitive(PrimitiveType::U64);
         let cast = |value: Expr, ty: &Type| {
@@ -458,6 +457,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }),
                 at,
             )
+        };
+        let mut receiver = Vec::new();
+        let object = if matches!(object.node, TypedExpression::Variable(_)) {
+            object
+        } else {
+            let name = self.fresh("receiver");
+            let ty = object.ty.clone();
+            receiver.push(let_(name, &ty, object));
+            var(name, ty, at)
         };
         let slot = self.fresh("slot");
         let length = self.fresh("length");
@@ -536,10 +544,22 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             integer,
             at,
         );
-        Ok(node(
+        let read = node(
             TypedExpression::Index(TypedIndex {
                 object: Box::new(object),
                 index: Box::new(guarded),
+            }),
+            element.clone(),
+            at,
+        );
+        if receiver.is_empty() {
+            return Ok(read);
+        }
+        receiver.push(expression(read));
+        Ok(node(
+            TypedExpression::Block(TypedBlock {
+                statements: receiver,
+                span: span(at),
             }),
             element,
             at,
@@ -850,6 +870,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     ) -> Result<Expr> {
         let fact = self.array_source(&m.object);
         let receiver = self.expr(&m.object)?;
+        self.array_method_on(c, m, fact, receiver)
+    }
+    pub(super) fn array_method_on(
+        &mut self,
+        c: &js::CallExpression<'ast>,
+        m: &js::StaticMemberExpression<'ast>,
+        fact: Option<ArrayFact>,
+        receiver: Expr,
+    ) -> Result<Expr> {
         let element = self.array_element(&receiver.ty, c.span)?;
         if c.type_arguments.is_some() {
             return self.error(

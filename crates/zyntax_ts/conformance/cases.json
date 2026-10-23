@@ -970,6 +970,41 @@
     "mode": "run"
   },
   {
+    "id": "arrays/nested_alias",
+    "file": "cases/arrays/nested_alias.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_literal",
+    "file": "cases/arrays/nested_literal.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_matmul",
+    "file": "cases/arrays/nested_matmul.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_three_levels",
+    "file": "cases/arrays/nested_three_levels.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_out_of_range",
+    "file": "cases/arrays/nested_out_of_range.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_assignment",
+    "file": "cases/arrays/nested_assignment.ts",
+    "mode": "run"
+  },
+  {
+    "id": "arrays/nested_release",
+    "file": "cases/arrays/nested_release.ts",
+    "mode": "run"
+  },
+  {
     "id": "arrays/error_element",
     "file": "cases/arrays/error_element.ts",
     "mode": "check"

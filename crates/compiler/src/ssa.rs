@@ -6059,6 +6059,12 @@ impl SsaBuilder {
                     }
                 }
 
+                if (is_list_shape_hir || is_list_shape_named)
+                    && matches!(&expr.ty, Type::Array { size: None, .. })
+                {
+                    elem_hir_ty = self.element_storage_type(&expr.ty);
+                }
+
                 let gep_base = if is_list_shape_hir || is_list_shape_named {
                     // Load the data pointer directly as `Ptr(elem)` — see
                     // `emit_list_data_ptr` for the AA rationale (the previous
@@ -6540,7 +6546,7 @@ impl SsaBuilder {
                     Some(expected) if elem_layouts_agree(&expected, &inferred_elem_ty) => expected,
                     _ => inferred_elem_ty,
                 };
-                let elem_ty = self.convert_type(&resolved_elem_ty);
+                let elem_ty = self.element_storage_type(&resolved_elem_ty);
                 let elem_ty = if matches!(elem_ty, HirType::Void) {
                     HirType::I64
                 } else {
@@ -11931,7 +11937,7 @@ impl SsaBuilder {
         value: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let raw = self.translate_operand(&mut cur, value)?;
@@ -11958,7 +11964,7 @@ impl SsaBuilder {
         elem_ty: &Type,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let len = self.list_len(cur, list);
@@ -11983,7 +11989,7 @@ impl SsaBuilder {
         value: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let idx = self.translate_operand(&mut cur, index)?;
@@ -12024,7 +12030,7 @@ impl SsaBuilder {
         index: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let idx = self.translate_operand(&mut cur, index)?;
@@ -12060,7 +12066,7 @@ impl SsaBuilder {
         receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
         elem_ty: &Type,
     ) -> CompilerResult<HirId> {
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let zero = self.i64_const(0);
@@ -12080,7 +12086,7 @@ impl SsaBuilder {
         elem_ty: &Type,
         wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let n = self.translate_operand(&mut cur, wanted)?;
@@ -12101,7 +12107,7 @@ impl SsaBuilder {
         other: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let ys = self.translate_operand(&mut cur, other)?;
@@ -12136,7 +12142,7 @@ impl SsaBuilder {
         byte: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let n = self.translate_operand(&mut cur, wanted)?;
@@ -12176,7 +12182,7 @@ impl SsaBuilder {
         elem_ty: &Type,
         wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
     ) -> CompilerResult<HirId> {
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let mut cur = block;
         let list = self.translate_operand(&mut cur, receiver)?;
         let n = self.translate_operand(&mut cur, wanted)?;
@@ -12192,7 +12198,7 @@ impl SsaBuilder {
     /// A fresh, empty list with room for `capacity` elements, on the heap.
     pub(crate) fn emit_list_new(&mut self, block: HirId, elem_ty: &Type, capacity: HirId) -> HirId {
         use crate::hir::BinaryOp as B;
-        let elem = self.convert_type(elem_ty);
+        let elem = self.element_storage_type(elem_ty);
         let header_bytes = self.i64_const(24);
         let list_ty = HirType::Ptr(std::sync::Arc::new(list_header_type()));
         let list = self.emit_intrinsic(
@@ -12818,6 +12824,16 @@ impl SsaBuilder {
             .collect();
         self.converting.borrow_mut().remove(&type_def.name);
         fields
+    }
+
+    /// How a list holds an element of type `ty`. A list that is itself an
+    /// element is stored as the address of its header, so every holder of the
+    /// inner list shares its identity and sees it grow.
+    pub fn element_storage_type(&self, ty: &Type) -> HirType {
+        match ty {
+            Type::Array { size: None, .. } => HirType::Ptr(std::sync::Arc::new(list_header_type())),
+            other => self.convert_type(other),
+        }
     }
 
     pub fn convert_type(&self, ty: &Type) -> HirType {
@@ -14421,7 +14437,7 @@ impl SsaBuilder {
                 let (element_type, array_size) = match &resolved_array_ty {
                     Type::Array {
                         element_type, size, ..
-                    } => (self.convert_type(element_type), size.clone()),
+                    } => (self.element_storage_type(element_type), size.clone()),
                     Type::Named { id, type_args, .. }
                         if self
                             .type_registry
@@ -14431,7 +14447,7 @@ impl SsaBuilder {
                             .unwrap_or(false)
                             && !type_args.is_empty() =>
                     {
-                        (self.convert_type(&type_args[0]), None)
+                        (self.element_storage_type(&type_args[0]), None)
                     }
                     // A typed buffer indexes like an array and is not
                     // one: `Ptr<T>` has no length, so it carries no

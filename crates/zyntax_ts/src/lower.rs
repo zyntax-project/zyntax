@@ -4043,6 +4043,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return Ok(call);
                 }
             }
+            // An array reached by an element access, as in `grid[i].push(x)`.
+            if !m.optional && matches!(m.object, js::Expression::ComputedMemberExpression(_)) {
+                let receiver = self.expr(&m.object)?;
+                if element_type(&receiver.ty).is_some() {
+                    return self.array_method_on(c, m, None, receiver);
+                }
+            }
         }
         let direct = self.direct_signature(&c.callee)?.cloned();
         let Some(sig) = direct else {
@@ -4343,8 +4350,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             _ => return self.unsupported("this assignment target", a.span),
         };
-        if matches!(target.node, TypedExpression::Index(_)) && matches!(target.ty, Type::TypeVar(_))
-        {
+        let indexed = match &target.node {
+            TypedExpression::Index(_) => true,
+            TypedExpression::Block(block) => Self::wraps_index(block),
+            _ => false,
+        };
+        if indexed && matches!(target.ty, Type::TypeVar(_)) {
             return self.unsupported(
                 "generic array mutation before element ownership is known",
                 a.span,
@@ -4448,6 +4459,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             span: original_span,
         } = target;
         match target {
+            // An element read that bound its receiver first: the binding runs ahead of the
+            // captured target.
+            TypedExpression::Block(mut block) if Self::wraps_index(&block) => {
+                let Some(TypedNode {
+                    node: TypedStatement::Expression(last),
+                    ..
+                }) = block.statements.pop()
+                else {
+                    unreachable!("wraps_index checked the last statement");
+                };
+                let (mut captured, target) = self.capture_target(*last, at);
+                block.statements.append(&mut captured);
+                (block.statements, target)
+            }
             TypedExpression::Index(index) => {
                 let (object_save, object) = self.capture_reference_value(index.object, at);
                 let (index_save, index) = self.capture_reference_value(index.index, at);
@@ -4486,6 +4511,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 },
             ),
         }
+    }
+
+    fn wraps_index(block: &TypedBlock) -> bool {
+        matches!(
+            block.statements.last(),
+            Some(TypedNode {
+                node: TypedStatement::Expression(last),
+                ..
+            }) if matches!(last.node, TypedExpression::Index(_))
+        )
     }
 
     fn capture_reference_value(&mut self, value: Box<Expr>, at: oxc_span::Span) -> (Stmt, Expr) {
