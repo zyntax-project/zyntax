@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792793657,"nonce":"GliSrN+OOlkbyzc2z2Y3YzmPhz4=","message":"Landed in 0ec0765fd388833258b9b2dd3578074674d6272a. ai 46.3 to 40.4 ms per iteration (NUC, interleaved 9 reps, quartiles apart); meteor unchanged over 15 reps in both orders.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792793657,"nonce":"S9nNgxOjfBjZYJeD/BhUeVK4ox0=","status":2}]}
