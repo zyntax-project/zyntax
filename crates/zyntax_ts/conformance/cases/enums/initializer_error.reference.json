@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1061,
+      "start": 18,
+      "length": 1,
+      "file": "initializer_error.ts",
+      "message": "Enum member must have initializer."
+    }
+  ],
+  "source_sha256": "756332c8e3ee8f18a646d7c3749694cbe3cd6dfd15fb738facc37e55a976175b",
+  "options": {}
+}

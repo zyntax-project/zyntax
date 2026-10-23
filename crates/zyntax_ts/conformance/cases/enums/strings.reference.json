@@ -1,0 +1,10 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": true,
+  "kind": "Accept",
+  "diagnostics": [],
+  "stdout": "color:green color:blue true true\nred\n",
+  "exit": 0,
+  "source_sha256": "03076d72281260b17b71a00df9413f6eaab5b67c734b679e57d7b16fb95587bf",
+  "options": {}
+}

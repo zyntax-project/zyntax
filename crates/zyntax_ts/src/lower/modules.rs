@@ -517,6 +517,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
         );
         for name in views {
+            if self.enum_views.contains_key(&name) {
+                return self.unsupported("exported declarations using enum types", program.span);
+            }
             if let Some(view) = self.views.get(&name) {
                 interface.views.insert(name, Arc::clone(view));
             }

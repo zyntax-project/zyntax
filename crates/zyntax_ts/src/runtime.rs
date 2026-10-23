@@ -152,6 +152,17 @@ extern "C" fn assigned_check(assigned: bool, name: zrtl::StringConstPtr) {
     exit_process(1);
 }
 
+/// A regular enum read before its declaration has run: the enum object is still `undefined`.
+extern "C" fn enum_check(ready: bool, name: zrtl::StringConstPtr) {
+    if ready {
+        return;
+    }
+    // SAFETY: the compiler passes the enum's name as a string literal.
+    let name = unsafe { zrtl::string_as_str(name) }.unwrap_or_default();
+    eprintln!("TypeError: Cannot read properties of undefined (enum '{name}' is not declared yet)");
+    exit_process(1);
+}
+
 /// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
 extern "C" fn to_int32_slow(value: f64) -> i64 {
     if !value.is_finite() {
@@ -200,6 +211,7 @@ zrtl::zrtl_plugin! {
         ("$TS$array_length_trap", array_length_trap),
         ("$TS$binding_check", binding_check),
         ("$TS$assigned_check", assigned_check),
+        ("$TS$enum_check", enum_check),
         ("$TS$date_now", date_now),
         ("$TS$performance_now", performance_now),
         ("$TS$to_int32_slow", to_int32_slow),

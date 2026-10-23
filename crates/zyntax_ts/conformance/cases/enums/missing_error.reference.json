@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2339,
+      "start": 27,
+      "length": 1,
+      "file": "missing_error.ts",
+      "message": "Property 'B' does not exist on type 'typeof E'."
+    }
+  ],
+  "source_sha256": "e2d88e7e7a9ad0e0e5543d4a55244c93bef2899c8dc4b60cd4696e38997cd1c9",
+  "options": {}
+}

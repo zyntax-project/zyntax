@@ -42,6 +42,8 @@ pub(super) struct FlowState {
     strings: FxHashSet<InternedString>,
     /// Bindings declared without a value that every path to here has assigned.
     assigned: FxHashSet<InternedString>,
+    /// The enum members a binding may hold, when narrower than its declared enum.
+    members: FxHashMap<InternedString, super::enums::Members>,
 }
 impl Deref for FlowState {
     type Target = FxHashMap<InternedString, ScalarFlow>;
@@ -61,6 +63,23 @@ impl FlowState {
         self.integers.remove(&name);
         self.strings.remove(&name);
         self.bounds.retain(|(_, i)| *i != name);
+        self.members.remove(&name);
+    }
+    pub(super) fn members(&self, name: InternedString) -> Option<&super::enums::Members> {
+        self.members.get(&name)
+    }
+    pub(super) fn set_members(&mut self, name: InternedString, members: super::enums::Members) {
+        self.members.insert(name, members);
+    }
+    pub(super) fn forget_members(&mut self, name: InternedString) {
+        self.members.remove(&name);
+    }
+    /// Facts about module globals do not cross into or out of a function body.
+    pub(super) fn forget_global_members(
+        &mut self,
+        globals: &FxHashMap<InternedString, super::globals::Global>,
+    ) {
+        self.members.retain(|name, _| !globals.contains_key(name));
     }
     pub(super) fn assign(&mut self, name: InternedString) {
         self.assigned.insert(name);
@@ -90,6 +109,14 @@ impl FlowState {
             .retain(|n, v| other.integers.get(n) == Some(v));
         self.bounds.retain(|b| other.bounds.contains(b));
         self.strings.retain(|n| other.strings.contains(n));
+        self.members
+            .retain(|n, members| match other.members.get(n) {
+                Some(more) => {
+                    *members = members.union(more);
+                    true
+                }
+                None => false,
+            });
     }
 }
 
@@ -130,6 +157,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let Some(source) = source.as_expression() else {
                 return self.unsupported("sparse or spread arrays", a.span);
             };
+            self.plain_enum(self.view_of(source), "arrays of enum values", source.span())?;
             let value = if let Some(hint) = &element {
                 self.expr_expected(source, hint)?
             } else {

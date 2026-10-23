@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2474,
+      "start": 19,
+      "length": 12,
+      "file": "const_computed_error.ts",
+      "message": "const enum member initializers must be constant expressions."
+    }
+  ],
+  "source_sha256": "cc23cf5631d3a5daeec7a85e799dbde781efd251a9a151ffaeaa0243d08dfab4",
+  "options": {}
+}

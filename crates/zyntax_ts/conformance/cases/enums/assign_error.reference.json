@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 20,
+      "length": 1,
+      "file": "assign_error.ts",
+      "message": "Type '7' is not assignable to type 'E'."
+    }
+  ],
+  "source_sha256": "0785c302e7655f2672aa74ba4673f77cc9769acbecea67e4190c9706aeb4e9ad",
+  "options": {}
+}

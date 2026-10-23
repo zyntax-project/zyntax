@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 23,
+      "length": 1,
+      "file": "string_error.ts",
+      "message": "Type '\"a\"' is not assignable to type 'S'."
+    }
+  ],
+  "source_sha256": "d3352a96e40a185b0603cfa91e83dbcd5ccf458d0bc217efeb832fb6ae1cbd49",
+  "options": {}
+}

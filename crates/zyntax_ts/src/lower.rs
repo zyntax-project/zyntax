@@ -25,6 +25,7 @@ mod arrays;
 mod bitwise;
 mod classes;
 mod constants;
+mod enums;
 mod generics;
 mod globals;
 mod math;
@@ -711,11 +712,25 @@ struct Lowerer<'ast, 'program> {
     scope_floor: usize,
     constants: FxHashMap<InternedString, Constant>,
     constant_symbols: FxHashSet<oxc_semantic::SymbolId>,
+    /// The literal types of top-level constants: numbers and strings.
+    literal_constants: FxHashMap<InternedString, enums::Static>,
+    /// The literal type each `const` binding was declared with, by native name.
+    const_literals: FxHashMap<InternedString, enums::Static>,
+    enums: FxHashMap<InternedString, enums::Enum>,
+    enum_views: FxHashMap<InternedString, InternedString>,
+    /// Views of member types, `E.A` or `E.A | E.B`: the enum and the members they admit.
+    member_views: RefCell<FxHashMap<InternedString, (InternedString, enums::Members)>>,
+    /// Enums whose declarations the module body has passed.
+    declared_enums: FxHashSet<InternedString>,
+    /// Every enum the module declares, including those not evaluated yet.
+    module_enums: FxHashSet<InternedString>,
     /// Module globals by native name, and the top-level symbols they store.
     globals: FxHashMap<InternedString, globals::Global>,
     module_symbols: FxHashMap<oxc_semantic::SymbolId, InternedString>,
     /// Lowering the module body itself, outside any function or arrow.
     top_level: bool,
+    /// Bindings an ambient `declare` names, by native name; they have no native value.
+    ambient: FxHashSet<InternedString>,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
@@ -765,9 +780,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             scope_floor: 0,
             constants: FxHashMap::default(),
             constant_symbols: FxHashSet::default(),
+            literal_constants: FxHashMap::default(),
+            const_literals: FxHashMap::default(),
+            enums: FxHashMap::default(),
+            enum_views: FxHashMap::default(),
+            member_views: RefCell::new(FxHashMap::default()),
+            declared_enums: FxHashSet::default(),
+            module_enums: FxHashSet::default(),
             globals: FxHashMap::default(),
             module_symbols: FxHashMap::default(),
             top_level: false,
+            ambient: FxHashSet::default(),
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
             class_order: vec![],
@@ -854,6 +877,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         self.hoist = plan.hoisted;
         let reexports = self.imports(program, semantic, dependencies)?;
+        // Enum initializers may name constants; types may name enums.
+        self.collect_constants(program);
+        self.declare_enums(program)?;
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -953,6 +979,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 ) {
                     return self.unsupported("this exported declaration", export.span);
                 }
+                continue;
+            }
+            if let js::Statement::TSEnumDeclaration(declaration) = item {
+                body.extend(self.run_enum_declaration(declaration));
                 continue;
             }
             if !matches!(
@@ -1118,7 +1148,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let Some(annotation) = &p.type_annotation else {
                 return self.error(ErrorKind::Type, "field requires a type", p.span);
             };
-            let (ty, _) = self.ty(&annotation.type_annotation)?;
+            let (ty, view) = self.ty(&annotation.type_annotation)?;
+            self.plain_enum(view, "enum-typed fields", p.span)?;
             let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
                 return self.unsupported("reference-valued object fields", p.span);
             };
@@ -1215,6 +1246,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::TSType::TSVoidKeyword(_) => (unit(), None),
             js::TSType::TSUndefinedKeyword(_) => (undefined(), None),
             js::TSType::TSUnionType(u) => {
+                if let Some(members) = self.enum_union(u) {
+                    return members;
+                }
                 let mut members = u.types.iter();
                 let (mut ty, view) = self.ty(members.next().unwrap())?;
                 if view.is_some() {
@@ -1236,7 +1270,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 (ty, None)
             }
             js::TSType::TSArrayType(a) => {
-                let (element, _) = self.ty(&a.element_type)?;
+                let (element, view) = self.ty(&a.element_type)?;
+                self.plain_enum(view, "arrays of enum values", a.span)?;
                 self.check_array_element(&element, a.span)?;
                 (array_type(element), None)
             }
@@ -1257,7 +1292,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if r.type_arguments.as_ref().unwrap().params.len() != 1 {
                     return self.error(ErrorKind::Type, "Array requires one type argument", r.span);
                 }
-                let (element, _) = self.ty(&r.type_arguments.as_ref().unwrap().params[0])?;
+                let (element, view) = self.ty(&r.type_arguments.as_ref().unwrap().params[0])?;
+                self.plain_enum(view, "arrays of enum values", r.span)?;
                 self.check_array_element(&element, r.span)?;
                 (array_type(element), None)
             }
@@ -1278,13 +1314,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             p.span,
                         );
                     };
-                    params.push(self.ty(&annotation.type_annotation)?.0);
+                    let (ty, view) = self.ty(&annotation.type_annotation)?;
+                    self.plain_enum(view, "enum types in function values", p.span)?;
+                    params.push(ty);
                 }
-                let ret = self.ty(&f.return_type.type_annotation)?.0;
+                let (ret, view) = self.ty(&f.return_type.type_annotation)?;
+                self.plain_enum(view, "enum types in function values", f.span)?;
                 (self.function_type(params.into_iter(), ret, f.span)?, None)
             }
             js::TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
                 if let js::TSTypeName::QualifiedName(name) = &r.type_name {
+                    if let Some(member) = self.enum_member_type(name, r.span) {
+                        return member;
+                    }
                     return self.namespace_type(name);
                 }
                 let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
@@ -1293,6 +1335,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let name = self.name(name.name.as_str());
                 if let Some((_, ty)) = self.active_types.iter().find(|(n, _)| *n == name) {
                     return Ok((ty.clone(), None));
+                }
+                if let Some(enumeration) = self.enum_type(name, r.span) {
+                    return enumeration;
                 }
                 self.aliases.get(&name).cloned().ok_or_else(|| {
                     Error::new(
@@ -1462,6 +1507,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.active_types.extend(sig.type_params.iter().cloned());
         self.active_type_rules = sig.type_rules.clone();
         self.scopes.push(FxHashMap::default());
+        self.flow.forget_global_members(&self.globals);
         let outer_vars = std::mem::replace(
             &mut self.vars,
             FunctionVars {
@@ -1605,6 +1651,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         sig.ret_view = ret_view;
         sig.array_result = array_result;
         self.pop_scope();
+        self.flow.forget_global_members(&self.globals);
         self.active_types.clear();
         self.active_type_rules = None;
         self.declarations.push(node(
@@ -1643,6 +1690,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if *first == Type::Never {
             self.returns.as_mut().unwrap().inferred = Some((ty.clone(), view));
             return Ok(());
+        }
+        if *first_view != view
+            && (self.enum_of(*first_view).is_some() || self.enum_of(view).is_some())
+        {
+            return self.unsupported("inferred returns mixing enum types", at);
         }
         if first != ty {
             if let Some(joined) = optional_join(first, ty) {
@@ -1790,6 +1842,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$array_length_trap", vec![number()], unit()),
             ("$TS$binding_check", vec![boolean(), string()], unit()),
             ("$TS$assigned_check", vec![boolean(), string()], unit()),
+            ("$TS$enum_check", vec![boolean(), string()], unit()),
             ("$TS$date_now", vec![], number()),
             ("$TS$performance_now", vec![], number()),
             (
@@ -2408,6 +2461,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     }
                 } else {
                     let equality = truth == matches!(b.operator.as_str(), "===" | "==");
+                    self.narrow_enum(b, equality);
                     for (operand, text) in [(&b.left, &b.right), (&b.right, &b.left)] {
                         if let (
                             js::Expression::UnaryExpression(u),
@@ -2573,15 +2627,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
             js::Expression::NewExpression(n) => self.class_of_new(n),
-            js::Expression::ComputedMemberExpression(m) if !m.optional => {
-                self.element_view(&m.object)
-            }
+            js::Expression::ComputedMemberExpression(m) if !m.optional => self
+                .enum_view_of_member(&m.object)
+                .or_else(|| self.element_view(&m.object)),
             js::Expression::ThisExpression(t) => {
                 self.binding("this", t.span).ok().and_then(|b| b.view)
             }
             js::Expression::ParenthesizedExpression(p) => self.view_of(&p.expression),
             js::Expression::TSNonNullExpression(n) => self.view_of(&n.expression),
-            js::Expression::ConditionalExpression(c) => self.view_of(&c.consequent),
+            js::Expression::ConditionalExpression(c) => {
+                let (a, b) = (self.view_of(&c.consequent), self.view_of(&c.alternate));
+                if a != b && (self.enum_of(a).is_some() || self.enum_of(b).is_some()) {
+                    None
+                } else {
+                    a
+                }
+            }
+            js::Expression::StaticMemberExpression(m) if !m.optional => {
+                self.enum_view_of_member(&m.object)
+            }
             js::Expression::AssignmentExpression(a) => self.view_of(&a.right),
             js::Expression::TSAsExpression(a) => {
                 self.ty(&a.type_annotation).ok().and_then(|(_, view)| view)
@@ -2695,6 +2759,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         .map_or(actual, |arg| self.source_type(arg, actual));
                     self.expect(logical, &ret, at)?;
                     self.check_view(view, expected_view, at)?;
+                    if let Some(source) = &r.argument {
+                        self.check_enum(source, expected_view, at)?;
+                    }
                     if let (Some(source), Some(returned)) = (&r.argument, value.take()) {
                         self.fresh_properties(source, &ret)?;
                         value = Some(self.adapt_value(returned, &ret, at)?);
@@ -2748,6 +2815,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 self.loop_depth -= 1;
                 self.clear_written_flow(w.span);
                 self.flow.restore_assigned(assigned);
+                if !Self::may_break(std::slice::from_ref(&w.body)) {
+                    self.narrow(&w.test, false);
+                }
                 vec![stmt(
                     TypedStatement::While(TypedWhile {
                         condition: Box::new(condition),
@@ -2844,6 +2914,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if !matches!(kind, "let" | "const" | "var") {
             return self.unsupported("using declarations", declaration.span);
         }
+        if declaration.declare {
+            return self.ambient_variables(declaration).map(|()| vec![]);
+        }
         let mut out = vec![];
         for d in &declaration.declarations {
             let js::BindingPattern::BindingIdentifier(id) = &d.id else {
@@ -2897,9 +2970,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 Some((ty, _)) => self.expr_expected(init, ty)?,
                 None => self.expr(init)?,
             };
-            if let Some((ty, _)) = &declared {
+            if let Some((ty, view)) = &declared {
                 self.expect(self.source_type(init, &value.ty), ty, d.span)?;
                 self.fresh_properties(init, ty)?;
+                self.check_enum(init, *view, d.span)?;
             }
             let (mut ty, view) = declared.unwrap_or_else(|| (value.ty.clone(), self.view_of(init)));
             self.check_view(self.view_of(init), view, d.span)?;
@@ -2928,6 +3002,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
             self.value_facts(unique, &ty, init);
+            self.enum_facts(unique, view, init);
+            if kind == "const" && d.type_annotation.is_none() {
+                self.declare_literal(unique, init);
+            }
             let value = self.adapt_value(value, &ty, d.span)?;
             self.scopes.last_mut().unwrap().insert(
                 name,
@@ -3151,6 +3229,51 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         )))
     }
 
+    /// An ambient binding's value comes from outside the program, which native code cannot read.
+    fn require_native(&self, name: InternedString, at: oxc_span::Span) -> Result<()> {
+        if self.ambient.contains(&name) {
+            return self.unsupported("values of ambient variables", at);
+        }
+        Ok(())
+    }
+
+    /// `declare var x: T`: a typed binding with no native value.
+    fn ambient_variables(&mut self, declaration: &js::VariableDeclaration<'ast>) -> Result<()> {
+        for d in &declaration.declarations {
+            let js::BindingPattern::BindingIdentifier(id) = &d.id else {
+                return self.unsupported("destructuring declarations", d.span);
+            };
+            let name = self.name(id.name.as_str());
+            if let Some(global) = id
+                .symbol_id
+                .get()
+                .and_then(|symbol| self.module_symbols.get(&symbol))
+            {
+                debug_assert!(self.ambient.contains(global));
+                self.scopes[0].get_mut(&name).unwrap().initialized = true;
+                continue;
+            }
+            let Some(annotation) = &d.type_annotation else {
+                return self.error(ErrorKind::Type, "variable implicitly has type any", d.span);
+            };
+            let (ty, view) = self.ty(&annotation.type_annotation)?;
+            let unique = self.fresh(id.name.as_str());
+            self.ambient.insert(unique);
+            self.scopes.last_mut().unwrap().insert(
+                name,
+                Binding {
+                    name: unique,
+                    symbol: id.symbol_id.get(),
+                    ty,
+                    view,
+                    mutable: declaration.kind.as_str() != "const",
+                    initialized: true,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn require_assigned(&self, name: InternedString, at: oxc_span::Span) -> Result<()> {
         // A body that runs later checks a global's first assignment when it runs.
         if !self.top_level && self.globals.contains_key(&name) {
@@ -3361,6 +3484,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
         let outer_top = std::mem::replace(&mut self.top_level, false);
+        let outer_flow = self.flow.clone();
+        self.flow.forget_global_members(&self.globals);
         let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
         self.scopes.push(FxHashMap::default());
         let outer_vars = std::mem::replace(
@@ -3380,7 +3505,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self.unsupported("optional or default arrow parameters", p.span);
                 }
                 let (ty, view) = match &p.type_annotation {
-                    Some(annotation) => self.ty(&annotation.type_annotation)?,
+                    Some(annotation) => {
+                        let (ty, view) = self.ty(&annotation.type_annotation)?;
+                        self.plain_enum(view, "enum types in function values", p.span)?;
+                        (ty, view)
+                    }
                     None => (
                         hints
                             .get(index)
@@ -3440,6 +3569,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if let Some((ret, view)) = self.returns.as_ref().unwrap().expected.clone() {
                     self.expect(&value.ty, &ret, at)?;
                     self.check_view(self.view_of(e), view, at)?;
+                    self.check_enum(e, view, at)?;
                     value = self.adapt_value(value, &ret, at)?;
                 } else {
                     self.returns.as_mut().unwrap().value_returned = true;
@@ -3472,6 +3602,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.vars = outer_vars;
         self.scope_floor = outer_floor;
         self.top_level = outer_top;
+        self.flow = outer_flow;
         self.loop_depth = outer_loop;
         self.returns = outer_returns;
         let (params, statements, ret, ty) = result?;
@@ -3524,6 +3655,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .any(|s| s.contains_key(&self.name(i.name.as_str())))
                 {
                     let unique = self.binding(i.name.as_str(), at)?.name;
+                    self.require_native(unique, at)?;
                     self.require_assigned(unique, at)?;
                     let b = self.binding(i.name.as_str(), at)?;
                     let value = var(b.name, b.ty.clone(), at);
@@ -3555,6 +3687,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         value
                     }
                 } else {
+                    if let Some(object) = self.enum_object(i) {
+                        return object;
+                    }
                     match i.name.as_str() {
                         "undefined" => var(self.name("None"), undefined(), at),
                         "NaN" => num(f64::NAN, at),
@@ -3725,6 +3860,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 )
             }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
+                if let Some(member) = self.enum_member(e) {
+                    return member;
+                }
                 if let Some(sig) = self.namespace_function(e)? {
                     return self.function_value(sig, at);
                 }
@@ -3752,6 +3890,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::Expression::ArrayExpression(a) => self.array_literal(a, None)?,
             js::Expression::ComputedMemberExpression(m) if !m.optional => {
+                if let Some(member) = self.enum_member(e) {
+                    return member;
+                }
                 if let Some(sig) = self.namespace_function(e)? {
                     return self.function_value(sig, at);
                 }
@@ -3870,6 +4011,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let left = self.constrained_scalar(left, b.left.span());
         let right = self.constrained_scalar(right, b.right.span());
         let op = b.operator.as_str();
+        if matches!(op, "===" | "!==" | "==" | "!=") {
+            self.check_comparison(&b.left, &b.right, at)?;
+        }
         if matches!(op, "===" | "!==" | "==" | "!=")
             && left.ty == string()
             && right.ty == string()
@@ -4043,6 +4187,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if matches!(ty, Type::Function { .. }) {
             return self.unsupported("function object properties", at);
         }
+        // Library members of primitives, arrays and unions are not modelled yet.
+        if matches!(
+            ty,
+            Type::Primitive(PrimitiveType::F64 | PrimitiveType::Bool | PrimitiveType::String)
+                | Type::Array { .. }
+                | Type::Union(_)
+        ) {
+            return self.unsupported("properties of primitive and array values", at);
+        }
         let Type::Named { id, .. } = ty else {
             return self.error(ErrorKind::Type, "receiver has no fields", at);
         };
@@ -4066,6 +4219,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             let name = self.key(&p.key)?;
             let value = self.expr(&p.value)?;
+            self.plain_enum(self.view_of(&p.value), "enum-valued object fields", p.span)?;
             if !matches!(
                 value.ty,
                 Type::Primitive(PrimitiveType::F64 | PrimitiveType::Bool)
@@ -4325,6 +4479,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 self.fresh_properties(source, &expected)?;
                 self.check_view(self.view_of(source), view, at)?;
+                self.check_enum(source, view, at)?;
                 self.adapt_value(arg, &expected, at)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -4441,7 +4596,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if !b.mutable {
                     return self.error(ErrorKind::Type, "cannot assign to const", at);
                 }
-                Ok(var(b.name, b.ty.clone(), at))
+                let (name, ty) = (b.name, b.ty.clone());
+                self.require_native(name, at)?;
+                Ok(var(name, ty, at))
             }
             js::SimpleAssignmentTarget::StaticMemberExpression(m) => self.field_target(m),
             js::SimpleAssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
@@ -4509,7 +4666,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if !b.mutable {
                     return self.error(ErrorKind::Type, "cannot assign to const", a.span);
                 }
-                var(b.name, b.ty.clone(), a.span)
+                let (name, ty) = (b.name, b.ty.clone());
+                self.require_native(name, a.span)?;
+                var(name, ty, a.span)
             }
             js::AssignmentTarget::StaticMemberExpression(m) => self.field_target(m)?,
             js::AssignmentTarget::ComputedMemberExpression(m) if !m.optional => {
@@ -4556,6 +4715,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         )?;
         self.fresh_properties(&a.right, &logical_target)?;
         self.check_view(self.view_of(&a.right), target_view, a.span)?;
+        if op == "=" {
+            self.check_enum(&a.right, target_view, a.span)?;
+        }
         if matches!(target.ty, Type::Named { .. }) && value.ty != target.ty {
             return self.unsupported(
                 "assignment changing a binding's physical record layout",
@@ -4595,6 +4757,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.record_write(&target, &ty);
             if op == "=" {
                 self.value_facts(name, &ty, &a.right);
+                self.enum_facts(name, target_view, &a.right);
             }
         } else if target.ty == string()
             && matches!(target.node, TypedExpression::Index(_))

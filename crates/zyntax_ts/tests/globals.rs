@@ -90,6 +90,16 @@ fn module_binding_errors_and_gaps() {
             "cannot assign to const",
         ),
         (
+            "declare var n: number;\nconsole.log(n);",
+            zyntax_ts::ErrorKind::Unsupported,
+            "ambient variables",
+        ),
+        (
+            "declare let n: number;\nfunction f(): number { return n; }",
+            zyntax_ts::ErrorKind::Unsupported,
+            "ambient variables",
+        ),
+        (
             "let n;\nfunction f(): number { return n; }",
             zyntax_ts::ErrorKind::Unsupported,
             "without a type annotation",

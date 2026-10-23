@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2475,
+      "start": 29,
+      "length": 1,
+      "file": "const_object_error.ts",
+      "message": "'const' enums can only be used in property or index access expressions or the right hand side of an import declaration or export assignment or type query."
+    }
+  ],
+  "source_sha256": "b0a349460aab57abaae46e2ee62027ebae2446b8cff262efa00e22a8bf0ce71e",
+  "options": {}
+}

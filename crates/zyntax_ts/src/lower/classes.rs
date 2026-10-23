@@ -125,7 +125,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     let field = self.class_key(&p.key)?;
                     let ty = match (&p.type_annotation, &p.value) {
                         (Some(annotation), _) => {
-                            let (ty, _) = self.ty(&annotation.type_annotation)?;
+                            let (ty, view) = self.ty(&annotation.type_annotation)?;
+                            self.plain_enum(view, "enum-typed fields", p.span)?;
                             let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) =
                                 ty
                             else {
@@ -218,7 +219,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         p.span,
                     );
                 };
-                let (ty, _) = self.ty(&annotation.type_annotation)?;
+                let (ty, view) = self.ty(&annotation.type_annotation)?;
+                self.plain_enum(view, "enum-typed fields", p.span)?;
                 let Type::Primitive(ty @ (PrimitiveType::F64 | PrimitiveType::Bool)) = ty else {
                     return self.unsupported("reference-valued object fields", p.span);
                 };

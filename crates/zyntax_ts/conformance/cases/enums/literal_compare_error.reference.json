@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 27,
+      "length": 9,
+      "file": "literal_compare_error.ts",
+      "message": "This comparison appears to be unintentional because the types '1' and '2' have no overlap."
+    }
+  ],
+  "source_sha256": "cf428f4625c3f6222b0065a34db7f17f4399222d73fe814040e07222b7ceb7d7",
+  "options": {}
+}

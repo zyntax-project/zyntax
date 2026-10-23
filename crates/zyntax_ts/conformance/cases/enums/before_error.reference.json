@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2450,
+      "start": 12,
+      "length": 1,
+      "file": "before_error.ts",
+      "message": "Enum 'E' used before its declaration."
+    }
+  ],
+  "source_sha256": "28e47dc39dd1d1f6820c4de09cd7741c0e124eefc04871231f0f2a18ae08c83f",
+  "options": {}
+}

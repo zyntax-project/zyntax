@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 80,
+      "length": 6,
+      "file": "member_type_error.ts",
+      "message": "Type 'Choice.Unknown' is not assignable to type 'YesNo'."
+    }
+  ],
+  "source_sha256": "899efdffdca7bae4891e691bfccf7e4689462a2e199afe70c05e6f521daec642",
+  "options": {}
+}

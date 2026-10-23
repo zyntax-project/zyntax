@@ -208,7 +208,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 Err(error)
             }
-            result => result.map(|(ty, view)| CheckerType { ty, view }),
+            Ok((ty, view)) => {
+                self.plain_enum(view, "enum types in generic rules", source.span())?;
+                Ok(CheckerType { ty, view })
+            }
+            Err(error) => Err(error),
         }
     }
 

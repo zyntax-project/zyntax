@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2367,
+      "start": 71,
+      "length": 9,
+      "file": "narrowed_error.ts",
+      "message": "This comparison appears to be unintentional because the types 'E.A' and 'E.B' have no overlap."
+    }
+  ],
+  "source_sha256": "d3a49a8dde28a491697b51ad48661041274ce55d3e0fd1a8fc26576b30c2346a",
+  "options": {}
+}

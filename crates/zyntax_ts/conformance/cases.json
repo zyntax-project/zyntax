@@ -2264,5 +2264,120 @@
     "id": "globals/arrow_late_binding",
     "file": "cases/globals/arrow_late_binding.ts",
     "mode": "run"
+  },
+  {
+    "id": "enums/ambient",
+    "file": "cases/enums/ambient.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/assign_error",
+    "file": "cases/enums/assign_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/before_error",
+    "file": "cases/enums/before_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/before_function",
+    "file": "cases/enums/before_function.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/compare_error",
+    "file": "cases/enums/compare_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/const_before_function",
+    "file": "cases/enums/const_before_function.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/const_computed_error",
+    "file": "cases/enums/const_computed_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/const_object_error",
+    "file": "cases/enums/const_object_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/cross_error",
+    "file": "cases/enums/cross_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/forward_error",
+    "file": "cases/enums/forward_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/initializer_error",
+    "file": "cases/enums/initializer_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/literal_compare_error",
+    "file": "cases/enums/literal_compare_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/loop_error",
+    "file": "cases/enums/loop_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/member_type_error",
+    "file": "cases/enums/member_type_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/member_types",
+    "file": "cases/enums/member_types.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/members",
+    "file": "cases/enums/members.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/missing_error",
+    "file": "cases/enums/missing_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/module_binding",
+    "file": "cases/enums/module_binding.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/narrowed_error",
+    "file": "cases/enums/narrowed_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/narrowing",
+    "file": "cases/enums/narrowing.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/numeric",
+    "file": "cases/enums/numeric.ts",
+    "mode": "run"
+  },
+  {
+    "id": "enums/string_error",
+    "file": "cases/enums/string_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "enums/strings",
+    "file": "cases/enums/strings.ts",
+    "mode": "run"
   }
 ]

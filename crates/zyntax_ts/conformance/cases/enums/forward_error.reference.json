@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2651,
+      "start": 13,
+      "length": 1,
+      "file": "forward_error.ts",
+      "message": "A member initializer in a enum declaration cannot reference members declared after it, including members defined in other enums."
+    }
+  ],
+  "source_sha256": "08910821c7ea1aee49e019e04ca37e04bb7194ccf09cbb1c1733aa544a59f0d6",
+  "options": {}
+}

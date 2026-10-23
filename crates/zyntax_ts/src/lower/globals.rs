@@ -179,17 +179,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
         }
-        if candidates.is_empty() {
-            return Ok(());
-        }
         let mut captures = Captures {
             scoping,
             candidates: &candidates,
             depth: 0,
             captured: FxHashSet::default(),
         };
-        captures.visit_program(program);
-        if captures.captured.is_empty() {
+        if !candidates.is_empty() {
+            captures.visit_program(program);
+        }
+        if captures.captured.is_empty() && self.enums.is_empty() {
             return Ok(());
         }
         let mut runs = RunsCode {
@@ -199,6 +198,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         for item in &program.body {
             let js::Statement::VariableDeclaration(declaration) = item else {
+                // A regular enum is an object its declaration creates; a call may read it first.
+                if let js::Statement::TSEnumDeclaration(declaration) = item
+                    && runs.found
+                    && !declaration.r#const
+                    && !declaration.declare
+                {
+                    self.enum_ready(declaration);
+                }
                 if !runs.found {
                     runs.visit_statement(item);
                 }
@@ -223,6 +230,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     continue;
                 }
                 let name = self.name(id.name.as_str());
+                if declaration.declare {
+                    self.declare_ambient(id, d, kind, symbol)?;
+                    continue;
+                }
                 if !runs.found && self.constants.contains_key(&name) {
                     continue;
                 }
@@ -265,6 +276,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         let source = self.name(id.name.as_str());
         let global = self.global_name("global$", id.name.as_str());
+        if kind == "const"
+            && d.type_annotation.is_none()
+            && let Some(init) = &d.init
+        {
+            self.declare_literal(global, init);
+        }
         let var = kind == "var";
         let ready = (guarded && !var).then(|| self.global_name("ready$", id.name.as_str()));
         let assigned = (d.init.is_none() || (guarded && var))
@@ -295,6 +312,36 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             },
         );
         self.module_symbols.insert(symbol, global);
+        self.scopes[0].insert(
+            source,
+            Binding {
+                name: global,
+                symbol: Some(symbol),
+                ty,
+                view,
+                mutable: kind != "const",
+                initialized: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// A module binding an ambient `declare` names: typed, with no native value to read.
+    fn declare_ambient(
+        &mut self,
+        id: &js::BindingIdentifier<'ast>,
+        d: &js::VariableDeclarator<'ast>,
+        kind: &str,
+        symbol: SymbolId,
+    ) -> Result<()> {
+        let Some(annotation) = &d.type_annotation else {
+            return Ok(());
+        };
+        let (ty, view) = self.ty(&annotation.type_annotation)?;
+        let global = self.global_name("ambient$", id.name.as_str());
+        self.ambient.insert(global);
+        self.module_symbols.insert(symbol, global);
+        let source = self.name(id.name.as_str());
         self.scopes[0].insert(
             source,
             Binding {
@@ -410,6 +457,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 (is_scalar(&element) || element == string()).then(|| (array_type(element), None))
             }
             js::Expression::TSAsExpression(a) => self.ty(&a.type_annotation).ok(),
+            js::Expression::StaticMemberExpression(m) if !m.optional => {
+                let enumeration = self.enum_access(&m.object)?;
+                (enumeration.kind() != enums::Kind::Mixed)
+                    .then(|| (enumeration.physical(), Some(enumeration.view)))
+            }
             _ => None,
         }
     }
@@ -513,6 +565,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.expect(self.source_type(init, &value.ty), &ty, at)?;
         self.fresh_properties(init, &ty)?;
         self.check_view(self.view_of(init), view, at)?;
+        self.check_enum(init, view, at)?;
+        self.enum_facts(global, view, init);
         if matches!(ty, Type::Named { .. }) && value.ty != ty {
             return self.unsupported("assignment changing a binding's physical record layout", at);
         }
@@ -533,5 +587,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             unit(),
             at,
         )))
+    }
+
+    fn enum_ready(&mut self, declaration: &js::TSEnumDeclaration<'ast>) {
+        let source = self.name(declaration.id.name.as_str());
+        if !self.enums.contains_key(&source) {
+            return;
+        }
+        let ready = self.global_name("enum_ready$", declaration.id.name.as_str());
+        self.declarations.push(node(
+            TypedDeclaration::Variable(TypedVariable {
+                name: ready,
+                ty: boolean(),
+                mutability: Mutability::Mutable,
+                initializer: None,
+                visibility: Visibility::Public,
+            }),
+            unit(),
+            declaration.span,
+        ));
+        self.enums.get_mut(&source).unwrap().ready = Some(ready);
     }
 }

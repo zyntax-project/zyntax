@@ -99,6 +99,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let name = self.name(id.name.as_str());
                 self.constants.insert(name, value);
                 self.constant_symbols.extend(id.symbol_id.get());
+                if d.type_annotation.is_none() {
+                    let literal = self.static_value(init);
+                    if !matches!(literal, super::enums::Static::Other) {
+                        self.literal_constants.insert(name, literal);
+                    }
+                }
             }
         }
     }
