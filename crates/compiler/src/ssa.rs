@@ -5635,7 +5635,12 @@ impl SsaBuilder {
             TypedExpression::Field(field_access) => {
                 let object = &field_access.object;
                 let field = &field_access.field;
-                let object_val = self.translate_expression(block_id, object)?;
+                let started = block_id;
+                let mut block_id = block_id;
+                let object_val = self.translate_operand(&mut block_id, object)?;
+                // The read is straight-line from here, so it ends where the
+                // object did.
+                self.settle(started, block_id);
 
                 // Resolve actual type — handles both variables (via var_typed_ast_types)
                 // and nested field accesses (via type registry walk)
