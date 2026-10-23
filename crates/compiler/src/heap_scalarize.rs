@@ -1,4 +1,5 @@
-//! Non-escaping objects carried by phis become scalar field phis.
+//! Non-escaping objects become scalar fields, and those carried by phis
+//! scalar field phis.
 //!
 //! Every root must be a local fixed-size allocation or null. Stores
 //! initialize an allocation in its defining block; writes through a phi
@@ -53,17 +54,20 @@ pub fn run_module(module: &mut HirModule) -> usize {
 
 pub fn run_function(f: &mut HirFunction) -> usize {
     let mut eliminated = 0;
-    let seeds: Vec<_> = f
+    let mut index = WebIndex::new(f);
+    // Webs grow from the phis that carry objects and from allocations no
+    // phi carries.
+    let mut seeds: Vec<_> = f
         .blocks
         .values()
         .flat_map(|b| &b.phis)
         .filter(|p| matches!(p.ty, HirType::Ptr(_)))
         .map(|p| p.result)
         .collect();
+    seeds.extend(index.allocs.keys().copied());
     if seeds.is_empty() {
         return 0;
     }
-    let mut index = WebIndex::new(f);
     let mut seen = HashSet::default();
     for seed in seeds {
         if seen.contains(&seed) {
@@ -505,7 +509,7 @@ fn plan(f: &HirFunction, roots: HashMap<HirId, Root>) -> Option<Plan> {
         if *offset < end {
             return None;
         }
-        end = offset.checked_add(bytes(ty)?)?;
+        end = offset.checked_add(field_bytes(ty)?)?;
     }
     for (root, kind) in &p.roots {
         if let Root::Alloc { size, .. } = kind {
@@ -521,8 +525,22 @@ fn plan(f: &HirFunction, roots: HashMap<HirId, Root>) -> Option<Plan> {
     Some(p)
 }
 
+/// Bytes a field of `ty` takes: a scalar, or a struct of scalars read
+/// and written whole.
+fn field_bytes(ty: &HirType) -> Option<u64> {
+    match ty {
+        HirType::Struct(s) => {
+            for field in s.fields.iter() {
+                field_bytes(field)?;
+            }
+            Some(crate::value_layout::size_of_hir_ty(ty) as u64)
+        }
+        _ => bytes(ty),
+    }
+}
+
 fn field(fields: &mut BTreeMap<u64, HirType>, offset: u64, ty: &HirType) -> Option<()> {
-    bytes(ty)?;
+    field_bytes(ty)?;
     if let Some(old) = fields.get(&offset)
         && old != ty
     {

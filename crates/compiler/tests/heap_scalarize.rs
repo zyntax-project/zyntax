@@ -419,7 +419,15 @@ fn does_not_snapshot_an_opaque_incoming_pointer() {
         HirValueKind::Parameter(0),
     );
     a.f.blocks.get_mut(&a.head).unwrap().phis[0].incoming[0].0 = ptr;
-    assert_eq!(heap_scalarize::run_function(&mut a.f), 0);
+    // The entry's allocation, which the phi no longer takes, may go; the
+    // web through the opaque pointer stays as it is.
+    heap_scalarize::run_function(&mut a.f);
+    let head = &a.f.blocks[&a.head];
+    assert!(
+        head.phis
+            .iter()
+            .any(|p| p.result == a.current && p.incoming.iter().any(|(v, _)| *v == ptr))
+    );
 }
 
 #[test]
@@ -518,4 +526,85 @@ fn fields_follow_cross_field_recurrences_through_byte_geps() {
     b.instructions
         .extend([gep(next_second, a.next), store(old, next_second)]);
     check(a.f, 106, 2);
+}
+
+/// An object no phi carries, whose field is a struct written whole in
+/// its own block and read whole in another, becomes the stored value.
+#[test]
+fn an_object_read_past_its_block_becomes_its_stored_fields() {
+    let num = HirType::Struct(HirStructType {
+        name: None,
+        fields: vec![HirType::I64, HirType::I64, HirType::F64].into(),
+        packed: false,
+    });
+    let mut f = HirFunction::new(
+        InternedString::new_global("read_later"),
+        HirFunctionSignature {
+            params: vec![],
+            returns: vec![HirType::F64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        },
+    );
+    let entry = f.entry_block;
+    let later = f.create_block();
+    let size = constant(&mut f, 32);
+    let eight = constant(&mut f, 8);
+    let stored = f.create_value(num.clone(), HirValueKind::Parameter(0));
+    let object = instruction(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+    let at = instruction(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+    let read = instruction(&mut f, num.clone());
+    let field = instruction(&mut f, HirType::F64);
+    let b = f.blocks.get_mut(&entry).unwrap();
+    b.instructions = vec![
+        call(Some(object), Intrinsic::Malloc, vec![size]),
+        HirInstruction::GetElementPtr {
+            result: at,
+            ty: HirType::U8,
+            ptr: object,
+            indices: vec![eight],
+        },
+        store(stored, at),
+    ];
+    b.terminator = HirTerminator::Branch { target: later };
+    let b = f.blocks.get_mut(&later).unwrap();
+    b.instructions = vec![
+        HirInstruction::Load {
+            result: read,
+            ty: num,
+            ptr: at,
+            align: 8,
+            volatile: false,
+        },
+        call(None, Intrinsic::Free, vec![object]),
+        HirInstruction::ExtractValue {
+            result: field,
+            ty: HirType::F64,
+            aggregate: read,
+            indices: vec![2],
+        },
+    ];
+    b.terminator = HirTerminator::Return {
+        values: vec![field],
+    };
+    f.rebuild_cfg_edges();
+    assert_eq!(heap_scalarize::run_function(&mut f), 1);
+    let instructions: Vec<_> = f.blocks.values().flat_map(|b| &b.instructions).collect();
+    assert!(!instructions.iter().any(|i| matches!(
+        i,
+        HirInstruction::Call {
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc | Intrinsic::Free),
+            ..
+        }
+    )));
+    assert!(instructions.iter().any(|i| matches!(
+        i,
+        HirInstruction::ExtractValue { aggregate, .. } if *aggregate == stored
+    )));
 }
