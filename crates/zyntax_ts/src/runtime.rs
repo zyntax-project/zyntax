@@ -130,6 +130,28 @@ extern "C" fn array_length_trap(_length: f64) {
     exit_process(1);
 }
 
+/// Raises the `ReferenceError` for a `let` or `const` reached before its declaration has run.
+extern "C" fn binding_check(ready: bool, name: zrtl::StringConstPtr) {
+    if ready {
+        return;
+    }
+    // SAFETY: the compiler passes the binding's name as a string literal.
+    let name = unsafe { zrtl::string_as_str(name) }.unwrap_or_default();
+    eprintln!("ReferenceError: Cannot access '{name}' before initialization");
+    exit_process(1);
+}
+
+/// A module binding read before any assignment, where TypeScript would read `undefined`.
+extern "C" fn assigned_check(assigned: bool, name: zrtl::StringConstPtr) {
+    if assigned {
+        return;
+    }
+    // SAFETY: the compiler passes the binding's name as a string literal.
+    let name = unsafe { zrtl::string_as_str(name) }.unwrap_or_default();
+    eprintln!("TypeError: '{name}' is read before it is assigned; TypeScript would read undefined");
+    exit_process(1);
+}
+
 /// ToInt32 for NaN, infinities and magnitudes the inline conversion does not cover.
 extern "C" fn to_int32_slow(value: f64) -> i64 {
     if !value.is_finite() {
@@ -176,6 +198,8 @@ zrtl::zrtl_plugin! {
         ("$TS$pow", number_pow),
         ("$TS$index_trap", index_trap),
         ("$TS$array_length_trap", array_length_trap),
+        ("$TS$binding_check", binding_check),
+        ("$TS$assigned_check", assigned_check),
         ("$TS$date_now", date_now),
         ("$TS$performance_now", performance_now),
         ("$TS$to_int32_slow", to_int32_slow),

@@ -175,9 +175,7 @@ fn lifted_functions_use_typed_code_references_without_heap_environments() {
 #[test]
 fn captures_and_function_object_semantics_require_explicit_implementation() {
     for source in [
-        "let x=1; const f=()=>x; x=2; console.log(f());",
         "function make(x:number):()=>number{return ()=>x;}",
-        "const f=()=>x; const x=1; console.log(f());",
         "const f=(n:number):number=>n>0?f(n-1):0;",
         "const f=()=>1; console.log(f===f);",
         "const f=()=>1; console.log(f.length);",

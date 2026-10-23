@@ -26,6 +26,7 @@ mod bitwise;
 mod classes;
 mod constants;
 mod generics;
+mod globals;
 mod math;
 mod modules;
 mod namespaces;
@@ -248,7 +249,10 @@ struct VarExtents<'s> {
     containers: Vec<(oxc_span::Span, bool)>,
     declarations:
         FxHashMap<oxc_semantic::SymbolId, SmallVec<[(oxc_span::Span, (oxc_span::Span, bool)); 1]>>,
-    references: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
+    /// Reference positions, each marked when it is inside a nested function body.
+    references: FxHashMap<oxc_semantic::SymbolId, SmallVec<[(u32, bool); 2]>>,
+    functions: usize,
+    program: oxc_span::Span,
 }
 
 impl VarExtents<'_> {
@@ -271,13 +275,23 @@ impl VarExtents<'_> {
                 .min_by_key(|(at, _)| at.start)
                 .copied()
                 .unwrap();
-            let references = self.references.get(symbol);
-            if references.is_some_and(|r| r.iter().any(|at| *at <= first.start)) {
+            // A module var reached from a function body is a module global.
+            let module =
+                container == self.program && declarations.iter().all(|(_, (c, _))| *c == container);
+            let references: SmallVec<[u32; 2]> = self
+                .references
+                .get(symbol)
+                .into_iter()
+                .flatten()
+                .filter(|(_, deferred)| !(module && *deferred))
+                .map(|(at, _)| *at)
+                .collect();
+            if references.iter().any(|at| *at <= first.start) {
                 reject(&mut plan, "var used before its declaration", first);
                 continue;
             }
             let confined = declarations.iter().all(|(_, (c, _))| *c == container)
-                && references.is_none_or(|r| r.iter().all(|at| *at < container.end));
+                && references.iter().all(|at| *at < container.end);
             if confined {
                 continue;
             }
@@ -309,7 +323,23 @@ impl VarExtents<'_> {
 
 impl<'ast> Visit<'ast> for VarExtents<'_> {
     fn visit_program(&mut self, it: &js::Program<'ast>) {
+        self.program = it.span;
         self.contained(it.span, false, |this| walk::walk_program(this, it));
+    }
+    fn visit_function(&mut self, it: &js::Function<'ast>, flags: oxc_semantic::ScopeFlags) {
+        self.functions += 1;
+        walk::walk_function(self, it, flags);
+        self.functions -= 1;
+    }
+    fn visit_arrow_function_expression(&mut self, it: &js::ArrowFunctionExpression<'ast>) {
+        self.functions += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.functions -= 1;
+    }
+    fn visit_class(&mut self, it: &js::Class<'ast>) {
+        self.functions += 1;
+        walk::walk_class(self, it);
+        self.functions -= 1;
     }
     fn visit_block_statement(&mut self, it: &js::BlockStatement<'ast>) {
         self.contained(it.span, false, |this| walk::walk_block_statement(this, it));
@@ -351,7 +381,7 @@ impl<'ast> Visit<'ast> for VarExtents<'_> {
             self.references
                 .entry(symbol)
                 .or_default()
-                .push(id.span.start);
+                .push((id.span.start, self.functions > 0));
         }
     }
 }
@@ -680,6 +710,12 @@ struct Lowerer<'ast, 'program> {
     scopes: Vec<FxHashMap<InternedString, Binding>>,
     scope_floor: usize,
     constants: FxHashMap<InternedString, Constant>,
+    constant_symbols: FxHashSet<oxc_semantic::SymbolId>,
+    /// Module globals by native name, and the top-level symbols they store.
+    globals: FxHashMap<InternedString, globals::Global>,
+    module_symbols: FxHashMap<oxc_semantic::SymbolId, InternedString>,
+    /// Lowering the module body itself, outside any function or arrow.
+    top_level: bool,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
@@ -728,6 +764,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             scopes: vec![],
             scope_floor: 0,
             constants: FxHashMap::default(),
+            constant_symbols: FxHashSet::default(),
+            globals: FxHashMap::default(),
+            module_symbols: FxHashMap::default(),
+            top_level: false,
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
             class_order: vec![],
@@ -804,6 +844,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             containers: vec![],
             declarations: FxHashMap::default(),
             references: FxHashMap::default(),
+            functions: 0,
+            program: program.span,
         };
         extents.visit_program(program);
         let plan = extents.plan();
@@ -852,6 +894,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         self.class_signatures()?;
         self.externs();
+        self.module_bindings(program, semantic)?;
         let dependencies = self.dependencies(semantic)?;
         let mut visiting = FxHashSet::default();
         for item in &program.body {
@@ -878,6 +921,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
         }
         self.lower_classes()?;
+        // In the module body a global is unavailable until its declaration runs.
+        for binding in self.scopes[0].values_mut() {
+            binding.initialized = false;
+        }
+        self.top_level = true;
         self.scopes.push(FxHashMap::default());
         self.vars = FunctionVars {
             scope: self.scopes.len() - 1,
@@ -918,6 +966,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
         }
         self.pop_scope();
+        self.top_level = false;
         body.splice(0..0, std::mem::take(&mut self.vars.hoisted));
         if !body.is_empty() {
             self.declarations.push(node(
@@ -1739,6 +1788,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             ("$TS$pow", vec![number(), number()], number()),
             ("$TS$index_trap", vec![number(), number()], unit()),
             ("$TS$array_length_trap", vec![number()], unit()),
+            ("$TS$binding_check", vec![boolean(), string()], unit()),
+            ("$TS$assigned_check", vec![boolean(), string()], unit()),
             ("$TS$date_now", vec![], number()),
             ("$TS$performance_now", vec![], number()),
             (
@@ -1803,6 +1854,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         for d in &declaration.declarations {
             if let js::BindingPattern::BindingIdentifier(id) = &d.id {
+                if id
+                    .symbol_id
+                    .get()
+                    .is_some_and(|symbol| self.module_symbols.contains_key(&symbol))
+                {
+                    continue;
+                }
                 let name = self.name(id.name.as_str());
                 if self.scopes.last().unwrap().contains_key(&name) {
                     return self.error(ErrorKind::Type, "duplicate variable", d.span);
@@ -1839,10 +1897,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at)
             })?;
-        if scope < self.scope_floor {
+        // Scope 0 holds module globals, which every body reaches.
+        if scope < self.scope_floor && scope != 0 {
             return self.unsupported("lexical captures in arrow functions", at);
         }
-        if !b.initialized {
+        // A body that runs later checks a global's readiness when it runs.
+        if !b.initialized && (scope != 0 || self.top_level) {
             return self.error(
                 ErrorKind::Type,
                 format!("`{name}` is used before initialization"),
@@ -2790,6 +2850,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.unsupported("destructuring declarations", d.span);
             };
             let name = self.name(id.name.as_str());
+            if let Some(global) = id
+                .symbol_id
+                .get()
+                .and_then(|symbol| self.module_symbols.get(&symbol))
+                .copied()
+            {
+                if let Some(annotation) = &d.type_annotation
+                    && self.ty(&annotation.type_annotation)?.0 != self.scopes[0][&name].ty
+                {
+                    return self.error(
+                        ErrorKind::Type,
+                        "subsequent variable declarations must have the same type",
+                        d.span,
+                    );
+                }
+                out.extend(self.declare_in_module(global, name, d.init.as_ref(), d.span)?);
+                continue;
+            }
             let redeclared = self
                 .scopes
                 .last()
@@ -3074,6 +3152,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn require_assigned(&self, name: InternedString, at: oxc_span::Span) -> Result<()> {
+        // A body that runs later checks a global's first assignment when it runs.
+        if !self.top_level && self.globals.contains_key(&name) {
+            return Ok(());
+        }
         match self.unassigned.get(&name) {
             Some(Unassigned::Declared) if !self.flow.is_assigned(name) => self.error(
                 ErrorKind::Type,
@@ -3278,6 +3360,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             unproven_string: false,
         });
         let outer_loop = std::mem::replace(&mut self.loop_depth, 0);
+        let outer_top = std::mem::replace(&mut self.top_level, false);
         let outer_floor = std::mem::replace(&mut self.scope_floor, self.scopes.len());
         self.scopes.push(FxHashMap::default());
         let outer_vars = std::mem::replace(
@@ -3388,6 +3471,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.pop_scope();
         self.vars = outer_vars;
         self.scope_floor = outer_floor;
+        self.top_level = outer_top;
         self.loop_depth = outer_loop;
         self.returns = outer_returns;
         let (params, statements, ret, ty) = result?;
@@ -3431,6 +3515,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self.unsupported("namespace objects as values", at);
                 }
                 self.require_value(i.name.as_str(), at)?;
+                if let Some(constant) = self.captured_constant(i.name.as_str(), at) {
+                    return Ok(constant);
+                }
                 if self
                     .scopes
                     .iter()
@@ -3441,7 +3528,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     let b = self.binding(i.name.as_str(), at)?;
                     let value = var(b.name, b.ty.clone(), at);
                     let flow = self.flow.get(&b.name).copied();
-                    let value = self.flow_read(value, flow, at)?;
+                    let mut value = self.flow_read(value, flow, at)?;
+                    let mut checks = self.global_guard(unique, true, at);
+                    if !checks.is_empty() {
+                        let ty = value.ty.clone();
+                        checks.push(expression(value));
+                        value = node(
+                            TypedExpression::Block(TypedBlock {
+                                statements: checks.into_vec(),
+                                span: span(at),
+                            }),
+                            ty,
+                            at,
+                        );
+                    }
                     if value.ty == Type::Primitive(PrimitiveType::I64) {
                         node(
                             TypedExpression::Cast(TypedCast {
@@ -3667,6 +3767,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let read = self.read_target(&target, at)?;
                 self.expect(&read.ty, &number(), at)?;
                 let (mut statements, target) = self.capture_target(target, at);
+                if let TypedExpression::Variable(name) = target.node {
+                    statements.extend(self.global_guard(name, true, at));
+                }
                 let read = if matches!(
                     target.node,
                     TypedExpression::Field(_) | TypedExpression::Index(_)
@@ -3705,7 +3808,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 } else {
                     var(old, number(), at)
                 };
-                statements.extend([save, expression(assign), expression(result)]);
+                statements.extend([save, expression(assign)]);
+                if let TypedExpression::Variable(name) = target.node {
+                    statements.extend(self.global_assigned(name, at));
+                }
+                statements.push(expression(result));
                 node(
                     TypedExpression::Block(TypedBlock {
                         statements,
@@ -4423,6 +4530,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             );
         }
         let (mut statements, target) = self.capture_target(target, a.span);
+        if let TypedExpression::Variable(name) = target.node {
+            statements.extend(self.global_guard(name, a.operator.as_str() != "=", a.span));
+        }
         let target_view = if let js::AssignmentTarget::AssignmentTargetIdentifier(i) = &a.left {
             self.binding(i.name.as_str(), a.span)?.view
         } else {
@@ -4495,13 +4605,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 a.span,
             );
         }
+        if let TypedExpression::Variable(name) = target.node
+            && self.globals.contains_key(&name)
+            && target.ty == string()
+            && (op != "=" || !self.immortal_string(&a.right))
+        {
+            return self.unsupported(
+                "module string bindings without a proven static lifetime",
+                a.span,
+            );
+        }
         let stored = self.adapt_value(var(name, ty.clone(), a.span), &target.ty, a.span)?;
+        let assigned = match target.node {
+            TypedExpression::Variable(global) => self.global_assigned(global, a.span),
+            _ => None,
+        };
         let assignment = binary(BinaryOp::Assign, target, stored, unit(), a.span);
-        statements.extend([
-            save,
-            expression(assignment),
-            expression(var(name, ty.clone(), a.span)),
-        ]);
+        statements.extend([save, expression(assignment)]);
+        statements.extend(assigned);
+        statements.push(expression(var(name, ty.clone(), a.span)));
         Ok(node(
             TypedExpression::Block(TypedBlock {
                 statements,

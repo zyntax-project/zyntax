@@ -1,0 +1,23 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2448,
+      "start": 12,
+      "length": 4,
+      "file": "before_declaration.ts",
+      "message": "Block-scoped variable 'late' used before its declaration."
+    },
+    {
+      "code": 2454,
+      "start": 12,
+      "length": 4,
+      "file": "before_declaration.ts",
+      "message": "Variable 'late' is used before being assigned."
+    }
+  ],
+  "source_sha256": "627a753c8fb11fc2076f30163ebad0e2eac6e0ccb22b87894bd79983b6c60bd9",
+  "options": {}
+}

@@ -281,6 +281,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         ty: &Type,
         source: &js::Expression<'ast>,
     ) {
+        if self.globals.contains_key(&name) {
+            return;
+        }
         if element_type(ty).is_some()
             || (matches!(ty, Type::TypeVar(_)) && self.array_source(source).is_some())
         {
@@ -306,7 +309,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         match source {
             js::Expression::Identifier(i) => {
                 let b = self.binding(i.name.as_str(), i.span).ok()?;
-                if element_type(&b.ty).is_none() {
+                if element_type(&b.ty).is_none() || self.globals.contains_key(&b.name) {
                     return None;
                 }
                 let name = b.name;
@@ -694,7 +697,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if (op == ">" && truth) || (op == "<=" && !truth) {
                 if matches!(self.integral(other), Some(Integral::Nonnegative)) {
                     if let js::Expression::Identifier(i) = other {
-                        if let Ok(binding) = self.binding(i.name.as_str(), i.span) {
+                        if let Ok(binding) = self.binding(i.name.as_str(), i.span)
+                            && !self.globals.contains_key(&binding.name)
+                        {
                             let name = binding.name;
                             self.flow.bounds.insert((fact.root, name));
                         }

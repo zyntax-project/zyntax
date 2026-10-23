@@ -11,7 +11,7 @@ gaps against TypeScript rather than treating them as compatibility passes.
 
 | Area | Implemented | Remaining gaps |
 | --- | --- | --- |
-| Values and control flow | Numbers, booleans, strings, primitive aliases, operators, branches and loops | Full JavaScript coercion and string behavior |
+| Values and control flow | Numbers, booleans, strings, primitive aliases, operators, branches and loops; module bindings that functions read and write | Full JavaScript coercion and string behavior; module bindings holding unions or computed strings |
 | Functions and inference | Typed parameters; forward calls; primitive, object and void return inference; annotated recursive groups; direct recursive returns inferred from base cases | Arithmetic and mutual inference cycles need annotations; recursive function-value types and broader contextual inference |
 | Generics | Inferred and explicit arguments, trailing defaults, dependent constraints, scalar-bound operations, nested calls, recursion and cached native specializations | Generic aliases/interfaces, const parameters, richer inference and layout-dependent aggregate operations |
 | Function values | Capture-free arrows, named references, contextual parameter types and higher-order scalar signatures | Captures, function object identity/properties, parameter-count adaptation and aggregate callback signatures |
@@ -19,6 +19,14 @@ gaps against TypeScript rather than treating them as compatibility passes.
 | Arrays | Dense numbers, booleans, static strings, class instances and nested arrays; typed indexing, length, push, array `for…of`, and filled length constructors | Sparse extension, length mutation, other methods, optional reads and general iterator protocols |
 | Unions | Scalar alternatives among number, boolean and string; number/boolean with `undefined`; narrowing, equality, truthiness and formatting | Owned/reference payloads, broader nullable combinations and optional callback signatures |
 | Modules | Named/default/type-only/side-effect imports; static namespace calls, function references and qualified types; function/type/interface exports; default function declarations and bindings; aliases; named and star re-exports; relative filesystem projects | Other default values, namespace object values/re-exports and runtime indexing, exported variables/live bindings, cycles/TDZ and package resolution |
+
+Top-level bindings that functions, arrows or methods use are module globals shared by
+every tier. A function that may run before a `let` or `const` declaration checks the
+binding on each access and raises `ReferenceError`, as the temporal dead zone requires;
+literal constants that nothing can observe early are substituted. A function read of a
+binding that may still hold `undefined` (declared without a value, or a `var` read before
+its declaration) is checked and traps, as an array index TypeScript would read as
+`undefined` does.
 
 String arrays and string union payloads require a proven static string lifetime.
 Generic element mutation, capturing closures and broader reference-bearing unions

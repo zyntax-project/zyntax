@@ -1,0 +1,37 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2451,
+      "start": 23,
+      "length": 4,
+      "file": "uninitialized_assigned.ts",
+      "message": "Cannot redeclare block-scoped variable 'name'."
+    },
+    {
+      "code": 2588,
+      "start": 141,
+      "length": 4,
+      "file": "uninitialized_assigned.ts",
+      "message": "Cannot assign to 'name' because it is a constant."
+    },
+    {
+      "code": 2454,
+      "start": 188,
+      "length": 5,
+      "file": "uninitialized_assigned.ts",
+      "message": "Variable 'level' is used before being assigned."
+    },
+    {
+      "code": 2454,
+      "start": 217,
+      "length": 5,
+      "file": "uninitialized_assigned.ts",
+      "message": "Variable 'level' is used before being assigned."
+    }
+  ],
+  "source_sha256": "efacb19f660743ab68d556403454c61d83ac89165fe5323b597b4513a8b39784",
+  "options": {}
+}

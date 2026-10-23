@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2454,
+      "start": 143,
+      "length": 5,
+      "file": "uninitialized_top_level.ts",
+      "message": "Variable 'total' is used before being assigned."
+    }
+  ],
+  "source_sha256": "d547bd77e70a5115a2def6701c99af76e6a9bc7bf531020d09e0dbf31d7f7fab",
+  "options": {}
+}

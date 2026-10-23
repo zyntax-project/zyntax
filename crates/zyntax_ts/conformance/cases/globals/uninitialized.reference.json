@@ -1,0 +1,23 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2454,
+      "start": 183,
+      "length": 5,
+      "file": "uninitialized.ts",
+      "message": "Variable 'total' is used before being assigned."
+    },
+    {
+      "code": 2454,
+      "start": 190,
+      "length": 5,
+      "file": "uninitialized.ts",
+      "message": "Variable 'ready' is used before being assigned."
+    }
+  ],
+  "source_sha256": "121b5d85557fed1088fe6a737c488465a235d238e2a2cd031948b3766f433c90",
+  "options": {}
+}

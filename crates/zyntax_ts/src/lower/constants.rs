@@ -61,7 +61,7 @@ pub(super) enum Constant {
 }
 
 impl Constant {
-    fn ty(self) -> Type {
+    pub(super) fn ty(self) -> Type {
         match self {
             Self::Number(_) => number(),
             Self::Bool(_) => boolean(),
@@ -98,6 +98,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 let name = self.name(id.name.as_str());
                 self.constants.insert(name, value);
+                self.constant_symbols.extend(id.symbol_id.get());
             }
         }
     }
@@ -175,7 +176,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if self.scopes.iter().any(|s| s.contains_key(&self.name(name))) {
             return None;
         }
-        Some(match value {
+        Some(Self::constant_literal(value, at))
+    }
+
+    /// The literal for a constant's own module binding reached from an arrow body, which the
+    /// body cannot capture.
+    pub(super) fn captured_constant(&self, name: &'ast str, at: oxc_span::Span) -> Option<Expr> {
+        let key = self.name(name);
+        let (scope, binding) = self
+            .scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, s)| s.get(&key).map(|b| (index, b)))?;
+        let declared = binding
+            .symbol
+            .is_some_and(|symbol| self.constant_symbols.contains(&symbol));
+        (declared && scope != 0 && scope < self.scope_floor)
+            .then(|| Self::constant_literal(self.constants[&key], at))
+    }
+
+    fn constant_literal(value: Constant, at: oxc_span::Span) -> Expr {
+        match value {
             Constant::Number(n) => num(n, at),
             Constant::Bool(b) => node(
                 TypedExpression::Literal(TypedLiteral::Bool(b)),
@@ -187,7 +209,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 string(),
                 at,
             ),
-        })
+        }
     }
 
     pub(super) fn constant_integral(&self, name: &'ast str) -> Option<Integral> {

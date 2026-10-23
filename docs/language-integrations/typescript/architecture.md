@@ -37,6 +37,9 @@ promotion. To enable LLVM, build with `--features llvm-backend` and run with
   parameters, layouts, borrow facts and array result summaries without bodies.
 - Generic function constraints and defaults share optional immutable rule metadata.
   Imported checker views retain nominal class identity and readonly properties.
+- Top-level bindings reached from function bodies are shared `TypedDeclaration::Variable`
+  globals that the module initializer assigns. Flow facts such as array bounds are
+  never kept for them, since any call may reassign one.
 - Static namespace members resolve by semantic symbol to those same signatures.
   A borrowed AST pass indexes namespace uses; only referenced functions enter
   shared linking, and no namespace object is allocated for these accesses.

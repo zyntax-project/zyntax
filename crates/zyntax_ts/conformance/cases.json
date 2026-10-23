@@ -2154,5 +2154,115 @@
     "id": "generics/default_partial_readonly_error",
     "file": "cases/generics/default_partial_readonly_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "globals/counter",
+    "file": "cases/globals/counter.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/flags",
+    "file": "cases/globals/flags.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/instance",
+    "file": "cases/globals/instance.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/lcg",
+    "file": "cases/globals/lcg.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/arrow",
+    "file": "cases/globals/arrow.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/shadow",
+    "file": "cases/globals/shadow.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/tdz_call",
+    "file": "cases/globals/tdz_call.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/tdz_constant",
+    "file": "cases/globals/tdz_constant.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/tdz_after",
+    "file": "cases/globals/tdz_after.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/var_global",
+    "file": "cases/globals/var_global.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/before_declaration",
+    "file": "cases/globals/before_declaration.ts",
+    "mode": "check"
+  },
+  {
+    "id": "globals/const_write",
+    "file": "cases/globals/const_write.ts",
+    "mode": "check"
+  },
+  {
+    "id": "globals/type_error",
+    "file": "cases/globals/type_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "globals/var_redeclared",
+    "file": "cases/globals/var_redeclared.ts",
+    "mode": "check"
+  },
+  {
+    "id": "globals/uninitialized",
+    "file": "cases/globals/uninitialized.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/var_after_declaration",
+    "file": "cases/globals/var_after_declaration.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/arrays",
+    "file": "cases/globals/arrays.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/arrays_nested",
+    "file": "cases/globals/arrays_nested.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/arrays_instances",
+    "file": "cases/globals/arrays_instances.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/uninitialized_top_level",
+    "file": "cases/globals/uninitialized_top_level.ts",
+    "mode": "check"
+  },
+  {
+    "id": "globals/uninitialized_assigned",
+    "file": "cases/globals/uninitialized_assigned.ts",
+    "mode": "run"
+  },
+  {
+    "id": "globals/arrow_late_binding",
+    "file": "cases/globals/arrow_late_binding.ts",
+    "mode": "run"
   }
 ]

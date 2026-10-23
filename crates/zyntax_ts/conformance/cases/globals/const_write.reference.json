@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2588,
+      "start": 70,
+      "length": 7,
+      "file": "const_write.ts",
+      "message": "Cannot assign to 'derived' because it is a constant."
+    }
+  ],
+  "source_sha256": "8a996d4401224445f466d0f34b1048c94f73706f3d932c1f599759f5fc85ad3b",
+  "options": {}
+}
