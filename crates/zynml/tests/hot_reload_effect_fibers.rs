@@ -235,10 +235,13 @@ fn a_handler_edit_retargets_dispatch_at_the_next_perform() {
 /// all-old and all-new extremes only if dispatch retargeted mid-flight.
 #[test]
 fn a_running_machine_observes_the_edited_event_source() {
-    const CAP: i64 = 3_000_000;
+    // Long enough that the all-old run outlasts the wait before the edit
+    // on a release build.
+    const CAP: i64 = 30_000_000;
+    let long = |src: String| src.replace("state < 3000000", "state < 30000000");
 
     let mut rt = runtime();
-    rt.compile_typed_program(parse(&source(1)))
+    rt.compile_typed_program(parse(&long(source(1))))
         .expect("v1 should compile");
 
     let entry = rt
@@ -250,7 +253,7 @@ fn a_running_machine_observes_the_edited_event_source() {
     let worker = std::thread::spawn(move || drive());
 
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let edited = source(1).replace("return 3", "return 30");
+    let edited = long(source(1)).replace("return 3", "return 30");
     let report = rt
         .reload_typed_program(parse(&edited))
         .expect("reload should succeed");

@@ -3269,15 +3269,15 @@ impl TieredRuntime {
 }
 
 /// Whether compiled loops carry a back-edge probe. A probe is how a running loop moves to the
-/// tier above, so it pays only where that tier exists and publishes code: LLVM selected as the
-/// top tier. A ladder that ends at the Cranelift baseline would execute a load and a branch per
-/// iteration for nothing. `ZYNTAX_BASELINE_OSR_PROBES=1` keeps the probes whatever the ladder;
-/// safe to run with.
+/// tier above or into a reloaded body, so it pays only where something publishes code for it:
+/// LLVM selected as the top tier, or hot reload on. A ladder that ends at the Cranelift baseline
+/// without reload would execute a load and a branch per iteration for nothing.
+/// `ZYNTAX_BASELINE_OSR_PROBES=1` keeps the probes whatever the ladder; safe to run with.
 fn loop_probes(config: &TieredConfig) -> bool {
     if !config.enable_osr {
         return false;
     }
-    if std::env::var_os("ZYNTAX_BASELINE_OSR_PROBES").is_some() {
+    if config.enable_hot_reload || std::env::var_os("ZYNTAX_BASELINE_OSR_PROBES").is_some() {
         return true;
     }
     #[cfg(feature = "llvm-backend")]
