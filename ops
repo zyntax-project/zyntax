@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":2,"timestamp":1792714299,"nonce":"1JXbuRDq8j892J0X/0XQCRNcWBk=","title":"Python conformance: 20 tests fail on main (generators, lists, classes, scope, modules)","was":"Python conformance: 20 tests fail on main (generators, lists, classes, scope, modules)"}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":5,"timestamp":1792714299,"nonce":"s3jhQJJzYvr3hDX93RQMT7TkFD0=","added":["perf"],"removed":null}]}
