@@ -12891,35 +12891,7 @@ impl SsaBuilder {
                 crate::hir::anonymous_union_type(members.iter().map(|t| self.convert_type(t)))
             }
             Type::Result { ok_type, err_type } => {
-                // Convert Result<T, E> to a tagged union: enum { Ok(T), Err(E) }
-                use crate::hir::{HirUnionType, HirUnionVariant};
-
-                // Convert inner types FIRST before locking arena
-                let ok_hir_type = self.convert_type(ok_type);
-                let err_hir_type = self.convert_type(err_type);
-
-                let mut arena = self.arena.lock().unwrap();
-                let ok_name = arena.intern_string("Ok");
-                let err_name = arena.intern_string("Err");
-                drop(arena);
-
-                HirType::Union(Box::new(HirUnionType {
-                    name: None,
-                    variants: vec![
-                        HirUnionVariant {
-                            name: ok_name,
-                            ty: ok_hir_type,
-                            discriminant: 0,
-                        },
-                        HirUnionVariant {
-                            name: err_name,
-                            ty: err_hir_type,
-                            discriminant: 1,
-                        },
-                    ],
-                    discriminant_type: Box::new(HirType::U32),
-                    is_c_union: false,
-                }))
+                crate::hir::result_type(self.convert_type(ok_type), self.convert_type(err_type))
             }
             Type::Fiber(inner) => {
                 // Symmetric with `Type::Result` etc. — the typed-AST

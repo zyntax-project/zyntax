@@ -54,6 +54,28 @@ pub fn optional_type(payload: HirType) -> HirType {
     }))
 }
 
+/// Shared representation for `Type::Result` in signatures and SSA values:
+/// `Ok` is variant 0 and `Err` variant 1.
+pub fn result_type(ok: HirType, err: HirType) -> HirType {
+    HirType::Union(Box::new(HirUnionType {
+        name: None,
+        variants: vec![
+            HirUnionVariant {
+                name: InternedString::new_global("Ok"),
+                ty: ok,
+                discriminant: 0,
+            },
+            HirUnionVariant {
+                name: InternedString::new_global("Err"),
+                ty: err,
+                discriminant: 1,
+            },
+        ],
+        discriminant_type: Box::new(HirType::U32),
+        is_c_union: false,
+    }))
+}
+
 /// Stable names for the positional alternatives of an anonymous union.
 pub fn union_variant_name(index: usize) -> InternedString {
     match index {

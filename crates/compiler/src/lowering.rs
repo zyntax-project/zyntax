@@ -4849,6 +4849,9 @@ impl LoweringContext {
             },
 
             Type::Optional(inner) => crate::hir::optional_type(self.convert_type(inner)),
+            Type::Result { ok_type, err_type } => {
+                crate::hir::result_type(self.convert_type(ok_type), self.convert_type(err_type))
+            }
             Type::Union(members) => {
                 crate::hir::anonymous_union_type(members.iter().map(|t| self.convert_type(t)))
             }
