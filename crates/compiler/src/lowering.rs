@@ -743,31 +743,39 @@ impl LoweringContext {
 
     /// Put each exact struct type's HIR spelling in `module.types`, where
     /// the optimiser finds the name its pointers carry. A type whose name
-    /// another registered type shares is left out: a pointer spelled with
-    /// that name need not point at the exact one.
+    /// another registered type of a different layout shares is left out:
+    /// a pointer spelled with that name need not point at the exact one.
+    /// Copies of one type under one name are the same spelling.
     fn record_exact_struct_types(&mut self) {
         let exact = self.module.exact_struct_types.clone();
         if exact.is_empty() {
             return;
         }
-        let mut names: HashMap<InternedString, usize> = HashMap::new();
+        let mut names: HashMap<InternedString, Vec<zyntax_typed_ast::TypeId>> = HashMap::new();
         for def in self.type_registry.get_all_types() {
-            *names.entry(def.name).or_default() += 1;
+            names.entry(def.name).or_default().push(def.id);
         }
-        for id in exact {
-            let Some(def) = self.type_registry.get_type_by_id(id) else {
-                continue;
-            };
-            if names.get(&def.name).copied() != Some(1) {
-                continue;
-            }
-            let ty = self.convert_type(&Type::Named {
+        let spelled = |this: &Self, id| {
+            this.convert_type(&Type::Named {
                 id,
                 type_args: vec![],
                 const_args: vec![],
                 variance: vec![],
                 nullability: zyntax_typed_ast::type_registry::NullabilityKind::NonNull,
+            })
+        };
+        for id in exact {
+            let Some(def) = self.type_registry.get_type_by_id(id) else {
+                continue;
+            };
+            let ty = spelled(self, id);
+            let alone = names.get(&def.name).is_some_and(|ids| {
+                ids.iter()
+                    .all(|&other| other == id || spelled(self, other) == ty)
             });
+            if !alone {
+                continue;
+            }
             self.module.types.entry(id).or_insert(ty);
         }
     }
