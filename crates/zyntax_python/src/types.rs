@@ -68,8 +68,9 @@ pub(crate) enum Ty {
     /// A callable supplied by the host whose arguments and result are
     /// all unboxed floats. The arity is enough to select its fixed ABI.
     HostFloatCallable(u8),
-    /// A generator: a fiber yielding dynamic values.
-    Gen,
+    /// A generator: a fiber yielding what the yield table holds at this
+    /// index (see [`gen_of`]); index 0 yields dynamic values.
+    Gen(u16),
     /// A function value whose function is known: the closure at this
     /// index of the module's table. Carried as the record every function
     /// value is, so it is a dynamic value wherever one is needed; where
@@ -111,6 +112,12 @@ pub(crate) enum Ty {
     /// whether the tuple is there and the tuple. A local, a parameter or
     /// a result holds it as itself; every other reader sees its box.
     MaybeTuple(u16),
+    /// A tuple of a length only the run time knows, every element of
+    /// this kind (see [`tuple_elem`]): held as the list of them is, by
+    /// its header's address. A local, a field or a generator's yield
+    /// holds it as itself; every other reader sees its box (see
+    /// [`Ty::boxed_view`]).
+    TupleOf(Elem),
     /// A dynamic value: a boxed `Any`.
     Object,
     #[default]
@@ -428,8 +435,14 @@ pub(crate) fn builtin_index(name: &str) -> Option<u8> {
 fn by_address(ty: Ty) -> bool {
     matches!(
         ty,
-        Ty::List(_) | Ty::MaybeList(_) | Ty::Dict(_) | Ty::Set(_)
+        Ty::List(_) | Ty::MaybeList(_) | Ty::TupleOf(_) | Ty::Dict(_) | Ty::Set(_)
     )
+}
+
+/// Whether a tuple of a length only the run time knows, every element
+/// of kind `e`, is a [`Ty::TupleOf`] rather than a dynamic value.
+pub(crate) fn tuple_elem(e: Elem) -> bool {
+    matches!(e, Elem::Int | Elem::Float | Elem::Str)
 }
 
 thread_local! {
@@ -454,6 +467,8 @@ thread_local! {
     /// `Ty::Tuple` decided in one inference round names the same shape
     /// in the next and in the lowering.
     static TUPLE_SHAPES: std::cell::RefCell<Vec<Vec<Ty>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What each generator type past the first yields (see [`gen_of`]).
+    static GEN_YIELDS: std::cell::RefCell<Vec<Ty>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Parameters, by item and position, that may not take lists of
     /// numbers of two kinds as one list of run-time numbers: a caller
     /// passes a list of another kind the callee may change or keep, so
@@ -527,6 +542,7 @@ thread_local! {
 /// Forget every shape: the start of a program.
 pub(crate) fn reset_tuple_shapes() {
     TUPLE_SHAPES.with(|t| t.borrow_mut().clear());
+    GEN_YIELDS.with(|t| t.borrow_mut().clear());
     FUNC_SETS.with(|t| t.borrow_mut().clear());
     CLASS_SETS.with(|t| t.borrow_mut().clear());
     CLASS_SET_UNBOXES.with(|t| t.borrow_mut().clear());
@@ -931,7 +947,7 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
     let elems: Vec<Ty> = elems
         .into_iter()
         .map(|t| match t {
-            Ty::Gen | Ty::MaybeList(_) | Ty::MaybeTuple(_) => Ty::Object,
+            Ty::Gen(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) | Ty::TupleOf(_) => Ty::Object,
             Ty::Num(_) if !crate::lower::num::enabled() => Ty::Object,
             other => other,
         })
@@ -945,6 +961,31 @@ pub(crate) fn tuple_of(elems: Vec<Ty>) -> Ty {
         table.push(elems);
         Ty::Tuple(k)
     })
+}
+
+/// The generator type yielding `ty`: one of its own when a fiber step can
+/// carry `ty` as the address it is held by (a list's or tuple's header),
+/// else the generator of dynamic values.
+pub(crate) fn gen_of(ty: Ty) -> Ty {
+    if !matches!(ty, Ty::List(_) | Ty::TupleOf(_)) {
+        return Ty::Gen(0);
+    }
+    GEN_YIELDS.with(|t| {
+        let mut table = t.borrow_mut();
+        if let Some(k) = table.iter().position(|y| *y == ty) {
+            return Ty::Gen(k as u16 + 1);
+        }
+        table.push(ty);
+        Ty::Gen(u16::try_from(table.len()).expect("fewer than 65536 generator types in a program"))
+    })
+}
+
+/// What the generator type `k` yields.
+pub(crate) fn gen_yield(k: u16) -> Ty {
+    match k {
+        0 => Ty::Object,
+        k => GEN_YIELDS.with(|t| t.borrow()[k as usize - 1]),
+    }
 }
 
 /// The element types of the tuple shape `k`.
@@ -1151,7 +1192,7 @@ impl Ty {
     /// wherever the reader has no arm of its own for it.
     pub(crate) fn boxed_view(self) -> Ty {
         match self {
-            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) => Ty::Object,
+            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) | Ty::TupleOf(_) => Ty::Object,
             t => t,
         }
     }
@@ -1366,6 +1407,7 @@ impl Ty {
             Ty::List(Elem::Array(c)) => format!("Array({})", c.letter()),
             Ty::MaybeList(e) => format!("{}|None", Ty::List(e).describe()),
             Ty::MaybeTuple(k) => format!("{}|None", Ty::Tuple(k).describe()),
+            Ty::TupleOf(e) => format!("TupleOf({})", e.ty().describe()),
             Ty::Num(m) => {
                 let names: Vec<&str> = [
                     (Ty::NUM_INT, "int"),
@@ -1451,6 +1493,10 @@ impl Ty {
                 Ty::Tuple(k) => Ty::MaybeTuple(k),
                 _ => Ty::Object,
             },
+            Ty::TupleOf(e) => match Ty::List(e).settled() {
+                Ty::List(e) if tuple_elem(e) => Ty::TupleOf(e),
+                _ => Ty::Object,
+            },
             other => other,
         }
     }
@@ -1465,7 +1511,7 @@ impl Ty {
     /// of its elements is stored as.
     pub(crate) fn element(self) -> Option<Ty> {
         match self {
-            Ty::List(e) => Some(e.ty()),
+            Ty::List(e) | Ty::TupleOf(e) => Some(e.ty()),
             Ty::Tuple(k) => {
                 let joined = tuple_shape(k).into_iter().fold(Ty::Unknown, Ty::join);
                 Some(match joined {
@@ -1480,7 +1526,7 @@ impl Ty {
             }),
             // A set iterates as its elements.
             Ty::Set(k) => Some(set_shape(k).0),
-            Ty::Gen => Some(Ty::Object),
+            Ty::Gen(k) => Some(gen_yield(k)),
             Ty::Str => Some(Ty::Str),
             // Bytes iterate as their byte values; a file as its lines.
             Ty::Bytes => Some(Ty::Int),
@@ -3052,7 +3098,7 @@ impl Module {
 /// passed None is, and nothing undecided keys an instance.
 pub(crate) fn spec_ty(t: Ty) -> Ty {
     match t {
-        Ty::None | Ty::Unknown | Ty::Gen => Ty::Object,
+        Ty::None | Ty::Unknown | Ty::Gen(_) => Ty::Object,
         other => other.settled(),
     }
 }
@@ -3149,6 +3195,8 @@ pub(crate) struct Locals {
     pub(crate) narrowed: HashMap<String, u16>,
     /// What the body assigns to its own parameters.
     pub(crate) param_writes: HashMap<String, Ty>,
+    /// What the body's `yield`s give, joined, as a local holds it.
+    pub(crate) yields: Ty,
     /// Whether the body has a `return`; without one it returns None.
     pub(crate) returns: bool,
     /// Whether the body has a `return []`: a fresh list that takes the
@@ -3309,7 +3357,7 @@ pub(crate) fn declared_sig_in(
         .map(|p| p.default.as_deref().cloned())
         .collect();
     let ret = if is_generator(&f.body) {
-        Ty::Gen
+        Ty::Gen(0)
     } else {
         f.returns
             .as_deref()
@@ -3920,7 +3968,24 @@ pub(crate) fn infer_module(
                         eprintln!("[types] inner {inner_rounds}: list params of {}", item.name);
                     }
                 }
-                if item.def.returns.is_none() && sig.ret != Ty::Gen {
+                // A generator yields what its yields join to, where a fiber
+                // step carries that as itself.
+                if let Ty::Gen(_) = sig.ret {
+                    let ret = gen_of(locals.yields);
+                    if ret != sig.ret {
+                        if trace_rounds {
+                            eprintln!(
+                                "[types] inner {inner_rounds}: {} yields {:?} (was {:?})",
+                                item.name,
+                                locals.yields.describe(),
+                                sig.ret
+                            );
+                        }
+                        module.funcs.get_mut(&item.name).unwrap().ret = ret;
+                        deps::wrote(Dep::Ret(deps::name_key(&item.name)));
+                        changed = true;
+                    }
+                } else if item.def.returns.is_none() {
                     let ret = if locals.returns { locals.ret } else { Ty::None };
                     if ret != sig.ret {
                         if trace_rounds {
@@ -4669,7 +4734,7 @@ fn specialisable(module: &Module, item: &Item<'_>) -> bool {
     if !(module.closed.contains(&item.name) || valued) || item.def.name.as_str() == "__init__" {
         return false;
     }
-    if module.funcs[&item.name].ret == Ty::Gen {
+    if let Ty::Gen(_) = module.funcs[&item.name].ret {
         return false;
     }
     true
@@ -5989,6 +6054,7 @@ fn infer_locals_in(
         // The result is decided afresh each round, from the types known
         // now, as an unkinded list is.
         locals.ret = Ty::Unknown;
+        locals.yields = Ty::Unknown;
         locals.returns = false;
         locals.returns_empty = false;
         locals.returns_other = false;
@@ -6023,6 +6089,7 @@ fn infer_locals_in(
         }
         if locals.vars == before.vars
             && locals.ret == before.ret
+            && locals.yields == before.yields
             && locals.global_writes == before.global_writes
             && locals.nonlocal_writes == before.nonlocal_writes
             && locals.widened_globals == before.widened_globals
@@ -7855,7 +7922,16 @@ impl Walker<'_> {
                 let ty = self.typer().operation(a.op, lhs, rhs, &a.value);
                 self.target(&a.target, ty);
             }
-            py::Stmt::Expr(e) => self.container_write(&e.value),
+            py::Stmt::Expr(e) => {
+                if let py::Expr::Yield(y) = &*e.value {
+                    let ty = match &y.value {
+                        Some(v) => self.expr_num(v).stored_view(),
+                        None => Ty::None,
+                    };
+                    self.locals.yields = self.locals.yields.join(ty);
+                }
+                self.container_write(&e.value)
+            }
             py::Stmt::Return(r) => {
                 self.locals.returns = true;
                 if r.value.as_deref().is_some_and(is_empty_list) {
@@ -7863,8 +7939,12 @@ impl Walker<'_> {
                     return;
                 }
                 self.locals.returns_other = true;
+                // A tuple held as its list is returned as its box.
                 let ty = match &r.value {
-                    Some(v) => self.expr_num(v),
+                    Some(v) => match self.expr_num(v) {
+                        Ty::TupleOf(_) => Ty::Object,
+                        t => t,
+                    },
                     None => Ty::None,
                 };
                 self.locals.ret = self.locals.ret.join_num(ty);
@@ -8922,6 +9002,7 @@ impl Typer<'_> {
         // None raises there.
         let seq = match self.expr_num(iter) {
             t @ (Ty::MaybeList(_) | Ty::MaybeTuple(_)) => t.present(),
+            t @ Ty::TupleOf(_) => t,
             t => t.boxed_view(),
         };
         seq.element().unwrap_or(Ty::Object)
@@ -9183,6 +9264,7 @@ impl Typer<'_> {
                 // tuple: None raises there.
                 let seq = match self.expr_num(&s.value) {
                     t @ (Ty::MaybeList(_) | Ty::MaybeTuple(_)) => t.present(),
+                    t @ Ty::TupleOf(_) => t,
                     t => t.boxed_view(),
                 };
                 if seq == Ty::Unknown {
@@ -9190,7 +9272,7 @@ impl Typer<'_> {
                 }
                 if let py::Expr::Slice(slice) = &*s.slice {
                     match seq {
-                        Ty::Str | Ty::Bytes | Ty::List(_) => seq,
+                        Ty::Str | Ty::Bytes | Ty::List(_) | Ty::TupleOf(_) => seq,
                         // A slice of a tuple with literal bounds is the
                         // shape those bounds cut out.
                         Ty::Tuple(k) => {
@@ -9302,7 +9384,7 @@ impl Typer<'_> {
                 set_of(elem, false)
             }
             py::Expr::SetComp(c) => set_of(self.comprehension_elem(&c.generators, &c.elt), false),
-            py::Expr::Generator(_) => Ty::Gen,
+            py::Expr::Generator(_) => Ty::Gen(0),
             py::Expr::Yield(_) | py::Expr::YieldFrom(_) => Ty::None,
             // A lambda is the closure it defines, where inference knows
             // it; otherwise a function value like any other.
@@ -9720,7 +9802,15 @@ impl Typer<'_> {
             "next" => Ty::Object,
             // Of an operand not yet typed, undecided: what it is made of
             // is decided by the round that types the operand.
-            "sorted" | "reversed" | "list" => match arg(0) {
+            "sorted" | "reversed" | "list" => match args
+                .first()
+                .map(|a| self.expr_num(a))
+                .map(|t| match t {
+                    Ty::TupleOf(e) => Ty::List(e),
+                    t => t.boxed_view(),
+                })
+                .unwrap_or(Ty::Unknown)
+            {
                 // An array's elements make a list of what they read as.
                 Ty::List(Elem::Array(c)) => Ty::List(Elem::of(c.item())),
                 Ty::List(e) => Ty::List(e),
@@ -9733,7 +9823,7 @@ impl Typer<'_> {
                     Ty::Unknown => Ty::Unknown,
                     e => Ty::List(Elem::of(e)),
                 },
-                Ty::Gen => Ty::List(Elem::Object),
+                Ty::Gen(_) => Ty::List(Elem::Object),
                 Ty::Unknown if !args.is_empty() => Ty::Unknown,
                 _ => match args.first() {
                     Some(py::Expr::Call(c)) if is_name(&c.func, "range") => Ty::List(Elem::Int),
@@ -9742,10 +9832,28 @@ impl Typer<'_> {
             },
             // A tuple built from a sequence has the length of that
             // sequence, which is not a shape.
-            "tuple" => match arg(0) {
-                Ty::Tuple(k) => Ty::Tuple(k),
-                Ty::Unknown if !args.is_empty() => Ty::Unknown,
-                _ => Ty::Object,
+            "tuple" => match args.first().map(|a| self.expr_num(a)) {
+                Some(t @ (Ty::Tuple(_) | Ty::TupleOf(_))) => t,
+                Some(Ty::Unknown) => Ty::Unknown,
+                // Of a comprehension, a range or a list whose elements
+                // are of one kind, the list of them with a tuple's
+                // identity.
+                Some(t) => {
+                    let elem = match &args[0] {
+                        py::Expr::Generator(_) | py::Expr::ListComp(_) => self.iter_elem(&args[0]),
+                        py::Expr::Call(c) if is_name(&c.func, "range") => Ty::Int,
+                        _ => match t {
+                            Ty::List(e) => e.ty(),
+                            _ => Ty::Object,
+                        },
+                    };
+                    match elem {
+                        Ty::Unknown => Ty::Unknown,
+                        e if tuple_elem(Elem::of(e)) => Ty::TupleOf(Elem::of(e)),
+                        _ => Ty::Object,
+                    }
+                }
+                None => Ty::Object,
             },
             // From pairs of a known shape, the dict a comprehension of
             // them would make.

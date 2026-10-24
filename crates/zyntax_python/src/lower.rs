@@ -108,7 +108,7 @@ pub(crate) fn class_type(k: usize) -> Type {
 pub(crate) fn field_storage(ty: Ty) -> Ty {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Class(_) | Ty::Num(_) => ty,
-        Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => Ty::Int,
+        Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) | Ty::TupleOf(_) => Ty::Int,
         _ => Ty::Object,
     }
 }
@@ -212,7 +212,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         Ty::None
         | Ty::Bytes
         | Ty::File(_)
-        | Ty::Gen
+        | Ty::Gen(_)
         | Ty::Closure(_)
         | Ty::Func(_)
         | Ty::Funcs(_)
@@ -225,6 +225,7 @@ fn field_of(ty: Ty) -> zyntax_builtins::lists::Field {
         | Ty::HostFloatCallable(_)
         | Ty::MaybeList(_)
         | Ty::MaybeTuple(_)
+        | Ty::TupleOf(_)
         | Ty::Classes(_)
         | Ty::Object
         | Ty::Unknown => Field::Any,
@@ -363,7 +364,7 @@ pub(crate) fn ir(ty: Ty) -> Type {
         Ty::Bool => prim(PrimitiveType::Bool),
         Ty::Str | Ty::Bytes => prim(PrimitiveType::String),
         Ty::None => prim(PrimitiveType::Unit),
-        Ty::List(e) | Ty::MaybeList(e) => list_type(elem_ir(e)),
+        Ty::List(e) | Ty::MaybeList(e) | Ty::TupleOf(e) => list_type(elem_ir(e)),
         // A shape is a value struct with one field per element, each
         // stored as `tuple_field_storage` says.
         Ty::Tuple(k) => Type::Tuple(
@@ -381,7 +382,8 @@ pub(crate) fn ir(ty: Ty) -> Type {
         // An instance of one of several classes, by its address.
         Ty::Classes(_) => addr_type(),
         Ty::HostObject(_, _) => prim(PrimitiveType::I64),
-        Ty::Gen => Type::Fiber(Box::new(Type::Any)),
+        // A fiber handle, whatever the fiber's steps carry.
+        Ty::Gen(_) => Type::Fiber(Box::new(Type::Any)),
         // A known function value is still the record every function
         // value is.
         Ty::Closure(_)
@@ -921,6 +923,32 @@ fn ownership_of(ty: Ty) -> ParamOwnership {
 /// Whether a generator expression is the start of a fresh generator,
 /// which whoever drains it owns, rather than a name for one held
 /// elsewhere.
+/// What a step of a fiber of the generator type `Gen(k)` carries: a box,
+/// or for a typed generator the address of what it yields.
+fn step_ir(k: u16) -> Type {
+    match k {
+        0 => Type::Any,
+        _ => prim(PrimitiveType::I64),
+    }
+}
+
+/// What the step a generator type `Gen(k)` bound to `item` stands for.
+fn gen_item(item: InternedString, k: u16, span: Span) -> Val {
+    match k {
+        0 => Val {
+            node: var(item, Ty::Object, span),
+            ty: Ty::Object,
+        },
+        k => {
+            let ty = types::gen_yield(k);
+            Val {
+                node: cast(var(item, Ty::Int, span), ty, span),
+                ty,
+            }
+        }
+    }
+}
+
 fn is_generator_start(r#gen: &Node) -> bool {
     matches!(
         &r#gen.node,
@@ -1446,7 +1474,7 @@ impl<'m> Lowerer<'m> {
         captured_types: HashMap<String, Ty>,
     ) -> Self {
         let bound = sig.params.iter().map(|(n, _)| intern(n)).collect();
-        let is_generator = sig.ret == Ty::Gen;
+        let is_generator = matches!(sig.ret, Ty::Gen(_));
         // A variable a nested function reads or assigns is shared
         // through a cell, as is everything captured from further out.
         let mut cells: BTreeSet<String> = captured.iter().cloned().collect();
@@ -2209,7 +2237,12 @@ impl<'m> Lowerer<'m> {
             );
             return self.comprehension(&g.generators, Produce::List(elem, &g.elt), span);
         }
-        self.expr(e)
+        // A tuple held as its list is read as the list.
+        let v = self.expr_num(e)?;
+        if let Ty::TupleOf(_) = v.ty {
+            return Ok(self.tuple_as_list(v));
+        }
+        Ok(self.boxed_num(v))
     }
 
     fn var_ty(&self, name: &str) -> Ty {
@@ -2600,7 +2633,7 @@ impl<'m> Lowerer<'m> {
         // A generator is a fiber whose declared type is what it yields
         // and whose arguments arrive in its environment.
         let return_type = if self.is_generator {
-            Type::Any
+            self.yield_ir()
         } else {
             ir(self.sig.ret)
         };
@@ -2778,6 +2811,21 @@ impl<'m> Lowerer<'m> {
             (Ty::MaybeList(_), _) | (_, Ty::MaybeList(_)) => self.coerce_nullable_list(v, target),
             (Ty::MaybeTuple(_), _) | (_, Ty::MaybeTuple(_)) => {
                 self.coerce_nullable_tuple(v, target)
+            }
+            // A tuple held as its list is boxed as a tuple of its elements.
+            (Ty::TupleOf(e), _) => {
+                let items = self.coerce(
+                    Val {
+                        node: v.node,
+                        ty: Ty::List(e),
+                    },
+                    Ty::List(Elem::Object),
+                );
+                let boxed = Val {
+                    node: call("zb_box_tuple", vec![items], Ty::Object, span),
+                    ty: Ty::Object,
+                };
+                self.coerce(boxed, target)
             }
             // A known function value is a dynamic value already.
             (Ty::Closure(_), Ty::Object | Ty::Closure(_)) | (Ty::Object, Ty::Closure(_)) => v.node,
@@ -3050,7 +3098,7 @@ impl<'m> Lowerer<'m> {
                     self.coerce(items, Ty::List(e))
                 }
             }
-            (Ty::Gen, Ty::List(Elem::Object)) => self.generator_to_list(v.node, span),
+            (Ty::Gen(k), Ty::List(Elem::Object)) => self.generator_to_list(v.node, k, span),
             // Run-time numbers of fewer kinds are stored as those of more.
             (Ty::List(Elem::Num(from)), Ty::List(Elem::Num(to))) if from & !to == 0 => {
                 let mut n = v.node;
@@ -3161,7 +3209,9 @@ impl<'m> Lowerer<'m> {
     /// from its address.
     pub(crate) fn field_out(&mut self, stored: Node, ty: Ty, span: Span) -> Node {
         match ty {
-            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => cast(stored, ty, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) | Ty::TupleOf(_) => {
+                cast(stored, ty, span)
+            }
             _ => self.trusted(
                 Val {
                     node: stored,
@@ -3177,7 +3227,9 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         let typed = self.coerce(v, ty);
         match ty {
-            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) => cast(typed, Ty::Int, span),
+            Ty::Dict(_) | Ty::Set(_) | Ty::List(_) | Ty::MaybeList(_) | Ty::TupleOf(_) => {
+                cast(typed, Ty::Int, span)
+            }
             _ => self.coerce(Val { node: typed, ty }, field_storage(ty)),
         }
     }
@@ -3197,6 +3249,7 @@ impl<'m> Lowerer<'m> {
                 })
             }
             Ty::MaybeTuple(_) => Ok(self.tuple_present(v, message)),
+            Ty::TupleOf(_) => Ok(v),
             _ => Ok(self.boxed_num(v)),
         }
     }
@@ -3524,6 +3577,10 @@ impl<'m> Lowerer<'m> {
     /// are when they are; anything else as it is.
     fn tuple_as_list(&mut self, v: Val) -> Val {
         match v.ty {
+            Ty::TupleOf(e) => Val {
+                node: v.node,
+                ty: Ty::List(e),
+            },
             Ty::Tuple(_) => {
                 let list = Ty::List(Elem::of(v.ty.element().unwrap_or(Ty::Object)));
                 Val {
@@ -3930,7 +3987,14 @@ impl<'m> Lowerer<'m> {
                 Ty::Bool,
                 span,
             ),
-            Ty::Gen
+            Ty::TupleOf(_) => binary(
+                BinaryOp::Ne,
+                method_call(v.node, "len", vec![], Ty::Int, span),
+                int_lit(0, span),
+                Ty::Bool,
+                span,
+            ),
+            Ty::Gen(_)
             | Ty::Closure(_)
             | Ty::Func(_)
             | Ty::Funcs(_)
@@ -4076,7 +4140,7 @@ impl<'m> Lowerer<'m> {
         let span = v.node.span;
         crate::records::demote_reached(self.module, v.ty);
         match v.ty {
-            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) => {
+            Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) | Ty::TupleOf(_) => {
                 let boxed = self.boxed_num(v);
                 self.str_of(boxed)
             }
@@ -4134,7 +4198,7 @@ impl<'m> Lowerer<'m> {
                 call("zb_tuple_repr", vec![items], Ty::Str, span)
             }
             Ty::Dict(_) | Ty::Set(_) => self.table_repr(v, span),
-            Ty::Gen => str_lit("<generator object>", span),
+            Ty::Gen(_) => str_lit("<generator object>", span),
             Ty::Closure(_) => str_lit("<function>", span),
             Ty::Bound(_) => str_lit("<bound method>", span),
             Ty::Builtin(k) => str_lit(
@@ -4602,7 +4666,14 @@ impl<'m> Lowerer<'m> {
                     unreachable!()
                 };
                 let value = match &y.value {
-                    Some(v) => self.expr_as(v, Ty::Object)?,
+                    // What a fiber step carries as itself goes as its address.
+                    Some(v) => match self.sig.ret {
+                        Ty::Gen(k) if k > 0 => {
+                            let held = self.expr_as(v, types::gen_yield(k))?;
+                            cast(held, Ty::Int, span)
+                        }
+                        _ => self.expr_as(v, Ty::Object)?,
+                    },
                     None => {
                         let none = Val {
                             node: node(
@@ -6190,7 +6261,7 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<TypedStatement> {
         let seq = self.expr_list_read(&f.iter, "'NoneType' object is not iterable")?;
-        if seq.ty == Ty::Gen {
+        if let Ty::Gen(_) = seq.ty {
             return self.for_generator(f, seq, extra, span);
         }
         self.for_items(f, seq, None, extra, span)
@@ -6208,7 +6279,7 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<TypedStatement> {
         // A generator's items are pulled into a list first.
-        let seq = if seq.ty == Ty::Gen {
+        let seq = if let Ty::Gen(_) = seq.ty {
             Val {
                 node: self.iterable(seq, span),
                 ty: Ty::List(Elem::Object),
@@ -7174,7 +7245,7 @@ impl<'m> Lowerer<'m> {
             }
             Ty::List(_) | Ty::Tuple(_) => self.coerce(source, target),
             // A set or a generator: its items first.
-            Ty::Set(_) | Ty::Gen => {
+            Ty::Set(_) | Ty::Gen(_) => {
                 let items = Val {
                     node: self.iterable(source, span),
                     ty: Ty::List(Elem::Object),
@@ -7554,7 +7625,7 @@ impl<'m> Lowerer<'m> {
     /// its own type when that is a string or a shape, else as it is.
     fn index_val(&mut self, container: Ty, slice: &py::Expr) -> Result<Val> {
         match container {
-            Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => Ok(Val {
+            Ty::List(_) | Ty::Tuple(_) | Ty::TupleOf(_) | Ty::Str | Ty::Bytes => Ok(Val {
                 node: self.expr_as(slice, Ty::Int)?,
                 ty: Ty::Int,
             }),
@@ -7582,6 +7653,16 @@ impl<'m> Lowerer<'m> {
             Ty::List(_) | Ty::Tuple(_) | Ty::Str | Ty::Bytes => {
                 Ok(self.index_value(seq, index.node, ty, span))
             }
+            Ty::TupleOf(e) => Ok(self.index_value_as(
+                Val {
+                    node: seq.node,
+                    ty: Ty::List(e),
+                },
+                index.node,
+                ty,
+                "tuple",
+                span,
+            )),
             Ty::Dict(_) => Ok(self.dict_get(seq, index, ty, span)),
             Ty::Class(k) if crate::records::is_record(k as usize) => {
                 self.record_read(k as usize, seq, index, span)
@@ -8125,7 +8206,7 @@ impl<'m> Lowerer<'m> {
 
     pub(crate) fn expr(&mut self, e: &py::Expr) -> Result<Val> {
         let v = self.expr_num(e)?;
-        if let Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) = v.ty {
+        if let Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_) | Ty::TupleOf(_) = v.ty {
             let node = self.coerce(v, Ty::Object);
             return Ok(Val {
                 node,
@@ -9439,12 +9520,20 @@ impl<'m> Lowerer<'m> {
             py::CmpOp::Is | py::CmpOp::IsNot => {
                 let (left, right) = match (left.ty, right.ty) {
                     (Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_), Ty::None)
-                    | (Ty::None, Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_)) => {
-                        (left, right)
-                    }
+                    | (Ty::None, Ty::Num(_) | Ty::MaybeList(_) | Ty::MaybeTuple(_))
+                    | (Ty::TupleOf(_), Ty::TupleOf(_)) => (left, right),
                     _ => (self.boxed_num(left), self.boxed_num(right)),
                 };
                 let n = match (left.ty, right.ty) {
+                    // Tuples held as their lists are one when their
+                    // headers are; a box of either would be a new object.
+                    (Ty::TupleOf(_), Ty::TupleOf(_)) => binary(
+                        BinaryOp::Eq,
+                        cast(left.node, Ty::Int, span),
+                        cast(right.node, Ty::Int, span),
+                        Ty::Bool,
+                        span,
+                    ),
                     (Ty::Num(_), Ty::None) => {
                         let none = Self::after_none(
                             right.node,
@@ -10142,7 +10231,7 @@ impl<'m> Lowerer<'m> {
             let step = bound(self, &sl.step, 4)?;
             let mask = int_lit(mask, span);
             let node = match seq.ty {
-                Ty::List(e) => call(
+                Ty::List(e) | Ty::TupleOf(e) => call(
                     &list_fn("slice", e),
                     vec![seq.node, start, stop, step, mask],
                     ty,
@@ -11610,14 +11699,14 @@ impl<'m> Lowerer<'m> {
                 }
                 "next" if !args.is_empty() && args.len() <= 2 => {
                     let g = self.expr(&args[0])?;
-                    if g.ty != Ty::Gen {
+                    let Ty::Gen(k) = g.ty else {
                         return unsupported("next() on something other than a generator", c);
-                    }
+                    };
                     let default = match args.get(1) {
                         Some(d) => Some(self.expr_as(d, Ty::Object)?),
                         None => None,
                     };
-                    return Ok(self.next_of(g.node, default, span));
+                    return Ok(self.next_of(g.node, k, default, span));
                 }
                 "len" => {
                     // The size of a set's intersection with or difference
@@ -11649,7 +11738,9 @@ impl<'m> Lowerer<'m> {
                     let node = match v.ty {
                         Ty::Str => call("zb_str_chars_len", vec![v.node], Ty::Int, span),
                         Ty::Bytes => call("zb_str_len", vec![v.node], Ty::Int, span),
-                        Ty::List(_) => method_call(v.node, "len", vec![], Ty::Int, span),
+                        Ty::List(_) | Ty::TupleOf(_) => {
+                            method_call(v.node, "len", vec![], Ty::Int, span)
+                        }
                         // A shape's length is its arity.
                         Ty::Tuple(k) => Self::after_none(
                             v.node,
@@ -11914,6 +12005,34 @@ impl<'m> Lowerer<'m> {
                         ty,
                     });
                 }
+                // The list of the elements, made here: a comprehension's
+                // own, else a copy, since the tuple is a snapshot.
+                "tuple" if let Ty::TupleOf(e) = ty => {
+                    let list = Ty::List(e);
+                    let node = match &args[0] {
+                        py::Expr::Generator(g) => {
+                            self.comprehension(&g.generators, Produce::List(e, &g.elt), span)?
+                                .node
+                        }
+                        py::Expr::ListComp(_) => {
+                            let v = self.expr(&args[0])?;
+                            self.coerce(v, list)
+                        }
+                        other => {
+                            let v = self.consumed(other, span)?;
+                            // A tuple of it is the tuple itself.
+                            if self.typer().expr_num(other) == ty {
+                                return Ok(Val { node: v.node, ty });
+                            }
+                            let v = Val {
+                                node: self.coerce(v, list),
+                                ty: list,
+                            };
+                            call(&list_fn("copy", e), vec![v.node], list, span)
+                        }
+                    };
+                    return Ok(Val { node, ty });
+                }
                 "sorted" | "reversed" | "list" | "tuple" => {
                     let target_elem = match ty {
                         Ty::List(e) => e,
@@ -11995,7 +12114,7 @@ impl<'m> Lowerer<'m> {
                                     }
                                 }
                                 Ty::Set(_) | Ty::Dict(_) => self.table_items(v, span),
-                                Ty::Gen => {
+                                Ty::Gen(_) => {
                                     let node = self.coerce(v, Ty::List(Elem::Object));
                                     Val {
                                         node,
@@ -12769,14 +12888,16 @@ impl<'m> Lowerer<'m> {
     fn next_match(
         &mut self,
         r#gen: Node,
+        k: u16,
         item: InternedString,
         some: Vec<Stmt>,
         none: Vec<Stmt>,
         span: Span,
     ) -> Stmt {
+        let step = step_ir(k);
         let next = method_call(r#gen, "next", vec![], Ty::Object, span);
         let next = Node {
-            ty: Type::Optional(Box::new(Type::Any)),
+            ty: Type::Optional(Box::new(step.clone())),
             ..next
         };
         let some_pattern = TypedNode::new(
@@ -12787,11 +12908,11 @@ impl<'m> Lowerer<'m> {
                         name: item,
                         mutability: Mutability::Immutable,
                     },
-                    Type::Any,
+                    step.clone(),
                     span,
                 )),
             },
-            Type::Any,
+            step,
             span,
         );
         let arm = |pattern: TypedNode<TypedPattern>, statements: Vec<Stmt>| TypedMatchArm {
@@ -12829,18 +12950,13 @@ impl<'m> Lowerer<'m> {
     ) -> Result<TypedStatement> {
         let mut prologue = std::mem::take(&mut self.hoisted);
         let held_from = r#gen.node.clone();
+        let Ty::Gen(k) = r#gen.ty else {
+            unreachable!("a loop over a generator")
+        };
         let held = self.hold(r#gen, &mut prologue, span);
         let item = self.temp();
         let mut body = Vec::new();
-        self.bind(
-            &f.target,
-            Val {
-                node: var(item, Ty::Object, span),
-                ty: Ty::Object,
-            },
-            span,
-            &mut body,
-        )?;
+        self.bind(&f.target, gen_item(item, k, span), span, &mut body)?;
         self.in_loop(|this| -> Result<()> {
             for s in &f.body {
                 this.stmt(s, &mut body)?;
@@ -12854,7 +12970,7 @@ impl<'m> Lowerer<'m> {
             span,
         )];
         let fresh = is_generator_start(&held_from);
-        let pull = self.next_match(held.node.clone(), item, body, stop, span);
+        let pull = self.next_match(held.node.clone(), k, item, body, stop, span);
         prologue.push(one_pass(vec![pull], span));
         if fresh {
             prologue.push(free_generator(held.node, span));
@@ -12866,13 +12982,13 @@ impl<'m> Lowerer<'m> {
     }
 
     /// Every value a generator yields, as a list.
-    fn generator_to_list(&mut self, r#gen: Node, span: Span) -> Node {
+    fn generator_to_list(&mut self, r#gen: Node, k: u16, span: Span) -> Node {
         let mut pre = Vec::new();
         let fresh = is_generator_start(&r#gen);
         let held = self.hold(
             Val {
                 node: r#gen,
-                ty: Ty::Gen,
+                ty: Ty::Gen(k),
             },
             &mut pre,
             span,
@@ -12890,11 +13006,12 @@ impl<'m> Lowerer<'m> {
             span,
         ));
         let item = self.temp();
+        let boxed_item = self.coerce(gen_item(item, k, span), Ty::Object);
         let push = vec![TypedNode::new(
             TypedStatement::Expression(Box::new(method_call(
                 var(out, Ty::List(Elem::Object), span),
                 "push",
-                vec![var(item, Ty::Object, span)],
+                vec![boxed_item],
                 Ty::None,
                 span,
             ))),
@@ -12906,7 +13023,7 @@ impl<'m> Lowerer<'m> {
             Type::Unknown,
             span,
         )];
-        let pull = self.next_match(held.node.clone(), item, push, stop, span);
+        let pull = self.next_match(held.node.clone(), k, item, push, stop, span);
         pre.push(one_pass(vec![pull], span));
         if fresh {
             pre.push(free_generator(held.node, span));
@@ -12916,7 +13033,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `next(gen)`: the next value, or the default, or StopIteration.
-    fn next_of(&mut self, r#gen: Node, default: Option<Node>, span: Span) -> Val {
+    fn next_of(&mut self, r#gen: Node, k: u16, default: Option<Node>, span: Span) -> Val {
         let mut pre = Vec::new();
         let result = self.temp();
         let initial = match &default {
@@ -12941,11 +13058,12 @@ impl<'m> Lowerer<'m> {
             span,
         ));
         let item = self.temp();
+        let boxed_item = self.coerce(gen_item(item, k, span), Ty::Object);
         let take = vec![TypedNode::new(
             TypedStatement::Expression(Box::new(binary(
                 BinaryOp::Assign,
                 var(result, Ty::Object, span),
-                var(item, Ty::Object, span),
+                boxed_item,
                 Ty::None,
                 span,
             ))),
@@ -12956,7 +13074,7 @@ impl<'m> Lowerer<'m> {
         if default.is_none() {
             self.raise_named("StopIteration", str_lit("", span), span, &mut exhausted);
         }
-        let pull = self.next_match(r#gen, item, take, exhausted, span);
+        let pull = self.next_match(r#gen, k, item, take, exhausted, span);
         pre.push(pull);
         self.hoisted.extend(pre);
         Val {
@@ -12974,7 +13092,7 @@ impl<'m> Lowerer<'m> {
         let sig = Sig {
             none_params: Vec::new(),
             params: Vec::new(),
-            ret: Ty::Gen,
+            ret: Ty::Gen(0),
             defaults: Vec::new(),
         };
         let mut child = Lowerer::new(
@@ -13017,11 +13135,19 @@ impl<'m> Lowerer<'m> {
         let sig = Sig {
             none_params: Vec::new(),
             params: Vec::new(),
-            ret: Ty::Gen,
+            ret: Ty::Gen(0),
             defaults: Vec::new(),
         };
         let cells = self.cells_of(&captured, span);
         Ok(self.start_generator(&lifted, &sig, Vec::new(), cells, span))
+    }
+
+    /// What this generator body's steps carry.
+    fn yield_ir(&self) -> Type {
+        match self.sig.ret {
+            Ty::Gen(k) => step_ir(k),
+            _ => Type::Any,
+        }
     }
 
     /// `let env = <the fiber's environment>` at the start of a body.
@@ -13081,10 +13207,10 @@ impl<'m> Lowerer<'m> {
             node: call(
                 "zb_fiber_start",
                 vec![code_of(code, span), env],
-                Ty::Gen,
+                sig.ret,
                 span,
             ),
-            ty: Ty::Gen,
+            ty: sig.ret,
         }
     }
 
@@ -13121,10 +13247,10 @@ impl<'m> Lowerer<'m> {
             node: call(
                 "zb_fiber_start",
                 vec![code_of(code, span), env],
-                Ty::Gen,
+                sig.ret,
                 span,
             ),
-            ty: Ty::Gen,
+            ty: sig.ret,
         }
     }
 
@@ -13564,7 +13690,7 @@ impl<'m> Lowerer<'m> {
             .pick_instance(name, &sig, 0, args, keywords)
             .unwrap_or((name.to_string(), sig));
         let lowered = self.arguments(name, &sig, args, keywords, c)?;
-        if sig.ret == Ty::Gen {
+        if let Ty::Gen(_) = sig.ret {
             return Ok(self.start_generator(name, &sig, lowered, Vec::new(), span));
         }
         let target = self.call_target(&fn_name, &sig.params, &lowered);
@@ -14487,7 +14613,7 @@ impl<'m> Lowerer<'m> {
         // A generator method starts its fiber, `self` in the environment
         // with the arguments; a dispatcher over overrides does that for
         // whichever it reaches.
-        if sig.ret == Ty::Gen && direct {
+        if matches!(sig.ret, Ty::Gen(_)) && direct {
             let sig = sig.clone();
             let started = self.start_generator(fn_name, &sig, all, Vec::new(), span);
             return Some((started, fn_name.to_string()));
@@ -15456,7 +15582,7 @@ impl<'m> Lowerer<'m> {
         }
         // A generator closure: the call starts its fiber, the record
         // being the environment's head.
-        if info.sig.ret == Ty::Gen {
+        if let Ty::Gen(_) = info.sig.ret {
             let record = self.coerce(callee, Ty::Object);
             let record = call(
                 "zb_unbox_list_raw_any",

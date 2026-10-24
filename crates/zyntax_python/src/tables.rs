@@ -929,12 +929,15 @@ impl Lowerer<'_> {
                 let listed = matches!(stored, Ty::Int | Ty::Float | Ty::Str | Ty::Object);
                 let items = match v.ty {
                     Ty::List(e) if listed && e.ty() == stored && e.code().is_none() => v,
-                    Ty::List(_) | Ty::Tuple(_) | Ty::Set(_) | Ty::Dict(_) | Ty::Str | Ty::Gen => {
-                        Val {
-                            node: self.iterable(v, span),
-                            ty: Ty::List(Elem::Object),
-                        }
-                    }
+                    Ty::List(_)
+                    | Ty::Tuple(_)
+                    | Ty::Set(_)
+                    | Ty::Dict(_)
+                    | Ty::Str
+                    | Ty::Gen(_) => Val {
+                        node: self.iterable(v, span),
+                        ty: Ty::List(Elem::Object),
+                    },
                     _ => {
                         let o = self.coerce(v, Ty::Object);
                         Val {

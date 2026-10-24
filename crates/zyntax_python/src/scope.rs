@@ -237,6 +237,15 @@ impl<'a> Visitor<'a> for Collector {
             py::Expr::Lambda(l) => {
                 self.children.push((String::new(), Scope::of_lambda(l)));
             }
+            // A generator expression a builtin consumes whole is built in
+            // place, as a list comprehension is: what it reads is this
+            // scope's own reads.
+            py::Expr::Call(c) if consumed_inline(c) => {
+                self.visit_expr(&c.func);
+                if let [py::Expr::Generator(g)] = c.arguments.args.as_ref() {
+                    self.loads.extend(Scope::of_generator(g).free);
+                }
+            }
             py::Expr::Generator(g) => {
                 self.children.push((String::new(), Scope::of_generator(g)));
             }
@@ -258,6 +267,16 @@ impl<'a> Visitor<'a> for Collector {
             _ => walk_expr(self, expr),
         }
     }
+}
+
+/// Whether `c` is a call of a builtin the lowering builds its one
+/// generator expression argument for in place.
+fn consumed_inline(c: &py::ExprCall) -> bool {
+    matches!(&*c.func, py::Expr::Name(n) if matches!(
+        n.id.as_str(),
+        "tuple" | "list" | "set" | "frozenset" | "sorted" | "sum" | "any" | "all" | "min" | "max" | "dict"
+    )) && c.arguments.keywords.is_empty()
+        && matches!(c.arguments.args.as_ref(), [py::Expr::Generator(_)])
 }
 
 /// Whether an `except` clause may still hold its exception once it has
