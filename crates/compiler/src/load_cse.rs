@@ -236,21 +236,17 @@ fn load_regions(func: &HirFunction, enabled: bool) -> (Vec<Vec<usize>>, Vec<usiz
 
 /// Reuse loads within each block.
 pub fn run(func: &mut HirFunction) -> LoadCseStats {
-    run_with(func, &IdHashSet::default(), false)
+    run_with(func, &crate::licm::AliasNames::default(), false)
 }
 
 /// Reuse loads through single-entry successors after structural optimization.
 pub fn run_regions(func: &mut HirFunction) -> LoadCseStats {
-    run_with(func, &IdHashSet::default(), true)
+    run_with(func, &crate::licm::AliasNames::default(), true)
 }
 
 /// [`run`], knowing the exact struct types
-/// (`licm::exact_struct_names`).
-fn run_with(
-    func: &mut HirFunction,
-    exact: &IdHashSet<InternedString>,
-    across: bool,
-) -> LoadCseStats {
+/// (`licm::alias_names`).
+fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: bool) -> LoadCseStats {
     let mut substitutions: HashMap<HirId, HirId> = HashMap::default();
     let addr_index = crate::licm::build_addr_index(func, exact);
     let no_subst = indexmap::IndexMap::new();
@@ -415,7 +411,7 @@ pub fn run_module_regions(module: &mut HirModule) -> LoadCseStats {
 
 fn run_module_with_regions(module: &mut HirModule, across: bool) -> LoadCseStats {
     let mut total = LoadCseStats::default();
-    let exact = crate::licm::exact_struct_names(module);
+    let exact = crate::licm::alias_names(module);
     for func in module.functions_to_optimize() {
         let s = run_with(func, &exact, across);
         total.eliminated += s.eliminated;

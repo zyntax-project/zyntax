@@ -1216,14 +1216,22 @@ fn parse_program_once(
         }
     }
     mark_nothrow(&mut declarations, &inferred.non_raising);
-    for k in classes::exact_classes(&inferred) {
-        if let Some(id) = inferred.classes[k].type_id
+    // Every instance is an object of its own; a leaf class never cast
+    // down to is also exact.
+    let exact = classes::exact_classes(&inferred);
+    for (k, class) in inferred.classes.iter().enumerate().skip(1) {
+        if let Some(id) = class.type_id
             && let Some(def) = library.type_registry.get_type_by_id(id)
         {
             let mut def = def.clone();
             def.metadata
                 .custom
-                .insert(intern(zyntax_embed::EXACT_STRUCT_KEY), String::new());
+                .insert(intern(zyntax_embed::OBJECT_STRUCT_KEY), String::new());
+            if exact.contains(&k) {
+                def.metadata
+                    .custom
+                    .insert(intern(zyntax_embed::EXACT_STRUCT_KEY), String::new());
+            }
             library
                 .type_registry
                 .register_type_in_module(def.module, def);

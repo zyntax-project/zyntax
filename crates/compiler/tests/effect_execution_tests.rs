@@ -79,6 +79,7 @@ fn empty_module() -> HirModule {
         handlers: Default::default(),
         automatic_release: false,
         exact_struct_types: Default::default(),
+        object_struct_types: Default::default(),
     }
 }
 

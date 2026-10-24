@@ -115,16 +115,12 @@ pub struct LicmStats {
 
 /// Run LICM over `func`.
 pub fn run(func: &mut HirFunction) -> LicmStats {
-    run_with(func, &HashSet::default(), &HashSet::default())
+    run_with(func, &HashSet::default(), &AliasNames::default())
 }
 
-/// [`run`], knowing which functions are pure and which struct types
-/// are exact (see [`exact_struct_names`]).
-fn run_with(
-    func: &mut HirFunction,
-    pure: &HashSet<HirId>,
-    exact: &HashSet<InternedString>,
-) -> LicmStats {
+/// [`run`], knowing which functions are pure and the struct types the
+/// alias checks may rely on (see [`alias_names`]).
+fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>, exact: &AliasNames) -> LicmStats {
     // SSA construction doesn't reliably populate `block.successors` /
     // `block.predecessors` — different lowering paths write the
     // fields at different times, the optimisation passes that splice
@@ -221,7 +217,7 @@ pub fn run_module(module: &mut HirModule) -> LicmStats {
         .filter(|(_, f)| f.signature.is_pure)
         .map(|(id, _)| *id)
         .collect();
-    let exact = exact_struct_names(module);
+    let exact = alias_names(module);
     for func in module.functions_to_optimize() {
         let s = run_with(func, &pure, &exact);
         total.hoisted += s.hoisted;
@@ -290,29 +286,41 @@ fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<Hi
     }
 }
 
-/// The names of `module`'s exact struct types
-/// (`HirModule::exact_struct_types`, spelled in `module.types`): two
-/// pointers whose pointee types are two different ones never name the
-/// same bytes.
-pub(crate) fn exact_struct_names(module: &HirModule) -> HashSet<InternedString> {
-    // ZYNTAX_DISABLE_TYPED_ALIAS=1 ignores exact struct types in alias
-    // checks; safe to run with.
+/// The struct type names alias checks rely on, spelled in
+/// `module.types`: exact types (`HirModule::exact_struct_types`), where
+/// pointers of two different ones never name the same bytes, and object
+/// types (`HirModule::object_struct_types`), whose pointers never point
+/// into a list's element storage.
+#[derive(Default)]
+pub(crate) struct AliasNames {
+    pub(crate) exact: HashSet<InternedString>,
+    pub(crate) objects: HashSet<InternedString>,
+}
+
+/// `module`'s [`AliasNames`].
+pub(crate) fn alias_names(module: &HirModule) -> AliasNames {
+    // ZYNTAX_DISABLE_TYPED_ALIAS=1 ignores exact and object struct types
+    // in alias checks; safe to run with.
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DISABLED.get_or_init(|| std::env::var_os("ZYNTAX_DISABLE_TYPED_ALIAS").is_some()) {
-        return HashSet::default();
+        return AliasNames::default();
     }
-    module
-        .exact_struct_types
-        .iter()
-        .filter_map(|id| match module.types.get(id)? {
-            HirType::Struct(s) => s.name,
-            HirType::Ptr(inner) => match &**inner {
+    let names = |ids: &std::collections::HashSet<zyntax_typed_ast::TypeId>| {
+        ids.iter()
+            .filter_map(|id| match module.types.get(id)? {
                 HirType::Struct(s) => s.name,
+                HirType::Ptr(inner) => match &**inner {
+                    HirType::Struct(s) => s.name,
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        })
-        .collect()
+            })
+            .collect()
+    };
+    AliasNames {
+        exact: names(&module.exact_struct_types),
+        objects: names(&module.object_struct_types),
+    }
 }
 
 /// What `hoist_loop` reads of the whole function, the same for each of
@@ -326,8 +334,8 @@ struct Shared<'a> {
     /// Pointers made from integers (`IntToPtr`): an address a program
     /// may keep as zero when there is nothing to point at.
     from_integer: HashSet<HirId>,
-    /// Names of the exact struct types.
-    exact: &'a HashSet<InternedString>,
+    /// The struct type names alias checks rely on.
+    exact: &'a AliasNames,
 }
 
 /// Whether `ptr` is made, through address arithmetic and casts, from
@@ -778,6 +786,8 @@ pub(crate) struct MemLoc {
     /// The root's pointee type when it is an exact struct type: the
     /// root points at an object of that type.
     exact_type: Option<InternedString>,
+    /// The root points at an object of an object struct type.
+    object: bool,
     /// The access is into a list header: the chain to the root passes a
     /// value typed as one.
     in_header: bool,
@@ -862,10 +872,10 @@ impl MemLoc {
     }
 
     /// Whether one side is in a list's element storage and the other in
-    /// an object of an exact struct type or in a list header, which that
-    /// storage never overlaps.
+    /// an object of an exact or object struct type or in a list header,
+    /// which that storage never overlaps.
     fn buffer_against_object(&self, other: &MemLoc) -> bool {
-        let object = |m: &MemLoc| m.exact_type.is_some() || m.in_header;
+        let object = |m: &MemLoc| m.exact_type.is_some() || m.object || m.in_header;
         (self.root_kind == RootKind::Buffer && other.root_kind != RootKind::Buffer && object(other))
             || (other.root_kind == RootKind::Buffer
                 && self.root_kind != RootKind::Buffer
@@ -909,10 +919,7 @@ pub(crate) enum AddrLink {
 /// Without this index every chase step walked `func.blocks ×
 /// instructions` looking for the defining instruction — for a
 /// function with N instructions and K Loads we paid O(N²·K).
-pub(crate) fn build_addr_index(
-    func: &HirFunction,
-    exact: &HashSet<InternedString>,
-) -> HashMap<HirId, AddrLink> {
+pub(crate) fn build_addr_index(func: &HirFunction, exact: &AliasNames) -> HashMap<HirId, AddrLink> {
     let mut idx: HashMap<HirId, AddrLink> = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
@@ -1033,7 +1040,7 @@ pub(crate) fn extract_mem_loc(
     size: u32,
     identity_subst: &indexmap::IndexMap<HirId, HirId>,
     addr_index: &HashMap<HirId, AddrLink>,
-    exact: &HashSet<InternedString>,
+    exact: &AliasNames,
 ) -> MemLoc {
     let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
     let mut total_offset: u64 = 0;
@@ -1081,13 +1088,15 @@ pub(crate) fn extract_mem_loc(
         _ if matches!(addr_index.get(&current), Some(AddrLink::Buffer)) => RootKind::Buffer,
         _ => RootKind::Unknown,
     };
-    let exact_type = match root_value.map(|v| &v.ty) {
+    let pointee = match root_value.map(|v| &v.ty) {
         Some(HirType::Ptr(inner)) => match &**inner {
-            HirType::Struct(s) => s.name.filter(|n| exact.contains(n)),
+            HirType::Struct(s) => s.name,
             _ => None,
         },
         _ => None,
     };
+    let exact_type = pointee.filter(|n| exact.exact.contains(n));
+    let object = pointee.is_some_and(|n| exact.objects.contains(&n));
     MemLoc {
         root: Some(current),
         offset: if offset_known {
@@ -1098,6 +1107,7 @@ pub(crate) fn extract_mem_loc(
         size,
         root_kind,
         exact_type,
+        object,
         in_header,
     }
 }

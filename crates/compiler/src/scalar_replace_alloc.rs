@@ -889,6 +889,7 @@ mod tests {
             handlers: Default::default(),
             automatic_release: false,
             exact_struct_types: Default::default(),
+            object_struct_types: Default::default(),
         };
         module.functions.insert(func_id, f);
         (module, func_id)

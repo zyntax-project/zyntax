@@ -468,6 +468,9 @@ pub struct LoweringConfig {
     /// Struct types the frontend guarantees exact; becomes
     /// `HirModule::exact_struct_types`.
     pub exact_struct_types: std::collections::HashSet<zyntax_typed_ast::TypeId>,
+    /// Struct types the frontend guarantees are objects allocated on
+    /// their own; becomes `HirModule::object_struct_types`.
+    pub object_struct_types: std::collections::HashSet<zyntax_typed_ast::TypeId>,
 }
 
 impl std::fmt::Debug for LoweringConfig {
@@ -504,6 +507,7 @@ impl Default for LoweringConfig {
             use_krio_async: false,
             error_flag_global: None,
             exact_struct_types: std::collections::HashSet::new(),
+            object_struct_types: std::collections::HashSet::new(),
         }
     }
 }
@@ -589,6 +593,7 @@ impl LoweringContext {
             declared_in: indexmap::IndexMap::new(),
             module: HirModule {
                 exact_struct_types: config.exact_struct_types.clone(),
+                object_struct_types: config.object_struct_types.clone(),
                 ..HirModule::new(module_name)
             },
             string_literals: std::collections::HashMap::new(),
@@ -741,13 +746,19 @@ impl LoweringContext {
             .unwrap_or_else(crate::hir::HirId::new)
     }
 
-    /// Put each exact struct type's HIR spelling in `module.types`, where
+    /// Put each exact or object struct type's HIR spelling in
+    /// `module.types`, where
     /// the optimiser finds the name its pointers carry. A type whose name
     /// another registered type of a different layout shares is left out:
     /// a pointer spelled with that name need not point at the exact one.
     /// Copies of one type under one name are the same spelling.
     fn record_exact_struct_types(&mut self) {
-        let exact = self.module.exact_struct_types.clone();
+        let exact: std::collections::HashSet<_> = self
+            .module
+            .exact_struct_types
+            .union(&self.module.object_struct_types)
+            .copied()
+            .collect();
         if exact.is_empty() {
             return;
         }

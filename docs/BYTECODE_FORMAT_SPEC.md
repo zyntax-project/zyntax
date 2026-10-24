@@ -1,8 +1,8 @@
 # Zyntax Bytecode Format Specification
 
-**Version**: 10.0
+**Version**: 11.0
 **Status**: Stable
-**Last Updated**: 2026-10-20
+**Last Updated**: 2026-10-24
 
 ---
 
@@ -27,7 +27,7 @@ on values.
 | CLI loader | `crates/zyntax_cli/src/formats/hir_bytecode.rs` |
 
 The payload layout is defined by the codec applied to the declarations in
-those files. Section 5 transcribes them for format 10.0; where the two
+those files. Section 5 transcribes them for format 11.0; where the two
 disagree, the source is authoritative.
 
 ### Where the format is used
@@ -197,31 +197,31 @@ as in Postcard.
 
 ### 4.1 A complete file
 
-An empty module with id 1 named `m`, in the Postcard encoding (91 bytes).
+An empty module with id 1 named `m`, in the Postcard encoding (92 bytes).
 `B` is the current compiler's 32-byte fingerprint, supplied by
 `zyntax_compiler::BUILD_ID_BYTES`:
 
 ```
-0000  00 43 42 5a 0a 00 00 00 00 00 00 00 00 00 00 00
+0000  00 43 42 5a 0b 00 00 00 00 00 00 00 00 00 00 00
 0010  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-0020  0f 00 00 00 00 00 00 00 59 83 f8 ba
+0020  10 00 00 00 00 00 00 00 5e fe 0f c0
 002c  B (32 bytes)
-004c  01 01 6d 00 00 00 00 00 00 00 00 00 00 00 00
+004c  01 01 6d 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 | Bytes | Meaning |
 |-------|---------|
 | `00 43 42 5a` | magic |
-| `0a 00` `00 00` | version 10.0 |
+| `0b 00` `00 00` | version 11.0 |
 | `00` `00 00 00` | format 0 (Postcard), padding |
 | `00 00 00 00` | flags |
 | `01 00 00 00` + 12 zero bytes | module_id: module id 1 |
-| `0f 00 00 00 00 00 00 00` | payload_size 15 |
-| `59 83 f8 ba` | checksum `0xBAF88359` |
+| `10 00 00 00 00 00 00 00` | payload_size 16 |
+| `5e fe 0f c0` | checksum `0xC00FFE5E` |
 | `B` | compiler fingerprint |
 | `01` | `HirModule.id` = 1 |
 | `01 6d` | `name` = `"m"` |
-| `00` x 12 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types` and `initializers` empty |
+| `00` x 13 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types`, `object_struct_types` and `initializers` empty |
 
 ### 4.2 Instructions and terminators
 
@@ -242,7 +242,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (91 bytes).
 
 ## 5. Payload Data Model
 
-This is the format 10.0 schema. Types are written in Rust notation; every
+This is the format 11.0 schema. Types are written in Rust notation; every
 struct field is present, in the order shown. A `Box<T>` or `Arc<T>` in the
 source is shown as `T`, which encodes identically.
 
@@ -293,6 +293,7 @@ HirModule {
     handlers: IndexMap<HirId, HirEffectHandler>,
     automatic_release: bool,
     exact_struct_types: HashSet<TypeId>,  // struct types no pointer of another type aliases
+    object_struct_types: HashSet<TypeId>, // struct types never pointed into list storage
 }
 ```
 
@@ -343,6 +344,7 @@ FunctionAttributes {
     nothrow: bool,                        // never sets the error flag
     queries_error_flag: bool,             // reports whether an error is pending
     keeps_error_flag: bool,               // a call leaves the error flag as found
+    returns_nonnull: bool,                // every return is non-zero
     shell_refs: Option<Box<ShellRefs>>,   // on a shell: what its body refers to
 }
 ReleaseFacts { returns_owned: bool, returns_param: Vec<bool>, automatic_release: bool,
@@ -680,7 +682,7 @@ it has no body), keyed by the entry's id.
 2. Encode it with the chosen codec (section 3). For Split, lay out the blob
    and directory as in section 6.1.
 3. Compute the CRC-32 of the encoded payload.
-4. Write the 76-byte header (section 2) with version 10.0, the format byte,
+4. Write the 76-byte header (section 2) with version 11.0, the format byte,
    flags 0, the module id, the payload length and the checksum; then the
    payload; then nothing else.
 
@@ -727,3 +729,4 @@ recorded by a different build or for a different width.
 | 8.0 | 2026-10-10 | `HirValue` no longer carries a set of its uses; a reader that needs def-use information derives it from the operands. |
 | 9.0 | 2026-10-20 | `HirModule.initializers` records ordered startup roots. |
 | 10.0 | 2026-10-20 | Header grows to 76 bytes with the shared compiler/source fingerprint, checked before any payload decoding. |
+| 11.0 | 2026-10-24 | `HirModule.object_struct_types` records the struct types whose pointers never address list element storage, and `FunctionAttributes.returns_nonnull` records a function that never returns zero or null. |

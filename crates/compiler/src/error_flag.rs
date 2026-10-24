@@ -2,8 +2,9 @@
 //!
 //! A language that reports errors through a sticky global (see
 //! `HirGlobal::error_flag`) tests it after every fallible call. The flag
-//! is null at every function entry, only stores and calls change it, and
-//! a callee's attributes say what a call does to it: `sets_error_flag`
+//! is null at every function entry, only stores and calls change it (a
+//! store of a value that is never null, `sign_fold::non_zero`, sets it),
+//! and a callee's attributes say what a call does to it: `sets_error_flag`
 //! leaves it set, `nothrow` leaves a null flag null, and a body that
 //! stores nothing to it and calls only such bodies leaves it as found.
 //! Those body summaries are read once per module ([`summaries`]) and
@@ -257,11 +258,12 @@ pub fn run_module(module: &mut HirModule, summaries: &Summaries) -> ErrorFlagSta
         return total;
     }
     let effects = call_effects(module, &candidates, summaries);
+    let nonnull = crate::sign_fold::nonnull_callees(module);
     for func in module.functions_to_optimize() {
         if !candidates.contains(&func.id) {
             continue;
         }
-        let s = run(func, flag, &effects);
+        let s = run(func, flag, &effects, &nonnull);
         total.folded += s.folded;
         total.threaded += s.threaded;
     }
@@ -417,6 +419,8 @@ struct Flow<'a> {
     loads: HashSet<HirId>,
     /// Compare result -> (the flag load it tests, whether it is `eq`).
     compares: HashMap<HirId, (HirId, bool)>,
+    /// Functions whose calls never return null.
+    nonnull_returns: &'a HashSet<HirId>,
 }
 
 /// The dataflow's answer.
@@ -428,7 +432,12 @@ struct Solution {
 }
 
 impl Flow<'_> {
-    fn new<'a>(f: &HirFunction, flag: HirId, effects: &'a HashMap<HirId, Effect>) -> Flow<'a> {
+    fn new<'a>(
+        f: &HirFunction,
+        flag: HirId,
+        effects: &'a HashMap<HirId, Effect>,
+        nonnull_returns: &'a HashSet<HirId>,
+    ) -> Flow<'a> {
         let ptrs = flag_pointers(f, flag);
         let mut loads = HashSet::default();
         for b in f.blocks.values() {
@@ -467,7 +476,33 @@ impl Flow<'_> {
             effects,
             loads,
             compares,
+            nonnull_returns,
         }
+    }
+
+    /// The flag stores, as (block, index), of a value that is never null
+    /// (`sign_fold::non_zero`), which therefore set the flag.
+    fn nonnull_stores(&self, f: &HirFunction) -> HashSet<(HirId, usize)> {
+        let mut stores = Vec::new();
+        for (&b, block) in &f.blocks {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if let HirInstruction::Store { ptr, value, .. } = inst
+                    && self.ptrs.contains(ptr)
+                    && !is_null(f, *value)
+                {
+                    stores.push((b, i, *value));
+                }
+            }
+        }
+        if stores.is_empty() {
+            return HashSet::default();
+        }
+        let nonzero = crate::sign_fold::non_zero(f, self.nonnull_returns);
+        stores
+            .into_iter()
+            .filter(|(_, _, value)| nonzero.contains(value))
+            .map(|(b, i, _)| (b, i))
+            .collect()
     }
 
     /// Run `block` from `state`: the state at its end, and the flag load
@@ -477,10 +512,11 @@ impl Flow<'_> {
         f: &HirFunction,
         block: HirId,
         mut state: State,
+        nonnull: &HashSet<(HirId, usize)>,
         mut at_load: Option<&mut HashMap<HirId, State>>,
     ) -> (State, Option<HirId>) {
         let mut last_load = None;
-        for inst in &f.blocks[&block].instructions {
+        for (i, inst) in f.blocks[&block].instructions.iter().enumerate() {
             match inst {
                 HirInstruction::Load { result, .. } if self.loads.contains(result) => {
                     if let Some(at) = at_load.as_deref_mut() {
@@ -493,6 +529,8 @@ impl Flow<'_> {
                         state
                     } else if is_null(f, *value) {
                         State::Clear
+                    } else if nonnull.contains(&(block, i)) {
+                        State::Set
                     } else {
                         State::Unknown
                     };
@@ -511,6 +549,7 @@ impl Flow<'_> {
     }
 
     fn solve(&self, f: &HirFunction) -> Solution {
+        let nonnull = self.nonnull_stores(f);
         let mut entry: HashMap<HirId, State> = HashMap::default();
         let mut edges: HashMap<(HirId, HirId), State> = HashMap::default();
         let rpo = &reverse_postorder(f);
@@ -527,7 +566,7 @@ impl Flow<'_> {
                     s = s.join(edges.get(&(*p, b)).copied().unwrap_or(State::Unreached));
                 }
                 entry.insert(b, s);
-                let (out, last_load) = self.transfer(f, b, s, None);
+                let (out, last_load) = self.transfer(f, b, s, &nonnull, None);
                 for (to, state) in self.out_edges(f, b, out, last_load) {
                     let old = edges.get(&(b, to)).copied().unwrap_or(State::Unreached);
                     let new = old.join(state);
@@ -540,7 +579,7 @@ impl Flow<'_> {
         }
         let mut at_load = HashMap::default();
         for &b in rpo {
-            self.transfer(f, b, entry[&b], Some(&mut at_load));
+            self.transfer(f, b, entry[&b], &nonnull, Some(&mut at_load));
         }
         Solution { edges, at_load }
     }
@@ -582,7 +621,12 @@ impl Flow<'_> {
     }
 }
 
-fn run(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) -> ErrorFlagStats {
+fn run(
+    func: &mut HirFunction,
+    flag: HirId,
+    effects: &HashMap<HirId, Effect>,
+    nonnull_returns: &HashSet<HirId>,
+) -> ErrorFlagStats {
     let mut stats = ErrorFlagStats::default();
     // Entered with the flag set on purpose: nothing holds at its entry.
     if func.is_external || func.attributes.queries_error_flag {
@@ -592,7 +636,7 @@ fn run(func: &mut HirFunction, flag: HirId, effects: &HashMap<HirId, Effect>) ->
     if ptrs.is_empty() || address_escapes(func, &ptrs) {
         return stats;
     }
-    let flow = Flow::new(func, flag, effects);
+    let flow = Flow::new(func, flag, effects, nonnull_returns);
     if flow.compares.is_empty() {
         return stats;
     }
@@ -1662,6 +1706,192 @@ mod tests {
         assert_eq!(func.blocks[&check].phis[0].incoming, vec![(two, other)]);
         assert_eq!(branch_constant(func, check, raise), Some(false));
         assert!(dominance_holds(func));
+    }
+
+    /// `e = malloc` at the end of `block`; returns `e`.
+    fn allocation(b: &mut Body, block: HirId) -> HirId {
+        let size = b.int(16);
+        let e = b.f.create_value(flag_ty(), HirValueKind::Instruction);
+        b.push(
+            block,
+            HirInstruction::Call {
+                result: Some(e),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        e
+    }
+
+    /// Two raise sites merge what they store into one store of the flag,
+    /// then reach the check beside a path that does not raise: the first
+    /// allocates, the second allocates when `second_allocates` and loads
+    /// a pointer it knows nothing of otherwise. Returns the module, the
+    /// merge block and the raising arm.
+    fn merged_raise(second_allocates: bool) -> (Module, HirId, HirId, HirId) {
+        let mut m = Module::new(true);
+        let mut b = Body::new(&m);
+        let cond = b.param(0, HirType::Bool);
+        let entry = b.block();
+        let pre = b.block();
+        let mk1 = b.block();
+        let mk2 = b.block();
+        let merge = b.block();
+        let other = b.block();
+        let check = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.term(
+            entry,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: pre,
+                false_target: other,
+            },
+        );
+        b.term(
+            pre,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: mk1,
+                false_target: mk2,
+            },
+        );
+        let e1 = allocation(&mut b, mk1);
+        b.term(mk1, HirTerminator::Branch { target: merge });
+        let e2 = if second_allocates {
+            allocation(&mut b, mk2)
+        } else {
+            let slot = b.param(1, HirType::Ptr(std::sync::Arc::new(flag_ty())));
+            let loaded = b.f.create_value(flag_ty(), HirValueKind::Instruction);
+            b.push(
+                mk2,
+                HirInstruction::Load {
+                    result: loaded,
+                    ty: flag_ty(),
+                    ptr: slot,
+                    align: 8,
+                    volatile: false,
+                },
+            );
+            loaded
+        };
+        b.term(mk2, HirTerminator::Branch { target: merge });
+        let e = b.f.create_value(flag_ty(), HirValueKind::Instruction);
+        b.f.blocks[&merge].phis.push(HirPhi {
+            result: e,
+            ty: flag_ty(),
+            incoming: vec![(e1, mk1), (e2, mk2)],
+        });
+        let flag_ptr = b.flag_ptr;
+        b.push(
+            merge,
+            HirInstruction::Store {
+                value: e,
+                ptr: flag_ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        b.term(merge, HirTerminator::Branch { target: check });
+        b.term(other, HirTerminator::Branch { target: check });
+        b.check(check, raise, ok);
+        b.ret(raise, 1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        (m, f, merge, raise)
+    }
+
+    /// Storing a fresh allocation sets the flag, so the store's edge
+    /// skips the check.
+    #[test]
+    fn storing_a_built_exception_threads_to_the_raising_arm() {
+        let (mut m, f, merge, raise) = merged_raise(true);
+        let stats = run_all(&mut m.module);
+        assert_eq!(stats.threaded, 1);
+        let func = body(&m, f);
+        assert!(
+            matches!(func.blocks[&merge].terminator, HirTerminator::Branch { target } if target == raise)
+        );
+        assert!(dominance_holds(func));
+    }
+
+    /// A pointer read from memory may be null, which would leave the
+    /// flag clear: the store's edge keeps its check.
+    #[test]
+    fn storing_a_loaded_pointer_keeps_the_check() {
+        let (mut m, _, _, _) = merged_raise(false);
+        let stats = run_all(&mut m.module);
+        assert_eq!(stats.threaded, 0);
+    }
+
+    /// A box the runtime made is never null: storing it sets the flag.
+    #[test]
+    fn storing_a_runtime_box_threads_to_the_raising_arm() {
+        let mut m = Module::new(true);
+        let maker = m.callee(
+            "box_ptr",
+            FunctionAttributes {
+                nothrow: true,
+                ..Default::default()
+            },
+        );
+        let maker_fn = m.module.functions.get_mut(&maker).unwrap();
+        maker_fn.link_name = Some("zyntax_box_ptr".to_string());
+        maker_fn.signature.returns = vec![flag_ty()];
+        let mut b = Body::new(&m);
+        let cond = b.param(0, HirType::Bool);
+        let entry = b.block();
+        let a = b.block();
+        let other = b.block();
+        let check = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.term(
+            entry,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: a,
+                false_target: other,
+            },
+        );
+        let boxed = b.f.create_value(flag_ty(), HirValueKind::Instruction);
+        b.push(
+            a,
+            HirInstruction::Call {
+                result: Some(boxed),
+                callee: HirCallable::Function(maker),
+                args: vec![],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        let flag_ptr = b.flag_ptr;
+        b.push(
+            a,
+            HirInstruction::Store {
+                value: boxed,
+                ptr: flag_ptr,
+                align: 8,
+                volatile: false,
+            },
+        );
+        b.term(a, HirTerminator::Branch { target: check });
+        b.term(other, HirTerminator::Branch { target: check });
+        b.check(check, raise, ok);
+        b.ret(raise, 1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        let stats = run_all(&mut m.module);
+        assert_eq!(stats.threaded, 1);
+        let func = body(&m, f);
+        assert!(
+            matches!(func.blocks[&a].terminator, HirTerminator::Branch { target } if target == raise)
+        );
     }
 
     /// A module that names no error flag is left alone.

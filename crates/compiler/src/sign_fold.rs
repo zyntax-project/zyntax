@@ -17,7 +17,8 @@
 //! if what comes round the back edge is.
 
 use crate::hir::{
-    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirValueKind,
+    BinaryOp, HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator,
+    HirValueKind,
 };
 use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 
@@ -31,21 +32,93 @@ pub struct SignFoldStats {
 
 pub fn run_module(module: &mut HirModule) -> SignFoldStats {
     let mut total = SignFoldStats::default();
+    let nonnull = nonnull_callees(module);
     for func in module.functions_to_optimize() {
         if func.is_external {
             continue;
         }
-        let s = run_function(func);
+        let s = run_function(func, &nonnull);
         total.compares += s.compares;
         total.selects += s.selects;
     }
     total
 }
 
-fn run_function(func: &mut HirFunction) -> SignFoldStats {
+/// The functions of `module` whose calls never return zero or null.
+pub(crate) fn nonnull_callees(module: &HirModule) -> HashSet<HirId> {
+    module
+        .functions
+        .iter()
+        .filter(|(_, f)| returns_nonnull(f))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+fn returns_nonnull(f: &HirFunction) -> bool {
+    f.attributes.returns_nonnull || f.link_name.as_deref().is_some_and(crate::boxes::is_maker)
+}
+
+/// Mark the functions of `module` whose every return is a value
+/// [`non_zero`] proves non-zero as `returns_nonnull`, for callers to
+/// read, through a shell too. Grows from the functions already known,
+/// so a cycle of such calls proves nothing.
+pub fn record_nonnull_returns(module: &mut HirModule) {
+    let candidates: Vec<HirId> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| {
+            !f.is_external
+                && !f.attributes.optimized
+                && !f.blocks.is_empty()
+                && !returns_nonnull(f)
+                && matches!(
+                    f.signature.returns.as_slice(),
+                    [crate::hir::HirType::Ptr(_)]
+                )
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let mut known = nonnull_callees(module);
+    for _ in 0..NONNULL_RETURN_ROUNDS {
+        let found: Vec<HirId> = candidates
+            .iter()
+            .copied()
+            .filter(|id| !known.contains(id))
+            .filter(|id| {
+                let f = &module.functions[id];
+                let nonzero = non_zero(f, &known);
+                let mut returns = f.blocks.values().filter_map(|b| match &b.terminator {
+                    HirTerminator::Return { values } => Some(values),
+                    _ => None,
+                });
+                let mut any = false;
+                let all = returns.all(|values| {
+                    any = true;
+                    matches!(values.as_slice(), [v] if nonzero.contains(v))
+                });
+                any && all
+            })
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        known.extend(found);
+    }
+    for id in known {
+        if let Some(f) = module.functions.get_mut(&id) {
+            f.attributes.returns_nonnull = true;
+        }
+    }
+}
+
+/// Rounds of [`record_nonnull_returns`]: each lets a body count calls to
+/// those the round before it found.
+const NONNULL_RETURN_ROUNDS: usize = 3;
+
+fn run_function(func: &mut HirFunction, nonnull: &HashSet<HirId>) -> SignFoldStats {
     let mut stats = SignFoldStats::default();
     let nonneg = non_negative(func);
-    let nonzero = non_zero(func);
+    let nonzero = non_zero(func, nonnull);
     if nonneg.is_empty() && nonzero.is_empty() {
         return stats;
     }
@@ -127,11 +200,12 @@ fn run_function(func: &mut HirFunction) -> SignFoldStats {
 }
 
 /// Values proven unequal to zero. Allocation results stay non-zero in
-/// every successful execution; pointer/integer representation casts
+/// every successful execution, as do the results of calls to `nonnull`
+/// functions (see [`returns_nonnull`]); pointer/integer representation casts
 /// preserve that fact. A select or phi is non-zero only when every arm
 /// is, which carries the fact around loops without guessing about a
 /// parameter or load.
-fn non_zero(func: &HirFunction) -> HashSet<HirId> {
+pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<HirId> {
     use crate::hir::{CastOp, Intrinsic};
 
     let mut set: HashSet<HirId> = HashSet::default();
@@ -180,6 +254,10 @@ fn non_zero(func: &HirFunction) -> HashSet<HirId> {
                             callee: crate::hir::HirCallable::Intrinsic(Intrinsic::Malloc),
                             ..
                         } => true,
+                        HirInstruction::Call {
+                            callee: crate::hir::HirCallable::Function(callee),
+                            ..
+                        } => nonnull.contains(callee),
                         HirInstruction::Cast {
                             op: CastOp::PtrToInt | CastOp::IntToPtr | CastOp::Bitcast,
                             operand,
@@ -517,7 +595,7 @@ mod tests {
         func.blocks.insert(exit, xb);
         func.entry_block = entry;
 
-        let stats = run_function(&mut func);
+        let stats = run_function(&mut func, &HashSet::default());
         assert_eq!(stats.compares, 1, "only k's compare is decided");
         assert_eq!(stats.selects, 1, "only k's select is taken");
         let insts = &func.blocks[&header].instructions;
@@ -613,7 +691,7 @@ mod tests {
         func.blocks.insert(entry, block);
         func.entry_block = entry;
 
-        let stats = run_function(&mut func);
+        let stats = run_function(&mut func, &HashSet::default());
         assert_eq!(stats.compares, 1);
         assert!(matches!(
             func.values[&nonnull].kind,
@@ -625,5 +703,89 @@ mod tests {
                 .iter()
                 .any(|instruction| instruction.result_id() == Some(nonnull))
         );
+    }
+    /// A constructor that returns its allocation never returns null, so
+    /// its caller's null check on the result folds.
+    #[test]
+    fn a_constructors_result_is_nonzero_in_its_caller() {
+        let ptr = || HirType::Ptr(std::sync::Arc::new(HirType::U8));
+        let sig = |returns: Vec<HirType>| HirFunctionSignature {
+            params: vec![],
+            returns,
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut ctor = HirFunction::new(InternedString::new_global("new"), sig(vec![ptr()]));
+        let size = value(
+            &mut ctor.values,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(16)),
+        );
+        let made = value(&mut ctor.values, ptr(), HirValueKind::Instruction);
+        let entry = ctor.entry_block;
+        let block = ctor.blocks.get_mut(&entry).unwrap();
+        block.instructions = vec![HirInstruction::Call {
+            result: Some(made),
+            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+            args: vec![size],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        }];
+        block.terminator = HirTerminator::Return { values: vec![made] };
+        let ctor_id = ctor.id;
+
+        let mut caller =
+            HirFunction::new(InternedString::new_global("f"), sig(vec![HirType::Bool]));
+        let zero = value(
+            &mut caller.values,
+            HirType::I64,
+            HirValueKind::Constant(HirConstant::I64(0)),
+        );
+        let object = value(&mut caller.values, ptr(), HirValueKind::Instruction);
+        let address = value(&mut caller.values, HirType::I64, HirValueKind::Instruction);
+        let is_null = value(&mut caller.values, HirType::Bool, HirValueKind::Instruction);
+        let entry = caller.entry_block;
+        let block = caller.blocks.get_mut(&entry).unwrap();
+        block.instructions = vec![
+            HirInstruction::Call {
+                result: Some(object),
+                callee: HirCallable::Function(ctor_id),
+                args: vec![],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+            HirInstruction::Cast {
+                result: address,
+                ty: HirType::I64,
+                op: CastOp::PtrToInt,
+                operand: object,
+            },
+            bin(BinaryOp::Eq, is_null, HirType::Bool, address, zero),
+        ];
+        block.terminator = HirTerminator::Return {
+            values: vec![is_null],
+        };
+        let caller_id = caller.id;
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(ctor_id, ctor);
+        module.functions.insert(caller_id, caller);
+        record_nonnull_returns(&mut module);
+        assert!(module.functions[&ctor_id].attributes.returns_nonnull);
+        assert!(!module.functions[&caller_id].attributes.returns_nonnull);
+        let stats = run_module(&mut module);
+        assert_eq!(stats.compares, 1);
+        assert!(matches!(
+            module.functions[&caller_id].values[&is_null].kind,
+            HirValueKind::Constant(HirConstant::Bool(false))
+        ));
     }
 }

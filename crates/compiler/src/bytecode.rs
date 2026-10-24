@@ -676,7 +676,7 @@ impl BytecodeHeader {
     // Moves with any change to a payload's layout, so a payload in an
     // older layout is refused with VersionMismatch and a cache loader
     // recompiles rather than misreading it.
-    const CURRENT_MAJOR: u16 = 10;
+    const CURRENT_MAJOR: u16 = 11;
     const CURRENT_MINOR: u16 = 0;
 
     /// Create a new header for the given module and format
@@ -1073,6 +1073,7 @@ mod tests {
             handlers: Default::default(),
             automatic_release: false,
             exact_struct_types: Default::default(),
+            object_struct_types: Default::default(),
         }
     }
 

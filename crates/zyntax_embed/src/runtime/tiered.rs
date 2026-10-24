@@ -1982,6 +1982,7 @@ impl TieredRuntime {
         zyntax_compiler::alloca_promote::run_module(&mut module);
         let facts = zyntax_compiler::drop_insert::facts_of(&module);
         zyntax_compiler::drop_insert::record_facts(&mut module, &facts);
+        zyntax_compiler::sign_fold::record_nonnull_returns(&mut module);
         if let Some(flag) = self
             .error_flag_global
             .and_then(|name| name.resolve_global())

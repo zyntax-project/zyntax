@@ -1604,6 +1604,7 @@ pub fn compile_to_hir(
         linked: Arc::default(),
         error_flag_global: None,
         exact_struct_types: Default::default(),
+        object_struct_types: Default::default(),
     };
 
     // Create arena for string interning (needed for async transformation)
@@ -2152,6 +2153,11 @@ fn run_interp_safe_opts_with(
     checkpoint!("purity");
     check_hir_uses(module, "purity");
 
+    // Before anything inlines a constructor: its callers' null checks
+    // on what it returns fold through the call.
+    sign_fold::record_nonnull_returns(module);
+    checkpoint!("nonnull returns");
+
     // What each call does to the error flag, read from the bodies once
     // per module rather than per round.
     let local_summaries;
@@ -2252,9 +2258,10 @@ fn run_interp_safe_opts_with(
         // After inline, which puts a callee's raising arm and the
         // caller's check in one body; before licm, so a loop left with no
         // flag load has nothing of it to hoist.
-        // Its checks come from inlining: a round that inlined nothing
-        // has none new for it.
-        let ef = if round == 0 || il.inlined > 0 {
+        // Its checks come from inlining, and a raise's store becomes
+        // decidable once folding drops a null arm: a round that did
+        // neither has nothing new for it.
+        let ef = if round == 0 || il.inlined > 0 || cf.folded > 0 || sf.compares > 0 {
             error_flag::run_module(module, ef_summaries)
         } else {
             error_flag::ErrorFlagStats::default()

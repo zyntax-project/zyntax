@@ -198,7 +198,8 @@ pub(crate) fn lower_typed_program_in_place(
     crate::import_chain::resolve_unresolved_types(program, &type_registry);
     program.type_registry = type_registry;
     lap("externs+resolve", &mut at);
-    let exact_struct_types = exact_struct_types(&program.type_registry);
+    let exact_struct_types = marked_struct_types(&program.type_registry, EXACT_STRUCT_KEY);
+    let object_struct_types = marked_struct_types(&program.type_registry, OBJECT_STRUCT_KEY);
 
     zyntax_compiler::register_impl_blocks(program)
         .map_err(|e| RuntimeError::Execution(format!("Failed to register impl blocks: {:?}", e)))?;
@@ -236,6 +237,7 @@ pub(crate) fn lower_typed_program_in_place(
         linked: inputs.linked,
         error_flag_global: inputs.error_flag_global,
         exact_struct_types,
+        object_struct_types,
         ..LoweringConfig::default()
     };
 
@@ -282,11 +284,17 @@ pub(crate) fn lower_typed_program_in_place(
 /// exact: every pointer typed as one points at an object of that type.
 pub const EXACT_STRUCT_KEY: &str = "exact";
 
-/// The struct types `registry` marks exact under [`EXACT_STRUCT_KEY`].
-fn exact_struct_types(
+/// The metadata key a frontend sets on a struct type whose every pointer
+/// points at an object allocated on its own, never into a list's
+/// element storage.
+pub const OBJECT_STRUCT_KEY: &str = "object";
+
+/// The struct types `registry` marks under `key`.
+fn marked_struct_types(
     registry: &zyntax_typed_ast::TypeRegistry,
+    key: &str,
 ) -> std::collections::HashSet<zyntax_typed_ast::TypeId> {
-    let key = InternedString::new_global(EXACT_STRUCT_KEY);
+    let key = InternedString::new_global(key);
     registry
         .get_all_types()
         .filter(|def| def.metadata.custom.contains_key(&key))

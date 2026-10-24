@@ -921,6 +921,7 @@ pub fn optimize_snapshot_hir(
     zyntax_compiler::const_boxes::run_library(module, name);
     let facts = zyntax_compiler::drop_insert::facts_of(module);
     zyntax_compiler::drop_insert::record_facts(module, &facts);
+    zyntax_compiler::sign_fold::record_nonnull_returns(module);
     if let Some(flag) = error_flag_global {
         zyntax_compiler::error_flag::record_keeps(module, flag);
     }

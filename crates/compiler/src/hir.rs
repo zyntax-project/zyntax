@@ -402,6 +402,11 @@ pub struct HirModule {
     /// `LoweringConfig::exact_struct_types`.
     #[serde(default)]
     pub exact_struct_types: HashSet<TypeId>,
+    /// Struct types whose every `*S` points at an object allocated on its
+    /// own, never into a list's element storage. Filled from
+    /// `LoweringConfig::object_struct_types`.
+    #[serde(default)]
+    pub object_struct_types: HashSet<TypeId>,
 }
 
 /// HIR function with CFG and SSA form
@@ -2404,6 +2409,11 @@ pub struct FunctionAttributes {
     /// module holding only the function's shell to read in its place.
     #[serde(default)]
     pub keeps_error_flag: bool,
+    /// Every return hands back a value that is never zero or null: found
+    /// of the body (`sign_fold::record_nonnull_returns`) or known of a
+    /// runtime function.
+    #[serde(default)]
+    pub returns_nonnull: bool,
     /// On a signature shell standing for a body kept elsewhere, what
     /// that body refers to.
     #[serde(default)]
@@ -2822,6 +2832,7 @@ impl HirModule {
             handlers: IdMap::default(),
             automatic_release: false,
             exact_struct_types: Default::default(),
+            object_struct_types: Default::default(),
         }
     }
 
@@ -2867,6 +2878,7 @@ impl HirModule {
             handlers,
             automatic_release,
             exact_struct_types,
+            object_struct_types,
         } = self;
         HirModule {
             id: *id,
@@ -2883,6 +2895,7 @@ impl HirModule {
             handlers: handlers.clone(),
             automatic_release: *automatic_release,
             exact_struct_types: exact_struct_types.clone(),
+            object_struct_types: object_struct_types.clone(),
         }
     }
 }

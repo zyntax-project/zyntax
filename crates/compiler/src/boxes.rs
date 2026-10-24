@@ -92,6 +92,12 @@ fn make_of(symbol: &str) -> Option<Make> {
     })
 }
 
+/// Whether `symbol` is a runtime call that makes a box, which it never
+/// returns null.
+pub fn is_maker(symbol: &str) -> bool {
+    make_of(symbol).is_some()
+}
+
 /// The release of a box.
 const FREE: &str = "zyntax_box_free";
 
