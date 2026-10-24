@@ -194,6 +194,7 @@ pub(super) struct Class<'ast, 'program> {
     pub base: Option<InternedString>,
     pub constructor_access: Access,
     pub is_abstract: bool,
+    pub ambient: bool,
     /// The hidden class field's value, for classes in a hierarchy.
     pub tag: Option<f64>,
     /// The initializer's key and native component, for classes others extend.
@@ -253,9 +254,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if class.type_parameters.is_some() {
             return self.unsupported("generic classes", class.span);
         }
-        if class.declare || self.declaration_file || !class.decorators.is_empty() {
+        if !class.decorators.is_empty() {
             return self.unsupported("abstract, ambient or decorated classes", class.span);
         }
+        // An ambient class is a type whose values and bodies come from outside the program.
+        let ambient = class.declare || self.declaration_file;
         let base = match &class.heritage {
             Some(heritage) => Some(self.class_base(class, heritage)?),
             None => None,
@@ -586,7 +589,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                     m.span,
                                 );
                             }
-                            if getter && !returns_value(&m.value) {
+                            if getter && !ambient && !returns_value(&m.value) {
                                 return self.error(
                                     ErrorKind::Type,
                                     "a 'get' accessor must return a value",
@@ -769,6 +772,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 base,
                 constructor_access,
                 is_abstract: class.r#abstract,
+                ambient,
                 tag,
                 init,
                 static_fields,
@@ -777,7 +781,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 span: class.span,
             },
         );
-        self.declare_static_globals(view, source);
+        if !ambient {
+            self.declare_static_globals(view, source);
+        }
         Ok(())
     }
 
@@ -816,6 +822,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     format!("class `{}` used before its declaration", base.name),
                     at,
                 );
+            }
+            if self.classes[view].ambient {
+                return self.unsupported("extending ambient classes", at);
             }
             if self.classes[view].constructor_access == Access::Private {
                 return self.error(
@@ -1231,6 +1240,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn lower_classes(&mut self) -> Result<()> {
         for view in self.class_order.clone() {
             let class = &self.classes[&view];
+            if class.ambient {
+                continue;
+            }
             let constructor = class.constructor;
             let key = class.constructor_key;
             let bodies = class.bodies.clone();
@@ -1915,9 +1927,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
             self.check_member_access(owner, access, name, at)?;
             let sig = self.signatures[&key].clone();
-            return self
-                .call_with_signature(sig, &c.arguments, c.type_arguments.as_deref(), None, c.span)
-                .map(Some);
+            let call = self.call_with_signature(
+                sig,
+                &c.arguments,
+                c.type_arguments.as_deref(),
+                None,
+                c.span,
+            )?;
+            if self.classes[&owner].ambient {
+                return self.unsupported("calls of ambient class methods", at);
+            }
+            return Ok(Some(call));
         }
         if let js::Expression::Super(s) = object {
             return self.super_method_call(c, name, s.span).map(Some);
@@ -1944,6 +1964,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
         self.check_member_access(owner, access, name, at)?;
         let receiver = self.expr(object)?;
+        if self.classes[&owner].ambient {
+            return self.unsupported("calls of ambient class methods", at);
+        }
         let call = self.member_call(key, owner, receiver, c)?;
         let call = self.dispatch(view, name, key, call, c.span)?;
         // A method whose result is inferred from `return this` has TypeScript's polymorphic
@@ -1983,6 +2006,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let (key, access, owner) = (getter.key, getter.access, getter.owner.unwrap_or(view));
         self.check_member_access(owner, access, name, at)?;
+        if self.classes[&owner].ambient {
+            return self.unsupported("accessors of ambient classes", at);
+        }
         let receiver = self.upcast(object, owner, at);
         let sig = &self.signatures[&key];
         let stripped = Arc::new(Signature {
@@ -2025,6 +2051,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let (key, access, owner) = (setter.key, setter.access, setter.owner.unwrap_or(view));
         self.check_member_access(owner, access, name, at)?;
+        if self.classes[&owner].ambient {
+            return self.unsupported("accessors of ambient classes", at);
+        }
         let object = self.expr(receiver)?;
         let receiver = self.upcast(object, owner, at);
         let sig = self.signatures[&key].clone();
@@ -2394,6 +2423,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 "cannot create an instance of an abstract class",
                 n.span,
             );
+        }
+        if self.classes[&view].ambient {
+            return self.unsupported("constructing ambient classes", n.span);
         }
         let allowed = match self.classes[&view].constructor_access {
             Access::Public => true,

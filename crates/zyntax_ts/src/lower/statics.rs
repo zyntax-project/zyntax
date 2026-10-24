@@ -283,6 +283,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return Ok(None);
         };
         self.check_member_access(field.owner.unwrap_or(view), field.access, name, at)?;
+        if self.classes[&field.owner.unwrap_or(view)].ambient {
+            return self.unsupported("values of ambient classes", at);
+        }
         if let Some((class, pending)) = &self.static_pending
             && *class == view
             && field.owner.is_none()
@@ -412,6 +415,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let Some(view) = self.class_names.get(&self.name(id.name.as_str())).copied() else {
             return Ok(vec![]);
         };
+        if self.classes[&view].ambient {
+            return Ok(vec![]);
+        }
         self.evaluated_classes.insert(view);
         let elements = self.classes[&view].static_elements.clone();
         // Static code reads only the fields declared before it.

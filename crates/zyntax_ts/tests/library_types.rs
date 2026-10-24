@@ -76,3 +76,47 @@ fn ambient_functions_are_typed_and_calls_are_gaps() {
         assert_eq!(error.kind, kind, "{source}: {error}");
     }
 }
+
+#[test]
+fn ambient_classes_are_types_without_values() {
+    let kind = |source: &str| {
+        zyntax_ts::parse_program(source, "ambient.ts", Default::default())
+            .map(|_| ())
+            .map_err(|error| error.kind)
+    };
+    use zyntax_ts::ErrorKind::{Type, Unsupported};
+    assert_eq!(
+        kind(
+            "declare class C { x: number; constructor(n: number); m(): number; }\nfunction f(c: C): number { return c.x; }"
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        kind("declare class C {}\nconst c = new C();"),
+        Err(Unsupported)
+    );
+    assert_eq!(
+        kind("declare class C { m(): number; }\nfunction f(c: C): number { return c.m(); }"),
+        Err(Unsupported)
+    );
+    assert_eq!(kind("declare class C { m(); }"), Err(Type));
+    assert_eq!(
+        kind("declare class B {}\nclass D extends B {}"),
+        Err(Unsupported)
+    );
+}
+
+#[test]
+fn class_objects_as_values_are_gaps() {
+    for source in [
+        "class C {}\nconst x = C;",
+        "class C {}\nconst c = new C();\nconsole.log(c instanceof C);",
+    ] {
+        let error = zyntax_ts::parse_program(source, "classes.ts", Default::default()).unwrap_err();
+        assert_eq!(
+            error.kind,
+            zyntax_ts::ErrorKind::Unsupported,
+            "{source}: {error}"
+        );
+    }
+}

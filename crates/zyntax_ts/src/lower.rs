@@ -2230,14 +2230,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     ) -> Result<()> {
         // A `declare function` is typed like any other; its value comes from outside.
         let ambient = f.declare && role == FunctionRole::Plain;
-        let bodiless = ambient || self.abstract_methods.contains(&key);
+        let bodiless = ambient
+            || self.abstract_methods.contains(&key)
+            || role
+                .body_class()
+                .is_some_and(|view| self.classes.get(&view).is_some_and(|class| class.ambient));
         if f.r#async || f.generator || f.this_param.is_some() || (f.body.is_none() && !bodiless) {
             return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
         if self.signatures.contains_key(&key) {
             return self.unsupported("function overloads", f.span);
         }
-        if bodiless && f.return_type.is_none() {
+        // Constructors and setters declare no result.
+        let declares_result = !matches!(
+            role,
+            FunctionRole::Constructor(_) | FunctionRole::Initializer(_)
+        ) && !component.contains(".set ");
+        if bodiless && declares_result && f.return_type.is_none() {
             return self.error(
                 ErrorKind::Type,
                 "a declaration without a body or return type annotation implicitly has an 'any' return type",
@@ -2931,6 +2940,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return Error::new(
                         ErrorKind::Unsupported,
                         format!("library value `{name}` is not implemented yet"),
+                        at,
+                    );
+                }
+                if self.class_names.contains_key(&key) {
+                    return Error::new(
+                        ErrorKind::Unsupported,
+                        "class objects as values is not implemented yet",
                         at,
                     );
                 }
