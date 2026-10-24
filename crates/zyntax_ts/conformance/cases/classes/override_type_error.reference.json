@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2416,
+      "start": 104,
+      "length": 5,
+      "file": "override_type_error.ts",
+      "message": "Property 'scale' in type 'Label' is not assignable to the same property in base type 'Shape'.\n  Type '(factor: string) => number' is not assignable to type '(factor: number) => number'.\n    Types of parameters 'factor' and 'factor' are incompatible.\n      Type 'number' is not assignable to type 'string'."
+    }
+  ],
+  "source_sha256": "49d0f21c90612586a6f892f3a42a2c4d612bccfc5f9af5857e93b7b90f8604ed",
+  "options": {}
+}

@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2341,
+      "start": 159,
+      "length": 7,
+      "file": "inherited_private_error.ts",
+      "message": "Property 'balance' is private and only accessible within class 'Account'."
+    }
+  ],
+  "source_sha256": "6be99807d43ef633a4ef813bb7c66d30ac656a1cb592b503114546fd27f4f368",
+  "options": {}
+}

@@ -6,7 +6,7 @@
 use super::*;
 
 /// How a signature's callers may supply fewer or more arguments than it has parameters.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Arity {
     /// Arguments every call supplies; later fixed parameters may be omitted.
     pub required: usize,

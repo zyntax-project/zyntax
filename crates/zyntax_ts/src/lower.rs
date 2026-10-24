@@ -1320,7 +1320,15 @@ struct Lowerer<'ast, 'program> {
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
     current_class: Option<InternedString>,
+    /// The class whose body holds the code being lowered, instance or static.
+    class_body: Option<InternedString>,
     in_constructor: bool,
+    /// Lowering a derived constructor's statements before its `super(...)` call.
+    before_super: bool,
+    /// Classes this module's class declarations extend, by source name.
+    extended_classes: FxHashSet<InternedString>,
+    /// Top-level functions, variables and imports, by source name.
+    top_level_values: FxHashSet<InternedString>,
     hoist: FxHashSet<oxc_semantic::SymbolId>,
     vars: FunctionVars,
     /// Hoisted bindings whose reads need a proven assignment on every path.
@@ -1390,7 +1398,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             class_names: FxHashMap::default(),
             class_order: vec![],
             current_class: None,
+            class_body: None,
             in_constructor: false,
+            before_super: false,
+            extended_classes: FxHashSet::default(),
+            top_level_values: FxHashSet::default(),
             hoist: FxHashSet::default(),
             vars: FunctionVars::default(),
             unassigned: FxHashMap::default(),
@@ -1480,6 +1492,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.collect_constants(program);
         self.declare_enums(program)?;
         self.inline_type_literals(program);
+        self.class_heritage(program);
         // Declare types before signatures; resolve forward aliases to a fixed point.
         let mut pending: Vec<_> = program
             .body
@@ -2164,7 +2177,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             self.active_type_rules = self.type_parameter_rules(parameters)?;
         }
         let mut params = vec![];
-        if let FunctionRole::Method(view) = role {
+        if let Some(view) = role.takes_this() {
             params.push(self.this_parameter(view));
         }
         let mut names = FxHashSet::default();
@@ -2228,6 +2241,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             (_, FunctionRole::Constructor(view)) => {
                 (Some(self.classes[&view].ty.clone()), Some(view))
             }
+            (_, FunctionRole::Initializer(_)) => (Some(unit()), None),
             (Some(ret), _) => {
                 let (ty, view) = self.ty(&ret.type_annotation)?;
                 (Some(ty), view)
@@ -2313,8 +2327,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         );
         let mut params = vec![];
         let mut prologue = vec![];
-        let has_this = matches!(role, FunctionRole::Method(_));
-        if let FunctionRole::Method(view) = role {
+        let has_this = role.takes_this().is_some();
+        if let Some(view) = role.takes_this() {
             params.push(self.bind_this(view, f.span));
         }
         let symbols = f
@@ -2410,24 +2424,45 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         });
         let mut statements = prologue;
         let outer_class = std::mem::replace(&mut self.current_class, role.class());
+        let outer_body = std::mem::replace(&mut self.class_body, role.body_class());
         let outer_constructor = std::mem::replace(
             &mut self.in_constructor,
-            matches!(role, FunctionRole::Constructor(_)),
+            matches!(
+                role,
+                FunctionRole::Constructor(_) | FunctionRole::Initializer(_)
+            ),
         );
         let constructed = match role {
             FunctionRole::Constructor(view) => {
                 Some(self.constructor_prologue(view, Some(f), &mut statements)?)
             }
+            FunctionRole::Initializer(view) if self.classes[&view].base.is_none() => {
+                let this = self.binding("this", f.span)?.name;
+                let initialized = self.initialize_fields(view, Some(f), this)?;
+                statements.extend(initialized);
+                None
+            }
             _ => None,
         };
-        self.reserve(&f.body.as_ref().unwrap().statements)?;
-        for s in &f.body.as_ref().unwrap().statements {
-            statements.extend(self.statement(s)?);
+        let body = &f.body.as_ref().unwrap().statements;
+        self.reserve(body)?;
+        match role {
+            FunctionRole::Constructor(view) | FunctionRole::Initializer(view)
+                if self.classes[&view].base.is_some() =>
+            {
+                self.derived_constructor_body(view, f, body, &mut statements)?;
+            }
+            _ => {
+                for s in body {
+                    statements.extend(self.statement(s)?);
+                }
+            }
         }
         if let FunctionRole::Constructor(view) = role {
             self.check_field_initialization(view, f)?;
         }
         self.current_class = outer_class;
+        self.class_body = outer_body;
         self.in_constructor = outer_constructor;
         statements.splice(0..0, std::mem::take(&mut self.vars.hoisted));
         self.vars = outer_vars;
@@ -2861,6 +2896,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             if self.record_subtype(actual, expected) {
                 return Ok(());
+            }
+            // A record lacks the class field every instance of a hierarchy carries.
+            if matches!(actual, Type::Named { .. })
+                && self
+                    .classes
+                    .values()
+                    .any(|class| class.tag.is_some() && class.ty == *expected)
+            {
+                return self.unsupported("structural values of classes with subclasses", at);
             }
             self.error(
                 ErrorKind::Type,
@@ -3444,9 +3488,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 description
             }
             Type::Named { id, .. } => {
+                if let Some(view) = self.class_by_layout(ty) {
+                    let component = &self.classes[&view].component;
+                    return component.trim_end_matches("\0new").to_owned();
+                }
                 let mut description = String::from("{ ");
                 if let Some(definition) = self.registry.get_type_by_id(*id) {
-                    for (index, field) in definition.fields.iter().enumerate() {
+                    let class_tag = self.name(classes::CLASS_TAG);
+                    let fields = definition.fields.iter().filter(|f| f.name != class_tag);
+                    for (index, field) in fields.enumerate() {
                         if index != 0 {
                             description.push_str("; ");
                         }
@@ -4813,6 +4863,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     at,
                 )
             }
+            js::Expression::StaticMemberExpression(m)
+                if matches!(m.object, js::Expression::Super(_)) =>
+            {
+                return self.super_member(m);
+            }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
                 if let Some(member) = self.enum_member(e) {
                     return member;
@@ -5284,6 +5339,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn call_expr(&mut self, c: &js::CallExpression<'ast>) -> Result<Expr> {
         let at = c.span;
+        if let js::Expression::Super(s) = &c.callee {
+            return self.misplaced_super_call(s.span, at);
+        }
         if let js::Expression::StaticMemberExpression(m) = &c.callee {
             if let Some(filled) = self.array_fill(c, m, None)? {
                 return Ok(filled);

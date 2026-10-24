@@ -16,6 +16,7 @@ gaps against TypeScript rather than treating them as compatibility passes.
 | Generics | Inferred and explicit arguments, trailing defaults, dependent constraints, scalar-bound operations, nested calls, recursion and cached native specializations | Generic aliases/interfaces, const parameters, richer inference and layout-dependent aggregate operations |
 | Function values | Capture-free arrows, named references, contextual parameter types and higher-order scalar signatures | Captures, function object identity/properties, parameter-count adaptation and aggregate callback signatures |
 | Objects | Number, boolean and static string fields, reference identity, aliases, interfaces extending record interfaces, classes implementing them, source-order initializers, readonly views and excess-property checks | Reference-valued fields, general layout adaptation and assignments that change concrete layout |
+| Classes | Fields, constructors with parameter properties, instance and static methods, `private`/`protected` members and constructors, `implements`; single inheritance among the module's classes with `super(...)`, `super.method()` and overriding methods dispatched on the instance's class | Abstract, generic and nested classes, accessors, static fields, redeclared inherited fields, overrides with a different signature, implicit constructors that forward base parameters, mixins and extending library classes |
 | Arrays | Dense numbers, booleans, static strings, class instances and nested arrays; typed indexing, length, push, array `for…of`, and filled length constructors | Sparse extension, length mutation, other methods, optional reads and general iterator protocols |
 | Enums | Numeric, string, `const` and ambient `const` enums with constant members; member access, member and union-of-member types, assignability, literal comparisons and narrowing by equality | Reverse mapping, enum objects as values, computed or mixed members, ambient values, declaration merging, exported enums, and enums in arrays, fields, unions or function types |
 | Unions | Scalar alternatives among number, boolean and string; number/boolean with `undefined`; narrowing, equality, truthiness and formatting | Owned/reference payloads, broader nullable combinations and optional callback signatures |
@@ -52,6 +53,12 @@ length constructors support `new Array<T>(n).fill(value)` and `Array<T>(n).fill(
 reference elements share identity. Invalid lengths fail before evaluating the fill
 argument. Bare length constructors, fill ranges, destructuring, `var` loop bindings
 and asynchronous/custom iterators remain unsupported.
+
+A subclass's layout begins with its base's, so a base-typed view reads an instance in
+place. Every instance in a hierarchy carries its class in a hidden field; a call through a
+base-typed receiver runs the override of the instance's class. A derived constructor runs
+the statements before `super(...)` without `this`, then the base constructor, then its own
+parameter properties and field initializers, as JavaScript does.
 
 Local object views can expose a subset of fields without copying. Calls and
 annotated returns require matching native offsets for every exposed field.

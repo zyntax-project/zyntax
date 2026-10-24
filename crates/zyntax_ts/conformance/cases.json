@@ -2574,5 +2574,40 @@
     "id": "numeric/unary_boolean",
     "file": "cases/numeric/unary_boolean.ts",
     "mode": "run"
+  },
+  {
+    "id": "classes/inheritance",
+    "file": "cases/classes/inheritance.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/inheritance_protected",
+    "file": "cases/classes/inheritance_protected.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/this_before_super_error",
+    "file": "cases/classes/this_before_super_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/super_missing_error",
+    "file": "cases/classes/super_missing_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/override_type_error",
+    "file": "cases/classes/override_type_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/extends_before_error",
+    "file": "cases/classes/extends_before_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "classes/inherited_private_error",
+    "file": "cases/classes/inherited_private_error.ts",
+    "mode": "check"
   }
 ]

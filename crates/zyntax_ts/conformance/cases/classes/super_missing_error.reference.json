@@ -1,0 +1,23 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2377,
+      "start": 97,
+      "length": 11,
+      "file": "super_missing_error.ts",
+      "message": "Constructors for derived classes must contain a 'super' call."
+    },
+    {
+      "code": 17009,
+      "start": 129,
+      "length": 4,
+      "file": "super_missing_error.ts",
+      "message": "'super' must be called before accessing 'this' in the constructor of a derived class."
+    }
+  ],
+  "source_sha256": "0e9d3a52811051dfb258fcf36e19d0555325487f44c6b1fd9ede693fd5dd4240",
+  "options": {}
+}

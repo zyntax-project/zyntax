@@ -8,16 +8,67 @@ pub(super) enum FunctionRole {
     Plain,
     /// An instance method of the class with this view.
     Method(InternedString),
-    Static,
+    /// A static method of the class with this view.
+    Static(InternedString),
     Constructor(InternedString),
+    /// The constructor body run on an instance allocated elsewhere: by `new` of the class
+    /// itself or of a subclass.
+    Initializer(InternedString),
 }
 
 impl FunctionRole {
     pub(super) fn class(self) -> Option<InternedString> {
         match self {
-            Self::Method(view) | Self::Constructor(view) => Some(view),
+            Self::Method(view) | Self::Constructor(view) | Self::Initializer(view) => Some(view),
             _ => None,
         }
+    }
+
+    /// The class whose body holds the function, which may use its private members.
+    pub(super) fn body_class(self) -> Option<InternedString> {
+        match self {
+            Self::Static(view) => Some(view),
+            role => role.class(),
+        }
+    }
+
+    /// Whether `this` is the function's first parameter.
+    pub(super) fn takes_this(self) -> Option<InternedString> {
+        match self {
+            Self::Method(view) | Self::Initializer(view) => Some(view),
+            _ => None,
+        }
+    }
+}
+
+/// The hidden field holding an instance's class in a hierarchy with subclasses.
+pub(super) const CLASS_TAG: &str = "\0class";
+
+/// Who may use a member.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Access {
+    Public,
+    Protected,
+    Private,
+}
+
+/// Whether a `super(...)` call occurs.
+struct SuperCalls {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for SuperCalls {
+    fn visit_call_expression(&mut self, it: &js::CallExpression<'a>) {
+        self.found |= matches!(it.callee, js::Expression::Super(_));
+        walk::walk_call_expression(self, it);
+    }
+}
+
+fn access(accessibility: Option<js::TSAccessibility>) -> Access {
+    match accessibility {
+        Some(js::TSAccessibility::Private) => Access::Private,
+        Some(js::TSAccessibility::Protected) => Access::Protected,
+        _ => Access::Public,
     }
 }
 
@@ -26,7 +77,9 @@ pub(super) struct ClassField<'ast, 'program> {
     pub name: &'ast str,
     pub ty: PrimitiveType,
     pub readonly: bool,
-    pub private: bool,
+    pub access: Access,
+    /// The class that declares an inherited field; `None` for the class's own fields.
+    pub owner: Option<InternedString>,
     pub initializer: Option<&'program js::Expression<'ast>>,
     /// Declared by a constructor parameter.
     pub parameter: bool,
@@ -35,8 +88,11 @@ pub(super) struct ClassField<'ast, 'program> {
 }
 
 pub(super) struct Member {
+    /// The implementing function.
     pub key: InternedString,
-    pub private: bool,
+    pub access: Access,
+    /// The class that declares an inherited member; `None` for the class's own members.
+    pub owner: Option<InternedString>,
 }
 
 pub(super) struct Class<'ast, 'program> {
@@ -54,6 +110,12 @@ pub(super) struct Class<'ast, 'program> {
         &'program js::Function<'ast>,
         FunctionRole,
     )>,
+    pub base: Option<InternedString>,
+    pub constructor_access: Access,
+    /// The hidden class field's value, for classes in a hierarchy.
+    pub tag: Option<f64>,
+    /// The initializer's key and native component, for classes others extend.
+    pub init: Option<(InternedString, String)>,
     pub span: oxc_span::Span,
 }
 
@@ -73,13 +135,6 @@ impl<'a> Visit<'a> for ThisAssignments<'a> {
     }
 }
 
-fn is_private(accessibility: Option<js::TSAccessibility>) -> bool {
-    matches!(
-        accessibility,
-        Some(js::TSAccessibility::Private | js::TSAccessibility::Protected)
-    )
-}
-
 impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn declare_class(&mut self, class: &'program js::Class<'ast>) -> Result<()> {
         let Some(id) = &class.id else {
@@ -88,10 +143,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if class.type_parameters.is_some() {
             return self.unsupported("generic classes", class.span);
         }
-        if class.heritage.is_some() {
-            return self.unsupported("class inheritance", class.span);
-        }
-
         if class.r#abstract
             || class.declare
             || self.declaration_file
@@ -99,17 +150,54 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         {
             return self.unsupported("abstract, ambient or decorated classes", class.span);
         }
+        let base = match &class.heritage {
+            Some(heritage) => Some(self.class_base(class, heritage)?),
+            None => None,
+        };
         let name = self.name(id.name.as_str());
         if self.aliases.contains_key(&name) {
             return self.error(ErrorKind::Type, "duplicate type declaration", id.span);
         }
         let source = id.name.as_str();
-        let mut fields: Vec<ClassField<'ast, 'program>> = vec![];
+        // Every class of a hierarchy carries its class in a hidden field, for dispatch.
+        let tag = (base.is_some() || self.extended_classes.contains(&name))
+            .then(|| self.class_order.len() as f64);
+        let (mut fields, mut methods, mut statics) = match base {
+            Some(base) => {
+                let parent = &self.classes[&base];
+                let inherit = |m: &Member| Member {
+                    key: m.key,
+                    access: m.access,
+                    owner: Some(m.owner.unwrap_or(base)),
+                };
+                (
+                    parent
+                        .fields
+                        .iter()
+                        .map(|f| ClassField {
+                            owner: Some(f.owner.unwrap_or(base)),
+                            ..f.clone()
+                        })
+                        .collect::<Vec<_>>(),
+                    parent
+                        .methods
+                        .iter()
+                        .map(|(k, m)| (*k, inherit(m)))
+                        .collect::<FxHashMap<_, _>>(),
+                    parent
+                        .statics
+                        .iter()
+                        .map(|(k, m)| (*k, inherit(m)))
+                        .collect::<FxHashMap<_, _>>(),
+                )
+            }
+            None => Default::default(),
+        };
         let mut constructor = None;
-        let mut methods = FxHashMap::default();
-        let mut statics = FxHashMap::default();
+        let mut constructor_access = Access::Public;
+        let mut own_members: FxHashSet<&'ast str> = FxHashSet::default();
         let mut bodies = vec![];
-        let mut nominal = false;
+        let mut nominal = !methods.is_empty() || fields.iter().any(|f| f.access != Access::Public);
         for element in &class.body.body {
             match element {
                 js::ClassElement::PropertyDefinition(p) => {
@@ -139,15 +227,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         (None, Some(js::Expression::StringLiteral(_))) => PrimitiveType::String,
                         _ => return self.unsupported("class field type inference", p.span),
                     };
-                    if fields.iter().any(|f| f.name == field) {
+                    if fields.iter().any(|f| f.name == field && f.owner.is_none()) {
                         return self.error(ErrorKind::Type, "duplicate identifier", p.span);
                     }
-                    nominal |= is_private(p.accessibility);
+                    self.check_inherited_member(
+                        source,
+                        &fields,
+                        &methods,
+                        field,
+                        Some(ty),
+                        p.span,
+                    )?;
+                    nominal |= access(p.accessibility) != Access::Public;
                     fields.push(ClassField {
                         name: field,
                         ty,
                         readonly: p.readonly,
-                        private: is_private(p.accessibility),
+                        access: access(p.accessibility),
+                        owner: None,
                         initializer: p.value.as_ref(),
                         parameter: false,
                         definite: p.definite,
@@ -164,6 +261,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 return self.unsupported("constructor overloads", m.span);
                             }
                             constructor = Some(&*m.value);
+                            constructor_access = access(m.accessibility);
                         }
                         js::MethodDefinitionKind::Method => {
                             let method = self.class_key(&m.key)?;
@@ -174,17 +272,39 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                     m.span,
                                 );
                             }
-                            if methods.contains_key(method) || statics.contains_key(method) {
+                            if !own_members.insert(method) {
                                 return self.unsupported("function overloads", m.span);
                             }
-                            let private = is_private(m.accessibility);
+                            let access = access(m.accessibility);
                             let (table, key) = if m.r#static {
                                 (&mut statics, intern(&format!("{source}::{method}")))
                             } else {
                                 nominal = true;
                                 (&mut methods, intern(&format!("{source}.{method}")))
                             };
-                            table.insert(method, Member { key, private });
+                            if let Some(inherited) = table.get(method) {
+                                self.check_override_access(
+                                    source, method, inherited, access, m.span,
+                                )?;
+                            }
+                            if !m.r#static {
+                                self.check_inherited_member(
+                                    source,
+                                    &fields,
+                                    &FxHashMap::default(),
+                                    method,
+                                    None,
+                                    m.span,
+                                )?;
+                            }
+                            table.insert(
+                                method,
+                                Member {
+                                    key,
+                                    access,
+                                    owner: None,
+                                },
+                            );
                             let component = if m.r#static {
                                 format!("{source}::{method}")
                             } else {
@@ -228,15 +348,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let Some(ty) = field_primitive(&ty) else {
                     return self.unsupported("reference-valued object fields", p.span);
                 };
-                if fields.iter().any(|f| f.name == parameter.name.as_str()) {
+                let field = parameter.name.as_str();
+                if fields.iter().any(|f| f.name == field && f.owner.is_none()) {
                     return self.error(ErrorKind::Type, "duplicate identifier", p.span);
                 }
-                nominal |= is_private(p.accessibility);
+                self.check_inherited_member(source, &fields, &methods, field, Some(ty), p.span)?;
+                nominal |= access(p.accessibility) != Access::Public;
                 fields.push(ClassField {
-                    name: parameter.name.as_str(),
+                    name: field,
                     ty,
                     readonly: p.readonly,
-                    private: is_private(p.accessibility),
+                    access: access(p.accessibility),
+                    owner: None,
                     initializer: None,
                     parameter: true,
                     definite: false,
@@ -244,6 +367,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 });
             }
         }
+        // A subclass keeps its base's layout as a prefix, so a base view reads it in place.
+        let mut key: SmallVec<[(InternedString, PrimitiveType); 4]> = match base {
+            Some(base) => self.layout_key(&self.classes[&base].ty),
+            None if tag.is_some() => [(self.name(CLASS_TAG), PrimitiveType::F64)]
+                .into_iter()
+                .collect(),
+            None => SmallVec::new(),
+        };
+        let mut own: Vec<&ClassField<'ast, 'program>> =
+            fields.iter().filter(|f| f.owner.is_none()).collect();
+        own.sort_by_key(|f| f.name);
+        key.extend(own.iter().map(|f| (self.name(f.name), f.ty)));
+        let ty = self.layout_of(key);
         let mut layout: Fields<'ast> = fields
             .iter()
             .map(|f| {
@@ -258,7 +394,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             })
             .collect();
         layout.sort_by_key(|(name, _)| *name);
-        let ty = self.layout(layout.iter().map(|(name, field)| (*name, field.ty)));
         let view = self.record_view(source, &ty, layout);
         Arc::get_mut(self.views.get_mut(&view).unwrap())
             .unwrap()
@@ -267,7 +402,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .into_iter()
             .map(|(key, component, f, is_static)| {
                 let role = if is_static {
-                    FunctionRole::Static
+                    FunctionRole::Static(view)
                 } else {
                     FunctionRole::Method(view)
                 };
@@ -275,6 +410,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             })
             .collect();
         self.check_implements(class, &fields)?;
+        let init = self.extended_classes.contains(&name).then(|| {
+            (
+                intern(&format!("{source}\0init")),
+                format!("{source}\0init"),
+            )
+        });
         self.aliases.insert(name, (ty.clone(), Some(view)));
         self.class_names.insert(name, view);
         self.class_order.push(view);
@@ -289,9 +430,160 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 methods,
                 statics,
                 bodies,
+                base,
+                constructor_access,
+                tag,
+                init,
                 span: class.span,
             },
         );
+        Ok(())
+    }
+
+    /// The class `class` extends: a class this module declares before it.
+    fn class_base(
+        &self,
+        class: &js::Class<'ast>,
+        heritage: &js::ClassHeritage<'ast>,
+    ) -> Result<InternedString> {
+        let at = heritage.expression.span();
+        let not_constructor = || {
+            self.error(
+                ErrorKind::Type,
+                "the class heritage is not a constructor function type",
+                at,
+            )
+        };
+        let js::Expression::Identifier(base) = &heritage.expression else {
+            return match heritage.expression {
+                js::Expression::NullLiteral(_) => self.unsupported("classes extending null", at),
+                js::Expression::BooleanLiteral(_)
+                | js::Expression::NumericLiteral(_)
+                | js::Expression::StringLiteral(_)
+                | js::Expression::TemplateLiteral(_) => not_constructor(),
+                _ => self.unsupported("class heritage expressions", at),
+            };
+        };
+        if heritage.type_arguments.is_some() {
+            return self.unsupported("extending generic classes", at);
+        }
+        let key = self.name(base.name.as_str());
+        if let Some(view) = self.class_names.get(&key) {
+            if self.classes[view].span.start > class.span.start {
+                return self.error(
+                    ErrorKind::Type,
+                    format!("class `{}` used before its declaration", base.name),
+                    at,
+                );
+            }
+            if self.classes[view].constructor_access == Access::Private {
+                return self.error(
+                    ErrorKind::Type,
+                    format!(
+                        "cannot extend class `{}`: its constructor is marked as private",
+                        base.name
+                    ),
+                    at,
+                );
+            }
+            return Ok(*view);
+        }
+        if self.aliases.contains_key(&key) {
+            return self.error(
+                ErrorKind::Type,
+                format!("cannot extend `{}`, which only refers to a type", base.name),
+                at,
+            );
+        }
+        if self.declared_types.contains(&key) {
+            return self.unsupported(UNRESOLVED_REFERENCE, at);
+        }
+        if library_value(base.name.as_str()) {
+            return self.unsupported(&format!("extending library class `{}`", base.name), at);
+        }
+        if self.top_level_values.contains(&key) {
+            return self.unsupported("extending values that are not class declarations", at);
+        }
+        if base.name == "undefined" {
+            return not_constructor();
+        }
+        self.error(
+            ErrorKind::Type,
+            format!("cannot find name `{}`", base.name),
+            at,
+        )
+    }
+
+    /// The field names and types of a class layout, in layout order.
+    fn layout_key(&self, ty: &Type) -> SmallVec<[(InternedString, PrimitiveType); 4]> {
+        let Type::Named { id, .. } = ty else {
+            unreachable!("class layouts are named records")
+        };
+        self.registry
+            .get_type_by_id(*id)
+            .unwrap()
+            .fields
+            .iter()
+            .map(|field| match field.ty {
+                Type::Primitive(primitive) => (field.name, primitive),
+                _ => unreachable!("class fields are primitives"),
+            })
+            .collect()
+    }
+
+    /// A member a subclass declares must agree in kind and type with the one it inherits.
+    fn check_inherited_member(
+        &self,
+        class: &str,
+        fields: &[ClassField<'ast, 'program>],
+        methods: &FxHashMap<&'ast str, Member>,
+        name: &str,
+        field_type: Option<PrimitiveType>,
+        at: oxc_span::Span,
+    ) -> Result<()> {
+        let inherited_field = fields.iter().find(|f| f.name == name && f.owner.is_some());
+        let incompatible = match (inherited_field, field_type) {
+            (Some(inherited), Some(ty)) if inherited.ty == ty => {
+                return self.unsupported("redeclared inherited fields", at);
+            }
+            (Some(_), _) => true,
+            (None, Some(_)) => methods.get(name).is_some_and(|m| m.owner.is_some()),
+            (None, None) => false,
+        };
+        if incompatible {
+            return self.error(
+                ErrorKind::Type,
+                format!(
+                    "property `{name}` in class `{class}` is not assignable to the same property in its base class"
+                ),
+                at,
+            );
+        }
+        Ok(())
+    }
+
+    /// An override keeps the inherited member at least as visible, and cannot replace a
+    /// private one.
+    fn check_override_access(
+        &self,
+        class: &str,
+        name: &str,
+        inherited: &Member,
+        access: Access,
+        at: oxc_span::Span,
+    ) -> Result<()> {
+        let narrower = match inherited.access {
+            Access::Private => true,
+            Access::Protected => access == Access::Private,
+            Access::Public => access != Access::Public,
+        };
+        if inherited.owner.is_some() && narrower {
+            return self.error(
+                ErrorKind::Type,
+                format!("class `{class}` incorrectly extends its base class: member `{name}` has another visibility"),
+                at,
+            );
+        }
         Ok(())
     }
 
@@ -333,7 +625,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let property = required.name.resolve_global().unwrap_or_default();
                 let found = fields.iter().find(|f| self.name(f.name) == required.name);
                 let matches = found.is_some_and(|f| {
-                    !f.private && Some(Type::Primitive(f.ty)) == Some(required.ty.clone())
+                    f.access == Access::Public
+                        && Some(Type::Primitive(f.ty)) == Some(required.ty.clone())
                 });
                 if !matches {
                     return self.error(
@@ -391,15 +684,29 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let component = class.component.clone();
             let ty = class.ty.clone();
             let bodies = class.bodies.clone();
+            let init = class.init.clone();
+            let base = class.base;
+            let at = class.span;
+            if constructor.is_none()
+                && let Some(base) = base
+            {
+                let (base_init, _) = self.classes[&base].init.as_ref().unwrap();
+                if self.signatures[base_init].params.len() > 1 {
+                    return self.unsupported(
+                        "implicit constructors forwarding base constructor parameters",
+                        at,
+                    );
+                }
+            }
             match constructor {
                 Some(f) => {
-                    self.signature_as(f, key, &component, FunctionRole::Constructor(view))?
+                    self.signature_as(f, key, &component, FunctionRole::Constructor(view))?;
+                    if let Some((init, component)) = &init {
+                        self.signature_as(f, *init, component, FunctionRole::Initializer(view))?;
+                    }
                 }
                 None => {
-                    self.name_buffer.truncate(self.prefix_len);
-                    self.name_buffer.push_str("fn$");
-                    crate::modules::append_component(&mut self.name_buffer, &component);
-                    let native = intern(&self.name_buffer);
+                    let native = self.native_name(&component);
                     self.signatures.insert(
                         key,
                         Arc::new(Signature {
@@ -412,13 +719,76 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             array_result: None,
                         }),
                     );
+                    if let Some((init, component)) = &init {
+                        let native = self.native_name(component);
+                        let this = self.this_parameter(view);
+                        self.signatures.insert(
+                            *init,
+                            Arc::new(Signature {
+                                native,
+                                type_params: vec![],
+                                type_rules: None,
+                                params: vec![this],
+                                ret: Some(unit()),
+                                ret_view: None,
+                                array_result: None,
+                            }),
+                        );
+                    }
                 }
             }
             for (key, component, f, role) in bodies {
                 self.signature_as(f, key, &component, role)?;
             }
+            self.check_overrides(view)?;
         }
         Ok(())
+    }
+
+    /// An overriding method must be assignable to the one it overrides: TypeScript compares
+    /// methods bivariantly, so distinct primitive parameter or result types never agree.
+    fn check_overrides(&self, view: InternedString) -> Result<()> {
+        let class = &self.classes[&view];
+        let Some(base) = class.base else {
+            return Ok(());
+        };
+        let distinct = |a: &Type, b: &Type| {
+            matches!((a, b), (Type::Primitive(_), Type::Primitive(_))) && a != b
+        };
+        // Own methods in source order, so the first incompatible override is reported.
+        for (key, _, f, _) in &class.bodies {
+            let Some((name, _)) = class.methods.iter().find(|(_, m)| m.key == *key) else {
+                continue;
+            };
+            let Some(inherited) = self.classes[&base].methods.get(name) else {
+                continue;
+            };
+            let (own, theirs) = (&self.signatures[key], &self.signatures[&inherited.key]);
+            let parameters = own.params[1..]
+                .iter()
+                .zip(&theirs.params[1..])
+                .any(|(a, b)| distinct(&a.ty, &b.ty));
+            let result = match (&own.ret, &theirs.ret) {
+                (Some(a), Some(b)) if *b != unit() => distinct(a, b) || *a == unit(),
+                _ => false,
+            };
+            if parameters || result {
+                let at = f.span;
+                return self.error(
+                    ErrorKind::Type,
+                    format!("property `{name}` in a derived class is not assignable to the same property in its base class"),
+                    at,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn native_name(&mut self, component: &str) -> InternedString {
+        self.name_buffer.truncate(self.prefix_len);
+        self.name_buffer.push_str("fn$");
+        crate::modules::append_component(&mut self.name_buffer, component);
+        intern(&self.name_buffer)
     }
 
     pub(super) fn lower_classes(&mut self) -> Result<()> {
@@ -427,9 +797,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let constructor = class.constructor;
             let key = class.constructor_key;
             let bodies = class.bodies.clone();
+            let init = class.init.clone();
             match constructor {
-                Some(f) => self.function_as(f, key, FunctionRole::Constructor(view))?,
-                None => self.default_constructor(view)?,
+                Some(f) => {
+                    self.function_as(f, key, FunctionRole::Constructor(view))?;
+                    if let Some((init, _)) = init {
+                        self.function_as(f, init, FunctionRole::Initializer(view))?;
+                    }
+                }
+                None => {
+                    self.default_constructor(view, false)?;
+                    if init.is_some() {
+                        self.default_constructor(view, true)?;
+                    }
+                }
             }
             for (key, _, f, role) in bodies {
                 self.function_as(f, key, role)?;
@@ -495,18 +876,38 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         f: Option<&js::Function<'ast>>,
         statements: &mut Vec<Stmt>,
     ) -> Result<InternedString> {
-        let ty = self.classes[&view].ty.clone();
-        let fields = self.classes[&view].fields.clone();
-        let at = f.map_or(self.classes[&view].span, |f| f.span);
+        let this = self.allocate_instance(view, f, statements);
+        if self.classes[&view].base.is_none() {
+            let initialized = self.initialize_fields(view, f, this)?;
+            statements.extend(initialized);
+        }
+        Ok(this)
+    }
+
+    /// Binds `this` to a new instance whose fields are zero and whose class field names `view`.
+    fn allocate_instance(
+        &mut self,
+        view: InternedString,
+        f: Option<&js::Function<'ast>>,
+        statements: &mut Vec<Stmt>,
+    ) -> InternedString {
+        let class = &self.classes[&view];
+        let ty = class.ty.clone();
+        let tag = class.tag;
+        let at = f.map_or(class.span, |f| f.span);
         let Type::Named { id, .. } = &ty else {
             unreachable!()
         };
         let struct_name = self.registry.get_type_by_id(*id).unwrap().name;
-        let zeros = fields
-            .iter()
-            .map(|field| TypedFieldInit {
-                name: self.name(field.name),
-                value: Box::new(match field.ty {
+        let class_tag = self.name(CLASS_TAG);
+        // Struct literals initialize fields in layout order.
+        let zeros: Vec<TypedFieldInit> = self
+            .layout_key(&ty)
+            .into_iter()
+            .map(|(name, ty)| TypedFieldInit {
+                name,
+                value: Box::new(match ty {
+                    _ if name == class_tag => num(tag.unwrap(), at),
                     PrimitiveType::Bool => node(
                         TypedExpression::Literal(TypedLiteral::Bool(false)),
                         boolean(),
@@ -539,18 +940,41 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }),
             at,
         ));
+        self.bind_instance(view, this);
+        this
+    }
+
+    fn bind_instance(&mut self, view: InternedString, this: InternedString) {
+        let ty = self.classes[&view].ty.clone();
         let name = self.name("this");
         self.scopes.last_mut().unwrap().insert(
             name,
             Binding {
                 name: this,
                 symbol: None,
-                ty: ty.clone(),
+                ty,
                 view: Some(view),
                 mutable: false,
                 initialized: true,
             },
         );
+    }
+
+    /// Parameter properties, then the class's own field initializers, in order.
+    pub(super) fn initialize_fields(
+        &mut self,
+        view: InternedString,
+        f: Option<&js::Function<'ast>>,
+        this: InternedString,
+    ) -> Result<Vec<Stmt>> {
+        let ty = self.classes[&view].ty.clone();
+        let fields: Vec<_> = self.classes[&view]
+            .fields
+            .iter()
+            .filter(|f| f.owner.is_none())
+            .cloned()
+            .collect();
+        let mut statements = vec![];
         if let Some(f) = f {
             for p in &f.params.items {
                 if p.accessibility.is_none() && !p.readonly {
@@ -589,7 +1013,181 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             statements
                 .push(self.field_assignment(this, &ty, field.name, field.ty, value, field.span));
         }
-        Ok(this)
+        Ok(statements)
+    }
+
+    /// `super(...)` in the constructor of `view`: the base initializer on this instance, then
+    /// this class's parameter properties and field initializers.
+    pub(super) fn super_call(
+        &mut self,
+        view: InternedString,
+        f: Option<&js::Function<'ast>>,
+        arguments: &[js::Argument<'ast>],
+        at: oxc_span::Span,
+    ) -> Result<Vec<Stmt>> {
+        let base = self.classes[&view].base.unwrap();
+        let (init, _) = self.classes[&base].init.clone().unwrap();
+        let this = self.binding("this", at)?.name;
+        let receiver = self.upcast(var(this, self.classes[&view].ty.clone(), at), base, at);
+        let sig = &self.signatures[&init];
+        let stripped = Arc::new(Signature {
+            params: sig.params[1..].to_vec(),
+            ..(**sig).clone()
+        });
+        let call = self.call_with_signature(stripped, arguments, None, Some(receiver), at)?;
+        let mut statements = vec![expression(call)];
+        statements.extend(self.initialize_fields(view, f, this)?);
+        Ok(statements)
+    }
+
+    /// The statements of a derived class's constructor: those before `super(...)` cannot use
+    /// `this`; the call runs the base initializer and then this class's field initializers.
+    pub(super) fn derived_constructor_body(
+        &mut self,
+        view: InternedString,
+        f: &js::Function<'ast>,
+        body: &[js::Statement<'ast>],
+        statements: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let position = body.iter().position(|s| {
+            matches!(s, js::Statement::ExpressionStatement(e)
+                if matches!(&e.expression, js::Expression::CallExpression(c)
+                    if matches!(c.callee, js::Expression::Super(_))))
+        });
+        let Some(position) = position else {
+            let mut nested = SuperCalls { found: false };
+            for s in body {
+                nested.visit_statement(s);
+            }
+            if nested.found {
+                return self.unsupported("super calls inside nested statements", f.span);
+            }
+            return self.error(
+                ErrorKind::Type,
+                "constructors for derived classes must contain a 'super' call",
+                f.span,
+            );
+        };
+        let outer = std::mem::replace(&mut self.before_super, true);
+        let before: Result<Vec<_>> = body[..position].iter().map(|s| self.statement(s)).collect();
+        self.before_super = outer;
+        statements.extend(before?.into_iter().flatten());
+        let js::Statement::ExpressionStatement(e) = &body[position] else {
+            unreachable!()
+        };
+        let js::Expression::CallExpression(call) = &e.expression else {
+            unreachable!()
+        };
+        statements.extend(self.super_call(view, Some(f), &call.arguments, call.span)?);
+        for s in &body[position + 1..] {
+            statements.extend(self.statement(s)?);
+        }
+        Ok(())
+    }
+
+    /// `super(...)` anywhere but a derived constructor's top-level statements.
+    pub(super) fn misplaced_super_call(
+        &self,
+        keyword: oxc_span::Span,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let derived = self
+            .current_class
+            .and_then(|view| self.classes.get(&view))
+            .is_some_and(|class| class.base.is_some());
+        if !derived {
+            return self.error(
+                ErrorKind::Type,
+                "'super' can only be referenced in a derived class",
+                keyword,
+            );
+        }
+        if !self.in_constructor {
+            return self.error(
+                ErrorKind::Type,
+                "super calls are not permitted outside constructors",
+                at,
+            );
+        }
+        self.unsupported(
+            "super calls outside a constructor's top-level statements",
+            at,
+        )
+    }
+
+    /// `super.name` outside a call: fields are not reachable through `super`.
+    pub(super) fn super_member(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
+        let name = m.property.name.as_str();
+        let base = self
+            .current_class
+            .and_then(|view| self.classes.get(&view))
+            .and_then(|class| class.base);
+        let Some(base) = base else {
+            return self.error(
+                ErrorKind::Type,
+                "'super' can only be referenced in a derived class",
+                m.object.span(),
+            );
+        };
+        if self.classes[&base].fields.iter().any(|f| f.name == name) {
+            return self.error(
+                ErrorKind::Type,
+                format!("class field `{name}` defined by the parent class is not accessible in the child class via super"),
+                m.span,
+            );
+        }
+        if !self.classes[&base].methods.contains_key(name) {
+            return self.error(
+                ErrorKind::Type,
+                format!("property `{name}` does not exist on the base class"),
+                m.span,
+            );
+        }
+        self.unsupported("super property values", m.span)
+    }
+
+    /// Records names used as `extends` targets and the module's top-level values, before
+    /// any class is declared.
+    pub(super) fn class_heritage(&mut self, program: &js::Program<'ast>) {
+        for statement in &program.body {
+            if let js::Statement::ImportDeclaration(import) = statement {
+                for specifier in import.specifiers.iter().flatten() {
+                    let local = self.name(specifier.local().name.as_str());
+                    self.top_level_values.insert(local);
+                }
+                continue;
+            }
+            let Some(declaration) = modules::declaration(statement) else {
+                continue;
+            };
+            match declaration {
+                js::Declaration::ClassDeclaration(class) => {
+                    if let Some(js::ClassHeritage {
+                        expression: js::Expression::Identifier(base),
+                        ..
+                    }) = &class.heritage
+                    {
+                        let base = self.name(base.name.as_str());
+                        self.extended_classes.insert(base);
+                    }
+                }
+                js::Declaration::FunctionDeclaration(function) => {
+                    if let Some(id) = &function.id {
+                        let name = self.name(id.name.as_str());
+                        self.top_level_values.insert(name);
+                    }
+                }
+                js::Declaration::VariableDeclaration(variables) => {
+                    for d in &variables.declarations {
+                        if let js::BindingPattern::BindingIdentifier(id) = &d.id {
+                            let name = self.name(id.name.as_str());
+                            self.top_level_values.insert(name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// TypeScript's strict property initialization: every field without an initializer
@@ -608,7 +1206,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn require_initialized(&self, view: InternedString, assigned: &FxHashSet<&str>) -> Result<()> {
         for field in &self.classes[&view].fields {
-            if field.initializer.is_none()
+            if field.owner.is_none()
+                && field.initializer.is_none()
                 && !field.parameter
                 && !field.definite
                 && !assigned.contains(field.name)
@@ -626,8 +1225,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
-    pub(super) fn default_constructor(&mut self, view: InternedString) -> Result<()> {
-        let key = self.classes[&view].constructor_key;
+    /// The constructor of a class that declares none: `new`, or the initializer subclasses
+    /// call. A subclass's implicit constructor calls its base's with no arguments.
+    pub(super) fn default_constructor(
+        &mut self,
+        view: InternedString,
+        initializer: bool,
+    ) -> Result<()> {
+        let key = if initializer {
+            self.classes[&view].init.as_ref().unwrap().0
+        } else {
+            self.classes[&view].constructor_key
+        };
         if self.lowered.contains(&key) {
             return Ok(());
         }
@@ -643,26 +1252,47 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             },
         );
         let outer_class = self.current_class.replace(view);
+        let outer_body = self.class_body.replace(view);
         let outer_constructor = std::mem::replace(&mut self.in_constructor, true);
         let outer_returns = self.returns.take();
         let mut statements = vec![];
-        let result = self.constructor_prologue(view, None, &mut statements);
+        let mut params = vec![];
+        let result = (|| {
+            let this = if initializer {
+                let parameter = self.bind_this(view, at);
+                let this = parameter.name;
+                params.push(parameter);
+                this
+            } else {
+                self.allocate_instance(view, None, &mut statements)
+            };
+            let initialized = if self.classes[&view].base.is_some() {
+                self.super_call(view, None, &[], at)?
+            } else {
+                self.initialize_fields(view, None, this)?
+            };
+            statements.extend(initialized);
+            Ok(this)
+        })();
         self.returns = outer_returns;
         self.in_constructor = outer_constructor;
         self.current_class = outer_class;
+        self.class_body = outer_body;
         self.vars = outer_vars;
         self.pop_scope();
         let this = result?;
         let ty = sig.ret.clone().unwrap();
-        statements.push(stmt(
-            TypedStatement::Return(Some(Box::new(var(this, ty.clone(), at)))),
-            at,
-        ));
+        if !initializer {
+            statements.push(stmt(
+                TypedStatement::Return(Some(Box::new(var(this, ty.clone(), at)))),
+                at,
+            ));
+        }
         self.declarations.push(node(
             TypedDeclaration::Function(TypedFunction {
                 name: sig.native,
                 annotations: vec![strict_fp(self.name("strict_fp"))],
-                params: vec![],
+                params,
                 return_type: ty,
                 body: Some(TypedBlock {
                     statements,
@@ -678,21 +1308,42 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(())
     }
 
+    /// A private member is used only in its class's body; a protected one also in subclasses.
     fn check_member_access(
         &self,
-        view: InternedString,
-        private: bool,
+        owner: InternedString,
+        access: Access,
         name: &str,
         at: oxc_span::Span,
     ) -> Result<()> {
-        if private && self.current_class != Some(view) {
-            return self.error(
-                ErrorKind::Type,
-                format!("property `{name}` is private and only accessible within its class"),
-                at,
-            );
+        let allowed = match access {
+            Access::Public => true,
+            Access::Private => self.class_body == Some(owner),
+            Access::Protected => self
+                .class_body
+                .is_some_and(|class| self.is_subclass(class, owner)),
+        };
+        if !allowed {
+            let kind = if access == Access::Private {
+                "private and only accessible within its class"
+            } else {
+                "protected and only accessible within its class and subclasses"
+            };
+            return self.error(ErrorKind::Type, format!("property `{name}` is {kind}"), at);
         }
         Ok(())
+    }
+
+    /// Whether `class` is `ancestor` or extends it.
+    pub(super) fn is_subclass(&self, class: InternedString, ancestor: InternedString) -> bool {
+        let mut current = Some(class);
+        while let Some(view) = current {
+            if view == ancestor {
+                return true;
+            }
+            current = self.classes.get(&view).and_then(|c| c.base);
+        }
+        false
     }
 
     /// Field reads and writes through a class-typed receiver honour access modifiers.
@@ -708,19 +1359,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         else {
             return Ok(());
         };
-        let private = self.classes[&view]
-            .fields
-            .iter()
-            .find(|f| f.name == field)
-            .is_some_and(|f| f.private);
-        self.check_member_access(view, private, field, at)
+        let Some(declared) = self.classes[&view].fields.iter().find(|f| f.name == field) else {
+            return Ok(());
+        };
+        self.check_member_access(declared.owner.unwrap_or(view), declared.access, field, at)
     }
 
     pub(super) fn readonly_field_write_allowed(&self, object: &js::Expression<'ast>) -> bool {
         self.in_constructor && matches!(object, js::Expression::ThisExpression(_))
     }
 
-    /// `receiver.method(...)` and `Class.method(...)`; `None` when not a class member call.
+    /// `receiver.method(...)`, `super.method(...)` and `Class.method(...)`; `None` when not a
+    /// class member call.
     pub(super) fn method_call(
         &mut self,
         c: &js::CallExpression<'ast>,
@@ -738,8 +1388,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             m.span,
                         );
                     };
-                    let (key, private) = (member.key, member.private);
-                    self.check_member_access(view, private, name, m.span)?;
+                    let (key, access, owner) =
+                        (member.key, member.access, member.owner.unwrap_or(view));
+                    self.check_member_access(owner, access, name, m.span)?;
                     let sig = self.signatures[&key].clone();
                     return self
                         .call_with_signature(
@@ -753,6 +1404,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
         }
+        if let js::Expression::Super(s) = &m.object {
+            return self.super_method_call(c, name, s.span).map(Some);
+        }
         let Some(view) = self
             .view_of(&m.object)
             .filter(|v| self.classes.contains_key(v))
@@ -761,19 +1415,79 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let class = &self.classes[&view];
         let Some(member) = class.methods.get(name) else {
-            return if class.fields.iter().any(|f| f.name == name) {
-                Ok(None)
-            } else {
-                self.error(
-                    ErrorKind::Type,
-                    format!("property `{name}` does not exist on this class"),
-                    m.span,
-                )
-            };
+            if class.fields.iter().any(|f| f.name == name) {
+                return Ok(None);
+            }
+            // Errors in the receiver come first, as TypeScript reports them in source order.
+            self.expr(&m.object)?;
+            return self.error(
+                ErrorKind::Type,
+                format!("property `{name}` does not exist on this class"),
+                m.span,
+            );
         };
-        let (key, private) = (member.key, member.private);
-        self.check_member_access(view, private, name, m.span)?;
+        let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
+        self.check_member_access(owner, access, name, m.span)?;
         let receiver = self.expr(&m.object)?;
+        // A method whose result is inferred from `return this` has TypeScript's polymorphic
+        // `this` type, which the native signature records as the declaring class.
+        if owner != view
+            && self.functions[&key].return_type.is_none()
+            && self.signatures[&key].ret_view == Some(owner)
+        {
+            return self.unsupported("polymorphic this results through subclasses", m.span);
+        }
+        let call = self.member_call(key, owner, receiver, c)?;
+        self.dispatch(view, name, key, call, c.span).map(Some)
+    }
+
+    /// `super.method(...)`: the base class's implementation, called on `this`.
+    fn super_method_call(
+        &mut self,
+        c: &js::CallExpression<'ast>,
+        name: &str,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let Some(base) = self
+            .current_class
+            .and_then(|view| self.classes.get(&view))
+            .and_then(|class| class.base)
+        else {
+            return self.error(
+                ErrorKind::Type,
+                "'super' can only be referenced in a derived class",
+                at,
+            );
+        };
+        let Some(member) = self.classes[&base].methods.get(name) else {
+            if self.classes[&base].fields.iter().any(|f| f.name == name) {
+                return self.error(
+                    ErrorKind::Type,
+                    format!("class field `{name}` defined by the parent class is not accessible in the child class via super"),
+                    at,
+                );
+            }
+            return self.error(
+                ErrorKind::Type,
+                format!("property `{name}` does not exist on the base class"),
+                at,
+            );
+        };
+        let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(base));
+        self.check_member_access(owner, access, name, at)?;
+        let this = self.this_expr(at)?;
+        self.member_call(key, owner, this, c)
+    }
+
+    /// A call of the method `key` that `owner` declares, on a receiver of `owner` or a subclass.
+    fn member_call(
+        &mut self,
+        key: InternedString,
+        owner: InternedString,
+        receiver: Expr,
+        c: &js::CallExpression<'ast>,
+    ) -> Result<Expr> {
+        let receiver = self.upcast(receiver, owner, c.span);
         let sig = &self.signatures[&key];
         let stripped = Arc::new(Signature {
             params: sig.params[1..].to_vec(),
@@ -786,7 +1500,155 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             Some(receiver),
             c.span,
         )
-        .map(Some)
+    }
+
+    /// A subclass instance seen through the layout of `class`, which is a prefix of its own.
+    pub(super) fn upcast(&self, value: Expr, class: InternedString, at: oxc_span::Span) -> Expr {
+        let ty = self.classes[&class].ty.clone();
+        if value.ty == ty {
+            return value;
+        }
+        node(
+            TypedExpression::Cast(TypedCast {
+                expr: Box::new(value),
+                target_type: ty.clone(),
+            }),
+            ty,
+            at,
+        )
+    }
+
+    /// A call of `name` through a receiver of class `view` runs the implementation of the
+    /// instance's class: `call` is the static call of `key`, and each subclass overriding it
+    /// is selected by the instance's class field.
+    fn dispatch(
+        &mut self,
+        view: InternedString,
+        name: &str,
+        key: InternedString,
+        call: Expr,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let mut overrides: Vec<(InternedString, InternedString, Vec<f64>)> = vec![];
+        for subclass in self.class_order.clone() {
+            if subclass == view || !self.is_subclass(subclass, view) {
+                continue;
+            }
+            let class = &self.classes[&subclass];
+            let member = &class.methods[name];
+            if member.key == key {
+                continue;
+            }
+            let tag = class.tag.expect("subclasses carry their class");
+            let owner = member.owner.unwrap_or(subclass);
+            match overrides.iter_mut().find(|(k, _, _)| *k == member.key) {
+                Some((_, _, tags)) => tags.push(tag),
+                None => overrides.push((member.key, owner, vec![tag])),
+            }
+        }
+        if overrides.is_empty() {
+            return Ok(call);
+        }
+        let base_sig = self.signatures[&key].clone();
+        for (implementation, _, _) in &overrides {
+            let sig = &self.signatures[implementation];
+            let same = sig.params.len() == base_sig.params.len()
+                && sig.params[1..]
+                    .iter()
+                    .zip(&base_sig.params[1..])
+                    .all(|(a, b)| a.ty == b.ty)
+                && sig.ret.is_some()
+                && sig.ret == base_sig.ret
+                && sig.type_params.is_empty()
+                && base_sig.type_params.is_empty()
+                && self.arities.get(&sig.native) == self.arities.get(&base_sig.native);
+            if !same {
+                return self.unsupported("overrides with a different signature", at);
+            }
+        }
+        let ty = call.ty.clone();
+        let TypedExpression::Call(TypedCall {
+            positional_args, ..
+        }) = call.node
+        else {
+            unreachable!("member calls are direct calls")
+        };
+        // Evaluate the receiver and arguments once, in order, then select the implementation.
+        let mut statements = vec![];
+        let mut values = vec![];
+        for argument in positional_args {
+            let temporary = self.fresh("dispatch");
+            let argument_type = argument.ty.clone();
+            statements.push(stmt(
+                TypedStatement::Let(TypedLet {
+                    name: temporary,
+                    ty: argument_type.clone(),
+                    mutability: Mutability::Immutable,
+                    initializer: Some(Box::new(argument)),
+                    span: span(at),
+                }),
+                at,
+            ));
+            values.push(var(temporary, argument_type, at));
+        }
+        let receiver = values[0].clone();
+        let tag = node(
+            TypedExpression::Field(TypedFieldAccess {
+                object: Box::new(receiver.clone()),
+                field: self.name(CLASS_TAG),
+            }),
+            number(),
+            at,
+        );
+        let invoke = |native: InternedString, receiver: Expr| {
+            node(
+                TypedExpression::Call(TypedCall {
+                    callee: Box::new(var(native, Type::Any, at)),
+                    positional_args: std::iter::once(receiver)
+                        .chain(values[1..].iter().cloned())
+                        .collect(),
+                    named_args: vec![],
+                    type_args: vec![],
+                }),
+                ty.clone(),
+                at,
+            )
+        };
+        let mut selected = invoke(base_sig.native, receiver.clone());
+        for (implementation, owner, tags) in overrides.into_iter().rev() {
+            let condition = tags
+                .into_iter()
+                .map(|value| binary(BinaryOp::Eq, tag.clone(), num(value, at), boolean(), at))
+                .reduce(|a, b| binary(BinaryOp::Or, a, b, boolean(), at))
+                .unwrap();
+            let native = self.signatures[&implementation].native;
+            let receiver = node(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(receiver.clone()),
+                    target_type: self.classes[&owner].ty.clone(),
+                }),
+                self.classes[&owner].ty.clone(),
+                at,
+            );
+            selected = node(
+                TypedExpression::If(TypedIfExpr {
+                    condition: Box::new(condition),
+                    then_branch: Box::new(invoke(native, receiver)),
+                    else_branch: Box::new(selected),
+                }),
+                ty.clone(),
+                at,
+            );
+        }
+        statements.push(expression(selected));
+        Ok(node(
+            TypedExpression::Block(TypedBlock {
+                statements,
+                span: span(at),
+            }),
+            ty,
+            at,
+        ))
     }
 
     /// The class view a method call produces, when its signature names one.
@@ -830,12 +1692,36 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if n.type_arguments.is_some() {
             return self.error(ErrorKind::Type, "class is not generic", n.span);
         }
+        let allowed = match self.classes[&view].constructor_access {
+            Access::Public => true,
+            Access::Private => self.class_body == Some(view),
+            Access::Protected => self
+                .class_body
+                .is_some_and(|class| self.is_subclass(class, view)),
+        };
+        if !allowed {
+            return self.error(
+                ErrorKind::Type,
+                format!(
+                    "constructor of class `{}` is not accessible outside the class declaration",
+                    id.name
+                ),
+                n.span,
+            );
+        }
         let sig = self.signatures[&self.classes[&view].constructor_key].clone();
         self.call_with_signature(sig, &n.arguments, None, None, n.span)
     }
 
     pub(super) fn this_expr(&mut self, at: oxc_span::Span) -> Result<Expr> {
         let name = self.name("this");
+        if self.before_super {
+            return self.error(
+                ErrorKind::Type,
+                "'super' must be called before accessing 'this' in the constructor of a derived class",
+                at,
+            );
+        }
         if !self.scopes.iter().any(|s| s.contains_key(&name)) {
             return self.unsupported("this outside instance methods and constructors", at);
         }
@@ -859,12 +1745,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         at: oxc_span::Span,
     ) -> Result<()> {
         if let Some(to) = to {
-            if self.views.get(&to).is_some_and(|v| v.nominal) && from != Some(to) {
+            let nominal = self.views.get(&to).is_some_and(|v| v.nominal);
+            let hierarchy = self.classes.get(&to).is_some_and(|c| c.tag.is_some());
+            let instance = from.is_some_and(|from| self.is_subclass(from, to));
+            if nominal && !instance {
                 return self.error(
                     ErrorKind::Type,
                     "value is missing members required by the class type",
                     at,
                 );
+            }
+            // Instances of a hierarchy carry their class; a lookalike record does not.
+            if hierarchy && !instance {
+                return self.unsupported("structural values of classes with subclasses", at);
             }
         }
         Ok(())

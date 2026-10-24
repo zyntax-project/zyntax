@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 17009,
+      "start": 117,
+      "length": 4,
+      "file": "this_before_super_error.ts",
+      "message": "'super' must be called before accessing 'this' in the constructor of a derived class."
+    }
+  ],
+  "source_sha256": "809f44e2ef76e8e9ae172dc76ba80ca9dbf4cc8955d1f19cc59ad6c3f2cb6445",
+  "options": {}
+}
