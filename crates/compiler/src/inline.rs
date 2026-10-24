@@ -1773,8 +1773,15 @@ fn convert_args_to_params(
         let Some(actual) = caller.values.get(&arg).map(|v| v.ty.clone()) else {
             continue;
         };
-        let Some(op) = numeric_cast_op(&actual, &param.ty) else {
-            continue;
+        let op = match numeric_cast_op(&actual, &param.ty) {
+            Some(op) => op,
+            // A struct the caller names by its address, as a list header
+            // is: the body reads its fields through that address, so it
+            // must see the struct's type, not the pointer's.
+            None if matches!(param.ty, HirType::Struct(_)) && matches!(actual, HirType::Ptr(_)) => {
+                crate::hir::CastOp::Bitcast
+            }
+            None => continue,
         };
         let converted = HirId::new();
         caller.values.insert(
