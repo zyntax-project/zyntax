@@ -2634,5 +2634,20 @@
     "id": "types/literal_widened_error",
     "file": "cases/types/literal_widened_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "classes/static_fields",
+    "file": "cases/classes/static_fields.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/static_this",
+    "file": "cases/classes/static_this.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/static_tdz",
+    "file": "cases/classes/static_tdz.ts",
+    "mode": "run"
   }
 ]

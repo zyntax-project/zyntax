@@ -33,6 +33,7 @@ mod modules;
 mod namespaces;
 mod params;
 mod statements;
+mod statics;
 mod timing;
 pub(crate) use modules::dependency_source;
 mod unions;
@@ -1325,6 +1326,12 @@ struct Lowerer<'ast, 'program> {
     in_constructor: bool,
     /// Lowering a derived constructor's statements before its `super(...)` call.
     before_super: bool,
+    /// The class `this` names in static methods, initializers and blocks.
+    static_this: Option<InternedString>,
+    /// Classes whose declaration the module body has run.
+    evaluated_classes: FxHashSet<InternedString>,
+    /// While a class's static code runs: the class and its static fields not yet initialized.
+    static_pending: Option<(InternedString, Vec<&'ast str>)>,
     /// Classes this module's class declarations extend, by source name.
     extended_classes: FxHashSet<InternedString>,
     /// Top-level functions, variables and imports, by source name.
@@ -1335,6 +1342,8 @@ struct Lowerer<'ast, 'program> {
     unassigned: FxHashMap<InternedString, Unassigned>,
     flow: FlowState,
     writes: FxHashMap<oxc_semantic::SymbolId, SmallVec<[u32; 2]>>,
+    /// Bindings no expression reads or writes.
+    unreferenced: FxHashSet<oxc_semantic::SymbolId>,
     write_offsets: Vec<u32>,
     declarations: Vec<TypedNode<TypedDeclaration>>,
     returns: Option<ReturnContext>,
@@ -1401,6 +1410,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             class_body: None,
             in_constructor: false,
             before_super: false,
+            static_this: None,
+            evaluated_classes: FxHashSet::default(),
+            static_pending: None,
             extended_classes: FxHashSet::default(),
             top_level_values: FxHashSet::default(),
             hoist: FxHashSet::default(),
@@ -1408,6 +1420,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             unassigned: FxHashMap::default(),
             flow: FlowState::default(),
             writes: FxHashMap::default(),
+            unreferenced: FxHashSet::default(),
             write_offsets: Vec::new(),
             declarations: vec![],
             returns: None,
@@ -1466,6 +1479,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         dependencies: &[ModuleDependency<'_>],
     ) -> Result<TypedProgram> {
         self.declaration_file = program.source_type.is_typescript_definition();
+        let scoping = semantic.scoping();
+        self.unreferenced = scoping
+            .symbol_ids()
+            .filter(|symbol| scoping.get_resolved_reference_ids(*symbol).is_empty())
+            .collect();
         WritePositions {
             scoping: semantic.scoping(),
             positions: &mut self.writes,
@@ -1625,6 +1643,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             if let js::Statement::TSEnumDeclaration(declaration) = item {
                 body.extend(self.run_enum_declaration(declaration));
+                continue;
+            }
+            if let js::Statement::ClassDeclaration(class) = item {
+                body.extend(self.run_class_declaration(class)?);
                 continue;
             }
             if !matches!(
@@ -2429,6 +2451,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let mut statements = prologue;
         let outer_class = std::mem::replace(&mut self.current_class, role.class());
         let outer_body = std::mem::replace(&mut self.class_body, role.body_class());
+        let outer_static = std::mem::replace(
+            &mut self.static_this,
+            match role {
+                FunctionRole::Static(view) => Some(view),
+                _ => None,
+            },
+        );
         let outer_constructor = std::mem::replace(
             &mut self.in_constructor,
             matches!(
@@ -2467,6 +2496,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         }
         self.current_class = outer_class;
         self.class_body = outer_body;
+        self.static_this = outer_static;
         self.in_constructor = outer_constructor;
         statements.splice(0..0, std::mem::take(&mut self.vars.hoisted));
         self.vars = outer_vars;
@@ -4090,10 +4120,21 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         hoisted: bool,
         earlier: Option<Type>,
     ) -> Result<Option<Stmt>> {
-        let Some(annotation) = &d.type_annotation else {
-            return self.unsupported("uninitialized bindings without a type annotation", d.span);
+        let (ty, view) = match &d.type_annotation {
+            Some(annotation) => self.ty(&annotation.type_annotation)?,
+            // A binding nothing uses keeps TypeScript's evolving type `undefined`.
+            None if id
+                .symbol_id
+                .get()
+                .is_some_and(|symbol| self.unreferenced.contains(&symbol)) =>
+            {
+                (undefined(), None)
+            }
+            None => {
+                return self
+                    .unsupported("uninitialized bindings without a type annotation", d.span);
+            }
         };
-        let (ty, view) = self.ty(&annotation.type_annotation)?;
         if matches!(
             ty,
             Type::Union(_) | Type::Function { .. } | Type::TypeVar(_)
@@ -4873,6 +4914,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.super_member(m);
             }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
+                if let Some(read) = self.static_field_read(m)? {
+                    return Ok(read);
+                }
                 if let Some(member) = self.enum_member(e) {
                     return member;
                 }
@@ -5691,6 +5735,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         at: oxc_span::Span,
     ) -> Result<Expr> {
         self.check_namespace_write(receiver, at)?;
+        if let Some(target) = self.static_field_target(receiver, name, at)? {
+            return Ok(target);
+        }
         if let js::Expression::Identifier(id) = receiver {
             if self
                 .binding(id.name.as_str(), id.span)

@@ -83,7 +83,7 @@ impl<'a> Visit<'a> for SuperCalls {
     }
 }
 
-fn access(accessibility: Option<js::TSAccessibility>) -> Access {
+pub(super) fn access(accessibility: Option<js::TSAccessibility>) -> Access {
     match accessibility {
         Some(js::TSAccessibility::Private) => Access::Private,
         Some(js::TSAccessibility::Protected) => Access::Protected,
@@ -137,6 +137,11 @@ pub(super) struct Class<'ast, 'program> {
     pub tag: Option<f64>,
     /// The initializer's key and native component, for classes others extend.
     pub init: Option<(InternedString, String)>,
+    /// Own and inherited static fields.
+    pub static_fields: Vec<statics::StaticField<'ast, 'program>>,
+    pub static_elements: Vec<statics::StaticElement<'ast, 'program>>,
+    /// Set when the class declaration has run, for classes with static members.
+    pub ready: Option<InternedString>,
     pub span: oxc_span::Span,
 }
 
@@ -183,6 +188,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         // Every class of a hierarchy carries its class in a hidden field, for dispatch.
         let tag = (base.is_some() || self.extended_classes.contains(&name))
             .then(|| self.class_order.len() as f64);
+        let mut static_fields: Vec<statics::StaticField<'ast, 'program>> = base
+            .map(|base| {
+                self.classes[&base]
+                    .static_fields
+                    .iter()
+                    .map(|f| statics::StaticField {
+                        owner: Some(f.owner.unwrap_or(base)),
+                        ..f.clone()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut static_elements = vec![];
         let (mut fields, mut methods, mut statics) = match base {
             Some(base) => {
                 let parent = &self.classes[&base];
@@ -223,7 +241,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             match element {
                 js::ClassElement::PropertyDefinition(p) => {
                     if p.r#static {
-                        return self.unsupported("static fields", p.span);
+                        let name =
+                            self.declare_static_field(source, p, &mut static_fields, &statics)?;
+                        static_elements.push(statics::StaticElement::Field(name));
+                        continue;
                     }
                     if p.computed
                         || p.declare
@@ -314,6 +335,22 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             if !own_members.insert(method) {
                                 return self.unsupported("function overloads", m.span);
                             }
+                            if m.r#static
+                                && let Some(field) = static_fields.iter().find(|f| f.name == method)
+                            {
+                                if field.owner.is_none() {
+                                    return self.error(
+                                        ErrorKind::Type,
+                                        "duplicate identifier",
+                                        m.span,
+                                    );
+                                }
+                                return self.error(
+                                    ErrorKind::Type,
+                                    format!("class `{source}` static side incorrectly extends its base class static side: property `{method}`"),
+                                    m.span,
+                                );
+                            }
                             let access = access(m.accessibility);
                             let (table, key) = if m.r#static {
                                 (&mut statics, intern(&format!("{source}::{method}")))
@@ -357,11 +394,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         }
                     }
                 }
+                js::ClassElement::StaticBlock(block) => {
+                    static_elements.push(statics::StaticElement::Block(block));
+                }
                 _ => {
-                    return self.unsupported(
-                        "class static blocks, accessor properties or index signatures",
-                        class.span,
-                    );
+                    return self.unsupported("accessor properties or index signatures", class.span);
                 }
             }
         }
@@ -493,9 +530,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 constructor_access,
                 tag,
                 init,
+                static_fields,
+                static_elements,
+                ready: None,
                 span: class.span,
             },
         );
+        self.declare_static_globals(view, source);
         Ok(())
     }
 
@@ -753,7 +794,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         self.classes.values().any(|class| class.ty == *ty)
     }
 
-    fn class_key(&self, key: &js::PropertyKey<'ast>) -> Result<&'ast str> {
+    pub(super) fn class_key(&self, key: &js::PropertyKey<'ast>) -> Result<&'ast str> {
         match key {
             js::PropertyKey::StaticIdentifier(i) => Ok(i.name.as_str()),
             js::PropertyKey::PrivateIdentifier(p) => self.unsupported("private names", p.span),
@@ -1211,6 +1252,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     /// `super.name` outside a call: fields are not reachable through `super`.
     pub(super) fn super_member(&mut self, m: &js::StaticMemberExpression<'ast>) -> Result<Expr> {
         let name = m.property.name.as_str();
+        if self.static_this.is_some() {
+            if let Some(read) = self.static_field_read(m)? {
+                return Ok(read);
+            }
+            return self.unsupported("super property values in static code", m.span);
+        }
         let base = self
             .current_class
             .and_then(|view| self.classes.get(&view))
@@ -1432,7 +1479,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     /// A private member is used only in its class's body; a protected one also in subclasses.
-    fn check_member_access(
+    pub(super) fn check_member_access(
         &self,
         owner: InternedString,
         access: Access,
@@ -1500,32 +1547,38 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         m: &js::StaticMemberExpression<'ast>,
     ) -> Result<Option<Expr>> {
         let name = m.property.name.as_str();
-        if let js::Expression::Identifier(id) = &m.object {
-            let class_name = self.name(id.name.as_str());
-            if !self.scopes.iter().any(|s| s.contains_key(&class_name)) {
-                if let Some(view) = self.class_names.get(&class_name).copied() {
-                    let Some(member) = self.classes[&view].statics.get(name) else {
-                        return self.error(
-                            ErrorKind::Type,
-                            format!("property `{name}` does not exist on class `{}`", id.name),
-                            m.span,
-                        );
-                    };
-                    let (key, access, owner) =
-                        (member.key, member.access, member.owner.unwrap_or(view));
-                    self.check_member_access(owner, access, name, m.span)?;
-                    let sig = self.signatures[&key].clone();
-                    return self
-                        .call_with_signature(
-                            sig,
-                            &c.arguments,
-                            c.type_arguments.as_deref(),
-                            None,
-                            c.span,
-                        )
-                        .map(Some);
+        if let Some((view, through_this)) = self.static_receiver(&m.object) {
+            let Some(member) = self.classes[&view].statics.get(name) else {
+                if self.classes[&view]
+                    .static_fields
+                    .iter()
+                    .any(|f| f.name == name)
+                {
+                    return Ok(None);
                 }
+                return self.error(
+                    ErrorKind::Type,
+                    format!("property `{name}` does not exist on this class"),
+                    m.span,
+                );
+            };
+            // In a static method `this` is whichever class the call names.
+            if through_this
+                && self.class_order.iter().any(|other| {
+                    *other != view
+                        && self.is_subclass(*other, view)
+                        && self.classes[other].statics[name].owner.is_none()
+                })
+            {
+                return self
+                    .unsupported("static this with methods overridden in subclasses", m.span);
             }
+            let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
+            self.check_member_access(owner, access, name, m.span)?;
+            let sig = self.signatures[&key].clone();
+            return self
+                .call_with_signature(sig, &c.arguments, c.type_arguments.as_deref(), None, c.span)
+                .map(Some);
         }
         if let js::Expression::Super(s) = &m.object {
             return self.super_method_call(c, name, s.span).map(Some);

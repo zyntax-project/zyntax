@@ -512,7 +512,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Some(Self::set_flag(flag, at))
     }
 
-    fn set_flag(flag: InternedString, at: oxc_span::Span) -> Stmt {
+    pub(super) fn set_flag(flag: InternedString, at: oxc_span::Span) -> Stmt {
         expression(binary(
             BinaryOp::Assign,
             var(flag, boolean(), at),
