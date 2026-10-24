@@ -778,6 +778,9 @@ pub(crate) struct MemLoc {
     /// The root's pointee type when it is an exact struct type: the
     /// root points at an object of that type.
     exact_type: Option<InternedString>,
+    /// The access is into a list header: the chain to the root passes a
+    /// value typed as one.
+    in_header: bool,
 }
 
 /// Where a location's root pointer comes from.
@@ -792,6 +795,10 @@ enum RootKind {
     /// A module global: storage the compiler owns, which no object
     /// pointer points into.
     Global,
+    /// A list's element storage, read from offset 0 of its header. Only
+    /// the list's own operations allocate and reallocate it, so it lies
+    /// inside no object and no header; two of them may still be one.
+    Buffer,
     /// A phi, a loaded pointer, a call's result or anything else: it
     /// may name the same object as any root but a global.
     Unknown,
@@ -806,7 +813,7 @@ impl MemLoc {
     /// prove two objects; then the offsets do not matter. One root is
     /// compared by byte range.
     pub(crate) fn may_alias(&self, other: &MemLoc) -> bool {
-        if self.distinct_exact_objects(other) {
+        if self.distinct_exact_objects(other) || self.buffer_against_object(other) {
             return false;
         }
         match (self.root, other.root) {
@@ -854,12 +861,24 @@ impl MemLoc {
         )
     }
 
+    /// Whether one side is in a list's element storage and the other in
+    /// an object of an exact struct type or in a list header, which that
+    /// storage never overlaps.
+    fn buffer_against_object(&self, other: &MemLoc) -> bool {
+        let object = |m: &MemLoc| m.exact_type.is_some() || m.in_header;
+        (self.root_kind == RootKind::Buffer && other.root_kind != RootKind::Buffer && object(other))
+            || (other.root_kind == RootKind::Buffer
+                && self.root_kind != RootKind::Buffer
+                && object(self))
+    }
+
     /// Whether the two locations provably never overlap, without the
     /// assumption [`Self::may_alias`] makes that distinct roots name
     /// distinct objects: they lie in objects of two different exact
-    /// struct types.
+    /// struct types, or one is a list's element storage and the other an
+    /// object or a header.
     pub(crate) fn provably_disjoint(&self, other: &MemLoc) -> bool {
-        self.distinct_exact_objects(other)
+        self.distinct_exact_objects(other) || self.buffer_against_object(other)
     }
 }
 
@@ -880,6 +899,8 @@ pub(crate) enum AddrLink {
     Field { aggregate: HirId, index: u32 },
     /// An allocation this function makes: a root, and a fresh object.
     Fresh,
+    /// A list's element storage read from its header: a root.
+    Buffer,
 }
 
 /// Build a `HirId → AddrLink` lookup over every `Cast` / `GEP`
@@ -986,6 +1007,15 @@ pub(crate) fn build_addr_index(
                 }
                 None => {
                     loaded_from.insert((root, offset), *result);
+                    // A header's first word is its element storage.
+                    if offset == 0
+                        && func
+                            .values
+                            .get(ptr)
+                            .is_some_and(|v| crate::ssa::is_list_header(&v.ty))
+                    {
+                        idx.insert(*result, AddrLink::Buffer);
+                    }
                 }
             }
         }
@@ -1008,8 +1038,15 @@ pub(crate) fn extract_mem_loc(
     let mut current = identity_subst.get(&ptr).copied().unwrap_or(ptr);
     let mut total_offset: u64 = 0;
     let mut offset_known = true;
+    let header = |id: HirId| {
+        func.values
+            .get(&id)
+            .is_some_and(|v| crate::ssa::is_list_header(&v.ty))
+    };
+    let mut in_header = header(current);
     // Cap the chase depth so a malformed SSA graph can't lock up.
     for _ in 0..32 {
+        in_header |= header(current);
         match addr_index.get(&current) {
             Some(AddrLink::Cast(operand)) => {
                 current = identity_subst.get(operand).copied().unwrap_or(*operand);
@@ -1033,7 +1070,7 @@ pub(crate) fn extract_mem_loc(
                 }
                 current = identity_subst.get(base).copied().unwrap_or(*base);
             }
-            Some(AddrLink::Fresh) | None => break,
+            Some(AddrLink::Fresh | AddrLink::Buffer) | None => break,
         }
     }
     let root_value = func.values.get(&current);
@@ -1041,6 +1078,7 @@ pub(crate) fn extract_mem_loc(
         Some(crate::hir::HirValueKind::Parameter(_)) => RootKind::Param,
         Some(crate::hir::HirValueKind::Global(_)) => RootKind::Global,
         _ if matches!(addr_index.get(&current), Some(AddrLink::Fresh)) => RootKind::Fresh,
+        _ if matches!(addr_index.get(&current), Some(AddrLink::Buffer)) => RootKind::Buffer,
         _ => RootKind::Unknown,
     };
     let exact_type = match root_value.map(|v| &v.ty) {
@@ -1060,6 +1098,7 @@ pub(crate) fn extract_mem_loc(
         size,
         root_kind,
         exact_type,
+        in_header,
     }
 }
 
@@ -1888,6 +1927,61 @@ mod tests {
                     is_tail: false,
                 });
             (fresh, param)
+        }));
+    }
+
+    /// The element storage `header` names, read from its first word in
+    /// `entry`.
+    fn elements_of(f: &mut HirFunction, entry: HirId, header: HirId) -> HirId {
+        let elements = add_inst(f, HirType::Ptr(std::sync::Arc::new(HirType::I64)));
+        f.blocks
+            .get_mut(&entry)
+            .unwrap()
+            .instructions
+            .push(HirInstruction::Load {
+                result: elements,
+                ty: HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+                ptr: header,
+                align: 8,
+                volatile: false,
+            });
+        elements
+    }
+
+    /// A list's element storage is not its header: a read of the length
+    /// leaves the loop past a store to an element.
+    #[test]
+    fn an_element_store_leaves_the_list_header_alone() {
+        assert!(hoists_past_store(|f, entry, _| {
+            let header_ty = HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type()));
+            let header = add_param(f, header_ty, 0);
+            let elements = elements_of(f, entry, header);
+            let eight = add_i64_const(f, 8);
+            let length = add_inst(f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+            f.blocks
+                .get_mut(&entry)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::GetElementPtr {
+                    result: length,
+                    ty: HirType::U8,
+                    ptr: header,
+                    indices: vec![eight],
+                });
+            (elements, length)
+        }));
+    }
+
+    /// Two lists' element storage may be one, as two headers read from
+    /// one place are: a read through one stays in the loop past a store
+    /// through the other.
+    #[test]
+    fn two_lists_elements_may_alias() {
+        assert!(!hoists_past_store(|f, entry, _| {
+            let header_ty = HirType::Ptr(std::sync::Arc::new(crate::ssa::list_header_type()));
+            let first = add_param(f, header_ty.clone(), 0);
+            let second = add_param(f, header_ty, 1);
+            (elements_of(f, entry, first), elements_of(f, entry, second))
         }));
     }
 
