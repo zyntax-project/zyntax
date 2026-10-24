@@ -17,7 +17,7 @@ fn extended_records_keep_unmodelled_forms_explicit() {
         ),
         (
             "class C implements I { f(): void {} }\ninterface I { f(): void }",
-            "interface method",
+            "implementing interfaces with methods",
         ),
         (
             "declare class C { x: number }\ninterface C { y: number }\nclass D implements C { y = 1; }",
@@ -70,4 +70,30 @@ fn unresolved_declarations_report_the_declaration_that_fails() {
     let missing = "type T = S[];\nconst t = 1;";
     let error = zyntax_ts::parse_program(missing, "aliases.ts", Default::default()).unwrap_err();
     assert_eq!(error.kind, zyntax_ts::ErrorKind::Type, "{error}");
+}
+
+#[test]
+fn interfaces_with_methods_are_types_without_values() {
+    let kind = |source: &str| {
+        zyntax_ts::parse_program(source, "methods.ts", Default::default())
+            .map(|_| ())
+            .map_err(|error| error.kind)
+    };
+    use zyntax_ts::ErrorKind::{Type, Unsupported};
+    assert_eq!(
+        kind("interface I { x: number; m(): number }\nfunction f(i: I): number { return i.x; }"),
+        Ok(())
+    );
+    assert_eq!(
+        kind("interface I { x: number; m(): number }\nvar a: I;\nconsole.log(a.x);"),
+        Err(Type)
+    );
+    assert_eq!(
+        kind("interface I { x: number; m(): number }\nconst a: I = { x: 1 };"),
+        Err(Unsupported)
+    );
+    assert_eq!(
+        kind("interface I { x: number; m(): number }\nfunction f(i: I): number { return i.m(); }"),
+        Err(Unsupported)
+    );
 }

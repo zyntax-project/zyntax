@@ -779,6 +779,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if self.class_names.contains_key(&key) {
                 return self.unsupported("classes implementing classes", clause.span);
             }
+            if view.is_some_and(|v| self.method_views.contains_key(&v)) {
+                return self.unsupported("implementing interfaces with methods", clause.span);
+            }
             let Some(view) = view.and_then(|v| self.views.get(&v)) else {
                 return self.unsupported("implementing this type", clause.span);
             };

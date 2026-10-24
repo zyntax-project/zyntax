@@ -1317,6 +1317,8 @@ struct Lowerer<'ast, 'program> {
     ambient: FxHashSet<InternedString>,
     /// Every declaration in a `.d.ts` file is ambient.
     declaration_file: bool,
+    /// Interfaces declaring methods, by view: their values cannot be built yet.
+    method_views: FxHashMap<InternedString, Vec<InternedString>>,
     /// Native names of `declare function` signatures, which have no body to call.
     ambient_functions: FxHashSet<InternedString>,
     source_text: &'ast str,
@@ -1406,6 +1408,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             top_level: false,
             ambient: FxHashSet::default(),
             declaration_file: false,
+            method_views: FxHashMap::default(),
             ambient_functions: FxHashSet::default(),
             source_text: "",
             classes: FxHashMap::default(),
@@ -1785,10 +1788,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if self.aliases.contains_key(&name) {
                     return self.unsupported("declaration merging", i.span);
                 }
-                let fields = self.fields(&i.body.body)?;
+                let mut methods = vec![];
+                let fields = self.members(&i.body.body, Some(&mut methods))?;
+                if !methods.is_empty() && !i.extends.is_empty() {
+                    return self.unsupported("extending interfaces with methods", i.span);
+                }
                 if i.extends.is_empty() {
                     let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
                     let view = self.record_view(i.id.name.as_str(), &ty, fields);
+                    if !methods.is_empty() {
+                        self.method_views.insert(view, methods);
+                    }
                     self.aliases.insert(name, (ty, Some(view)));
                 } else {
                     let (ty, view) = self.extended_interface(i, fields)?;
@@ -1849,8 +1859,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn fields(&mut self, members: &[js::TSSignature<'ast>]) -> Result<Fields<'ast>> {
+        self.members(members, None)
+    }
+
+    /// Property signatures as fields; method signatures are collected into `methods` when the
+    /// declaration allows them.
+    fn members(
+        &mut self,
+        members: &[js::TSSignature<'ast>],
+        mut methods: Option<&mut Vec<InternedString>>,
+    ) -> Result<Fields<'ast>> {
         let mut fields = Fields::new();
         for member in members {
+            if let (js::TSSignature::TSMethodSignature(m), Some(methods)) =
+                (member, methods.as_mut())
+                && !m.computed
+                && !m.optional
+                && m.kind == js::TSMethodSignatureKind::Method
+            {
+                let name = self.key(&m.key)?;
+                methods.push(self.name(name));
+                continue;
+            }
             let js::TSSignature::TSPropertySignature(p) = member else {
                 return self.unsupported("interface method or index signatures", member.span());
             };
@@ -1955,6 +1985,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             };
             if self.class_names.contains_key(&base_name) {
                 return self.unsupported("interfaces extending classes", heritage.span);
+            }
+            if base_view.is_some_and(|v| self.method_views.contains_key(&v)) {
+                return self.unsupported("extending interfaces with methods", heritage.span);
             }
             let Some(view) = base_view.and_then(|v| self.views.get(&v)).cloned() else {
                 return self.unsupported("interfaces extending this type", heritage.span);
@@ -3627,6 +3660,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         to: Option<InternedString>,
         at: oxc_span::Span,
     ) -> Result<()> {
+        // Only a value already of such an interface carries its methods.
+        if to.is_some_and(|to| self.method_views.contains_key(&to)) && from != to {
+            return self.unsupported("values of interfaces with methods", at);
+        }
         self.check_class_target(from, to, at)?;
         if self.options.soundness == Soundness::Checked {
             if let Some(from) = from.and_then(|n| self.views.get(&n)) {
@@ -5264,6 +5301,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         at: oxc_span::Span,
     ) -> Result<Expr> {
         let object = self.expr(receiver)?;
+        if self
+            .view_of(receiver)
+            .and_then(|view| self.method_views.get(&view))
+            .is_some_and(|methods| methods.contains(&self.name(name)))
+        {
+            return self.unsupported("methods of interface values", at);
+        }
         if element_type(&object.ty).is_some() && name == "length" {
             return Ok(self.array_length(object, at));
         }
