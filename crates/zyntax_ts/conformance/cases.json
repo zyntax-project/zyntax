@@ -2669,5 +2669,10 @@
     "id": "classes/abstract_missing_error",
     "file": "cases/classes/abstract_missing_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "classes/accessors",
+    "file": "cases/classes/accessors.ts",
+    "mode": "run"
   }
 ]

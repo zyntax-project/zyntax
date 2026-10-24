@@ -2991,6 +2991,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             if self.record_subtype(actual, expected) {
                 return Ok(());
             }
+            // A class's accessors are not fields a record view can read.
+            if self.classes.values().any(|class| {
+                class.ty == *actual && !(class.getters.is_empty() && class.setters.is_empty())
+            }) {
+                return self.unsupported("structural values of classes with accessors", at);
+            }
             // A record lacks the class field every instance of a hierarchy carries.
             if matches!(actual, Type::Named { .. })
                 && self
@@ -5312,6 +5318,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         {
             return self.unsupported("methods of interface values", at);
         }
+        let object = match self.accessor_read(receiver, object, name, at)? {
+            Ok(call) => return Ok(call),
+            Err(object) => object,
+        };
         if element_type(&object.ty).is_some() && name == "length" {
             return Ok(self.array_length(object, at));
         }
@@ -5843,6 +5853,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if let Some(target) = self.static_field_target(receiver, name, at)? {
             return Ok(target);
         }
+        if self.accessor_class(receiver, name).is_some() {
+            return self.unsupported("updates of accessors", at);
+        }
         if let js::Expression::Identifier(id) = receiver {
             if self
                 .binding(id.name.as_str(), id.span)
@@ -5884,6 +5897,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn assignment(&mut self, a: &js::AssignmentExpression<'ast>) -> Result<Expr> {
+        let member = match &a.left {
+            js::AssignmentTarget::StaticMemberExpression(m) => {
+                Some((&m.object, m.property.name.as_str()))
+            }
+            js::AssignmentTarget::PrivateFieldExpression(p) if !p.optional => {
+                Some((&p.object, classes::private_name(self.source_text, &p.field)))
+            }
+            _ => None,
+        };
+        if let Some((object, name)) = member
+            && let Some(view) = self.accessor_class(object, name)
+        {
+            if a.operator.as_str() != "=" {
+                return self.unsupported("compound assignments to accessors", a.span);
+            }
+            return self.accessor_write(view, object, name, &a.right, a.span);
+        }
         let target = match &a.left {
             js::AssignmentTarget::AssignmentTargetIdentifier(i) => {
                 let b = self.binding(i.name.as_str(), a.span)?;

@@ -41,6 +41,27 @@ impl FunctionRole {
     }
 }
 
+/// Which member table a dispatched name lives in.
+#[derive(Clone, Copy)]
+pub(super) enum MemberTable {
+    Methods,
+    Getters,
+    Setters,
+}
+
+impl MemberTable {
+    fn of<'c, 'ast, 'program>(
+        self,
+        class: &'c Class<'ast, 'program>,
+    ) -> &'c FxHashMap<&'ast str, Member> {
+        match self {
+            Self::Methods => &class.methods,
+            Self::Getters => &class.getters,
+            Self::Setters => &class.setters,
+        }
+    }
+}
+
 /// The hidden field holding an instance's class in a hierarchy with subclasses.
 pub(super) const CLASS_TAG: &str = "\0class";
 
@@ -88,6 +109,23 @@ impl<'a> Visit<'a> for ThisReturns {
     fn visit_function(&mut self, _: &js::Function<'a>, _: oxc_semantic::ScopeFlags) {}
 
     fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'a>) {}
+}
+
+/// Whether a body returns a value on some path, outside nested functions.
+fn returns_value(f: &js::Function<'_>) -> bool {
+    struct Valued(bool);
+    impl<'a> Visit<'a> for Valued {
+        fn visit_return_statement(&mut self, it: &js::ReturnStatement<'a>) {
+            self.0 |= it.argument.is_some();
+        }
+        fn visit_function(&mut self, _: &js::Function<'a>, _: oxc_semantic::ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'a>) {}
+    }
+    let mut valued = Valued(false);
+    if let Some(body) = &f.body {
+        valued.visit_function_body(body);
+    }
+    valued.0
 }
 
 /// Whether a `super(...)` call occurs.
@@ -142,6 +180,9 @@ pub(super) struct Class<'ast, 'program> {
     pub constructor_key: InternedString,
     pub component: String,
     pub methods: FxHashMap<&'ast str, Member>,
+    /// Instance accessors by property name, own and inherited.
+    pub getters: FxHashMap<&'ast str, Member>,
+    pub setters: FxHashMap<&'ast str, Member>,
     pub statics: FxHashMap<&'ast str, Member>,
     /// Method bodies in source order, with the native-symbol component of each.
     pub bodies: Vec<(
@@ -271,6 +312,31 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             None => Default::default(),
         };
+        let (mut getters, mut setters): (
+            FxHashMap<&'ast str, Member>,
+            FxHashMap<&'ast str, Member>,
+        ) = match base {
+            Some(base) => {
+                let parent = &self.classes[&base];
+                let inherit = |table: &FxHashMap<&'ast str, Member>| {
+                    table
+                        .iter()
+                        .map(|(k, m)| {
+                            (
+                                *k,
+                                Member {
+                                    key: m.key,
+                                    access: m.access,
+                                    owner: Some(m.owner.unwrap_or(base)),
+                                },
+                            )
+                        })
+                        .collect()
+                };
+                (inherit(&parent.getters), inherit(&parent.setters))
+            }
+            None => Default::default(),
+        };
         let mut constructor = None;
         let mut constructor_access = Access::Public;
         let mut own_members: FxHashSet<&'ast str> = FxHashSet::default();
@@ -329,6 +395,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     };
                     if fields.iter().any(|f| f.name == field && f.owner.is_none()) {
                         return self.error(ErrorKind::Type, "duplicate identifier", p.span);
+                    }
+                    for table in [&getters, &setters] {
+                        if let Some(accessor) = table.get(field) {
+                            if accessor.owner.is_none() {
+                                return self.error(ErrorKind::Type, "duplicate identifier", p.span);
+                            }
+                            return self.unsupported("fields overriding accessors", p.span);
+                        }
                     }
                     let redeclared = self.check_inherited_member(
                         source,
@@ -458,7 +532,80 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             bodies.push((key, component, &*m.value, m.r#static));
                         }
                         js::MethodDefinitionKind::Get | js::MethodDefinitionKind::Set => {
-                            return self.unsupported("accessors", m.span);
+                            if m.r#static {
+                                return self.unsupported("static accessors", m.span);
+                            }
+                            let property = self.class_key(&m.key)?;
+                            let getter = m.kind == js::MethodDefinitionKind::Get;
+                            if let Some(field) = fields.iter().find(|f| f.name == property) {
+                                if field.owner.is_none() {
+                                    return self.error(
+                                        ErrorKind::Type,
+                                        "duplicate identifier",
+                                        m.span,
+                                    );
+                                }
+                                return self.unsupported("accessors overriding fields", m.span);
+                            }
+                            if let Some(method) = methods.get(property) {
+                                if method.owner.is_none() {
+                                    return self.error(
+                                        ErrorKind::Type,
+                                        "duplicate identifier",
+                                        m.span,
+                                    );
+                                }
+                                return self.unsupported("accessors overriding methods", m.span);
+                            }
+                            let access = member_access(property, m.accessibility);
+                            let table = if getter { &mut getters } else { &mut setters };
+                            if let Some(inherited) = table.get(property) {
+                                if inherited.owner.is_none() {
+                                    return self.error(
+                                        ErrorKind::Type,
+                                        "duplicate identifier",
+                                        m.span,
+                                    );
+                                }
+                                self.check_override_access(
+                                    source, property, inherited, access, m.span,
+                                )?;
+                            }
+                            // TypeScript types an unannotated setter parameter by the getter.
+                            if !getter
+                                && m.value.params.items.first().is_some_and(|p| p.type_annotation.is_none())
+                                && class.body.body.iter().any(|element| {
+                                    matches!(element, js::ClassElement::MethodDefinition(other)
+                                        if other.kind == js::MethodDefinitionKind::Get
+                                            && other.r#static == m.r#static
+                                            && self.class_key(&other.key).is_ok_and(|key| key == property))
+                                })
+                            {
+                                return self.unsupported(
+                                    "setter parameter types taken from the getter",
+                                    m.span,
+                                );
+                            }
+                            if getter && !returns_value(&m.value) {
+                                return self.error(
+                                    ErrorKind::Type,
+                                    "a 'get' accessor must return a value",
+                                    m.key.span(),
+                                );
+                            }
+                            let kind = if getter { "get" } else { "set" };
+                            let component = format!("{source}.{kind} {property}");
+                            let key = intern(&component);
+                            table.insert(
+                                property,
+                                Member {
+                                    key,
+                                    access,
+                                    owner: None,
+                                },
+                            );
+                            nominal = true;
+                            bodies.push((key, component, &*m.value, false));
                         }
                     }
                 }
@@ -591,7 +738,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 (key, component, f, role)
             })
             .collect();
-        self.check_implements(class, &fields)?;
+        let accessor_names: Vec<InternedString> = getters
+            .keys()
+            .chain(setters.keys())
+            .map(|name| self.name(name))
+            .collect();
+        self.check_implements(class, &fields, &accessor_names)?;
         let init = self.extended_classes.contains(&name).then(|| {
             (
                 intern(&format!("{source}\0init")),
@@ -610,6 +762,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 constructor_key: intern(&format!("{source}\0new")),
                 component: format!("{source}\0new"),
                 methods,
+                getters,
+                setters,
                 statics,
                 bodies,
                 base,
@@ -862,6 +1016,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         &self,
         class: &js::Class<'ast>,
         fields: &[ClassField<'ast, 'program>],
+        accessor_names: &[InternedString],
     ) -> Result<()> {
         for clause in &class.implements {
             let js::TSTypeName::IdentifierReference(name) = &clause.expression else {
@@ -895,6 +1050,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             };
             for required in &view.fields {
                 let property = required.name.resolve_global().unwrap_or_default();
+                if accessor_names.contains(&required.name) {
+                    return self
+                        .unsupported("accessors implementing interface fields", clause.span);
+                }
                 let found = fields.iter().find(|f| self.name(f.name) == required.name);
                 let matches = found.is_some_and(|f| {
                     f.access == Access::Public
@@ -1442,7 +1601,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 m.span,
             );
         }
-        if !self.classes[&base].methods.contains_key(name) {
+        let class = &self.classes[&base];
+        if !class.methods.contains_key(name)
+            && !class.getters.contains_key(name)
+            && !class.setters.contains_key(name)
+        {
             return self.error(
                 ErrorKind::Type,
                 format!("property `{name}` does not exist on the base class"),
@@ -1797,6 +1960,114 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         Ok(Some(call))
     }
 
+    /// `receiver.name` through a getter, when the receiver's class declares an accessor `name`.
+    pub(super) fn accessor_read(
+        &mut self,
+        receiver: &js::Expression<'ast>,
+        object: Expr,
+        name: &str,
+        at: oxc_span::Span,
+    ) -> Result<std::result::Result<Expr, Expr>> {
+        let Some(view) = self
+            .view_of(receiver)
+            .filter(|v| self.classes.contains_key(v))
+        else {
+            return Ok(Err(object));
+        };
+        let class = &self.classes[&view];
+        let Some(getter) = class.getters.get(name) else {
+            if class.setters.contains_key(name) {
+                return self.unsupported("reading accessors without a getter", at);
+            }
+            return Ok(Err(object));
+        };
+        let (key, access, owner) = (getter.key, getter.access, getter.owner.unwrap_or(view));
+        self.check_member_access(owner, access, name, at)?;
+        let receiver = self.upcast(object, owner, at);
+        let sig = &self.signatures[&key];
+        let stripped = Arc::new(Signature {
+            params: sig.params[1..].to_vec(),
+            ..(**sig).clone()
+        });
+        let call = self.call_with_signature(stripped, &[], None, Some(receiver), at)?;
+        self.dispatch_in(view, name, key, call, at, MemberTable::Getters)
+            .map(Ok)
+    }
+
+    /// The class view of a receiver whose class declares an accessor `name`.
+    pub(super) fn accessor_class(
+        &self,
+        receiver: &js::Expression<'ast>,
+        name: &str,
+    ) -> Option<InternedString> {
+        let view = self
+            .view_of(receiver)
+            .filter(|v| self.classes.contains_key(v))?;
+        let class = &self.classes[&view];
+        (class.getters.contains_key(name) || class.setters.contains_key(name)).then_some(view)
+    }
+
+    /// `receiver.name = value` through a setter: the value is the expression's result.
+    pub(super) fn accessor_write(
+        &mut self,
+        view: InternedString,
+        receiver: &js::Expression<'ast>,
+        name: &str,
+        value: &js::Expression<'ast>,
+        at: oxc_span::Span,
+    ) -> Result<Expr> {
+        let Some(setter) = self.classes[&view].setters.get(name) else {
+            return self.error(
+                ErrorKind::Type,
+                format!("cannot assign to `{name}` because it is a read-only property"),
+                at,
+            );
+        };
+        let (key, access, owner) = (setter.key, setter.access, setter.owner.unwrap_or(view));
+        self.check_member_access(owner, access, name, at)?;
+        let object = self.expr(receiver)?;
+        let receiver = self.upcast(object, owner, at);
+        let sig = self.signatures[&key].clone();
+        let expected = sig.params[1].ty.clone();
+        let assigned = self.expr_expected(value, &expected)?;
+        self.expect(self.source_type(value, &assigned.ty), &expected, at)?;
+        self.check_view(self.view_of(value), sig.params[1].view, at)?;
+        let assigned = self.adapt_value(assigned, &expected, at)?;
+        let temporary = self.fresh("assigned");
+        let call = node(
+            TypedExpression::Call(TypedCall {
+                callee: Box::new(var(sig.native, Type::Any, at)),
+                positional_args: vec![receiver, var(temporary, expected.clone(), at)],
+                named_args: vec![],
+                type_args: vec![],
+            }),
+            unit(),
+            at,
+        );
+        let call = self.dispatch_in(view, name, key, call, at, MemberTable::Setters)?;
+        Ok(node(
+            TypedExpression::Block(TypedBlock {
+                statements: vec![
+                    stmt(
+                        TypedStatement::Let(TypedLet {
+                            name: temporary,
+                            ty: expected.clone(),
+                            mutability: Mutability::Immutable,
+                            initializer: Some(Box::new(assigned)),
+                            span: span(at),
+                        }),
+                        at,
+                    ),
+                    expression(call),
+                    expression(var(temporary, expected.clone(), at)),
+                ],
+                span: span(at),
+            }),
+            expected,
+            at,
+        ))
+    }
+
     /// `super.method(...)`: the base class's implementation, called on `this`.
     fn super_method_call(
         &mut self,
@@ -1919,13 +2190,25 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         call: Expr,
         at: oxc_span::Span,
     ) -> Result<Expr> {
+        self.dispatch_in(view, name, key, call, at, MemberTable::Methods)
+    }
+
+    pub(super) fn dispatch_in(
+        &mut self,
+        view: InternedString,
+        name: &str,
+        key: InternedString,
+        call: Expr,
+        at: oxc_span::Span,
+        table: MemberTable,
+    ) -> Result<Expr> {
         let mut overrides: Vec<(InternedString, InternedString, Vec<f64>)> = vec![];
         for subclass in self.class_order.clone() {
             if subclass == view || !self.is_subclass(subclass, view) {
                 continue;
             }
             let class = &self.classes[&subclass];
-            let member = &class.methods[name];
+            let member = &table.of(class)[name];
             if member.key == key {
                 continue;
             }
