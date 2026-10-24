@@ -206,6 +206,16 @@ impl Loader<'_> {
                 let Some(source) = lower::dependency_source(statement) else {
                     continue;
                 };
+                // A source or deferred phase import names a module the program does not execute.
+                if let oxc_ast::ast::Statement::ImportDeclaration(import) = statement
+                    && import.phase.is_some()
+                {
+                    return Err(diagnostic(Error::new(
+                        ErrorKind::Unsupported,
+                        "source and deferred import phases are not implemented yet",
+                        import.span,
+                    )));
+                }
                 if source.lone_surrogates {
                     return Err(diagnostic(Error::new(
                         ErrorKind::Unsupported,

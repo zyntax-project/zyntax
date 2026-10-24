@@ -92,7 +92,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("class inheritance", class.span);
         }
 
-        if class.r#abstract || class.declare || !class.decorators.is_empty() {
+        if class.r#abstract
+            || class.declare
+            || self.declaration_file
+            || !class.decorators.is_empty()
+        {
             return self.unsupported("abstract, ambient or decorated classes", class.span);
         }
         let name = self.name(id.name.as_str());

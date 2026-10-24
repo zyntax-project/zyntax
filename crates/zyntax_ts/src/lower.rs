@@ -64,6 +64,75 @@ fn undefined() -> Type {
 fn is_undefined(ty: &Type) -> bool {
     matches!(ty, Type::Optional(inner) if **inner == Type::Never)
 }
+/// Values the standard library declares globally, which the frontend does not model yet.
+fn library_value(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "Object",
+        "Function",
+        "String",
+        "Number",
+        "Boolean",
+        "Symbol",
+        "BigInt",
+        "Date",
+        "RegExp",
+        "Error",
+        "EvalError",
+        "RangeError",
+        "ReferenceError",
+        "SyntaxError",
+        "TypeError",
+        "URIError",
+        "AggregateError",
+        "SuppressedError",
+        "Array",
+        "Map",
+        "Set",
+        "WeakMap",
+        "WeakSet",
+        "WeakRef",
+        "FinalizationRegistry",
+        "Promise",
+        "Proxy",
+        "Reflect",
+        "JSON",
+        "Math",
+        "Intl",
+        "Atomics",
+        "Iterator",
+        "ArrayBuffer",
+        "SharedArrayBuffer",
+        "DataView",
+        "Int8Array",
+        "Uint8Array",
+        "Uint8ClampedArray",
+        "Int16Array",
+        "Uint16Array",
+        "Int32Array",
+        "Uint32Array",
+        "Float16Array",
+        "Float32Array",
+        "Float64Array",
+        "BigInt64Array",
+        "BigUint64Array",
+        "DisposableStack",
+        "AsyncDisposableStack",
+        "globalThis",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "encodeURI",
+        "encodeURIComponent",
+        "decodeURI",
+        "decodeURIComponent",
+        "escape",
+        "unescape",
+        "eval",
+    ];
+    NAMES.contains(&name)
+}
+
 /// Types the standard and DOM libraries declare, which the frontend does not model yet.
 fn library_type(name: &str) -> bool {
     const NAMES: &[&str] = &[
@@ -1245,6 +1314,8 @@ struct Lowerer<'ast, 'program> {
     top_level: bool,
     /// Bindings an ambient `declare` names, by native name; they have no native value.
     ambient: FxHashSet<InternedString>,
+    /// Every declaration in a `.d.ts` file is ambient.
+    declaration_file: bool,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
@@ -1314,6 +1385,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             module_symbols: FxHashMap::default(),
             top_level: false,
             ambient: FxHashSet::default(),
+            declaration_file: false,
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
             class_order: vec![],
@@ -1381,6 +1453,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         semantic: &oxc_semantic::Semantic<'_>,
         dependencies: &[ModuleDependency<'_>],
     ) -> Result<TypedProgram> {
+        self.declaration_file = program.source_type.is_typescript_definition();
         WritePositions {
             scoping: semantic.scoping(),
             positions: &mut self.writes,
@@ -2012,6 +2085,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 let js::TSTypeName::IdentifierReference(name) = &r.type_name else {
                     return self.unsupported("qualified type names", r.span);
                 };
+                // `const` is reserved, so it names a type only in `x as const`.
+                if name.name == "const" {
+                    return self.unsupported("const assertions", r.span);
+                }
                 let name = self.name(name.name.as_str());
                 if let Some((_, ty)) = self.active_types.iter().find(|(n, _)| *n == name) {
                     return Ok((ty.clone(), None));
@@ -2720,6 +2797,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 // Substituted constants have no binding; only a write reaches this lookup.
                 if self.constants.contains_key(&key) {
                     return Error::new(ErrorKind::Type, "cannot assign to const", at);
+                }
+                if library_value(name) {
+                    return Error::new(
+                        ErrorKind::Unsupported,
+                        format!("library value `{name}` is not implemented yet"),
+                        at,
+                    );
                 }
                 Error::new(ErrorKind::Type, format!("cannot find name `{name}`"), at)
             })?;
@@ -4540,6 +4624,27 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 } else if u.operator.as_str() == "typeof" {
                     let value = self.expr(&u.argument)?;
                     self.typeof_value(value, at)?
+                } else if u.operator.as_str() == "delete" {
+                    let mut operand = &u.argument;
+                    while let js::Expression::ParenthesizedExpression(p) = operand {
+                        operand = &p.expression;
+                    }
+                    if !matches!(
+                        operand,
+                        js::Expression::StaticMemberExpression(_)
+                            | js::Expression::ComputedMemberExpression(_)
+                            | js::Expression::PrivateFieldExpression(_)
+                            | js::Expression::ChainExpression(_)
+                    ) {
+                        return self.error(
+                            ErrorKind::Type,
+                            "The operand of a 'delete' operator must be a property reference.",
+                            operand.span(),
+                        );
+                    }
+                    // The operand is checked like any read before the gap is reported.
+                    self.expr(operand)?;
+                    return self.unsupported("delete", at);
                 } else if u.operator.as_str() == "!" {
                     node(
                         TypedExpression::Unary(TypedUnary {
@@ -4550,11 +4655,37 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         at,
                     )
                 } else {
-                    let value = self.expr(&u.argument)?;
+                    let mut value = self.expr(&u.argument)?;
                     if u.operator.as_str() == "~" {
                         return self.bitwise_not(value, at);
                     }
-                    self.expect(&value.ty, &number(), at)?;
+                    // Unary plus and minus convert any defined operand to a number.
+                    if let Err(error) = self.expect(&value.ty, &number(), at) {
+                        if matches!(value.ty, Type::Optional(_)) {
+                            return Err(error);
+                        }
+                        if value.ty != boolean() {
+                            return self.unsupported("numeric conversion of this type", at);
+                        }
+                        // Through an integer: false and true are 0 and 1.
+                        let integer = Type::Primitive(PrimitiveType::I32);
+                        let bits = node(
+                            TypedExpression::Cast(TypedCast {
+                                expr: Box::new(value),
+                                target_type: integer.clone(),
+                            }),
+                            integer,
+                            at,
+                        );
+                        value = node(
+                            TypedExpression::Cast(TypedCast {
+                                expr: Box::new(bits),
+                                target_type: number(),
+                            }),
+                            number(),
+                            at,
+                        );
+                    }
                     let op = match u.operator.as_str() {
                         "+" => UnaryOp::Plus,
                         "-" => UnaryOp::Minus,

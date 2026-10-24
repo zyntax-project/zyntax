@@ -264,6 +264,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let name = self.name(id.name.as_str());
             if !self.scopes.iter().any(|scope| scope.contains_key(&name)) {
                 self.require_value(id.name.as_str(), id.span)?;
+                if !self.signatures.contains_key(&name) && library_value(id.name.as_str()) {
+                    return self.unsupported(&format!("library value `{}`", id.name), id.span);
+                }
                 return self.signatures.get(&name).map(Some).ok_or_else(|| {
                     Error::new(
                         ErrorKind::Type,

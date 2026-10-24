@@ -231,3 +231,25 @@ fn forms_the_reference_checks_after_parsing_report_its_category_and_message() {
         assert_eq!(error.kind, ErrorKind::Type, "{source}: {}", error.message);
     }
 }
+
+#[test]
+fn delete_needs_a_property_reference() {
+    let error = zyntax_ts::parse_program("delete `abc${0}`;\n", "delete.ts", Default::default())
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Type, "{error}");
+    assert_eq!((error.start, error.end), (7, 16));
+    let error = zyntax_ts::parse_program(
+        "let o = { a: 1 };\ndelete o.a;\n",
+        "delete.ts",
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Unsupported, "{error}");
+}
+
+#[test]
+fn delete_checks_its_operand_first() {
+    let error =
+        zyntax_ts::parse_program("delete a[0];\n", "delete.ts", Default::default()).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Type, "{error}");
+}

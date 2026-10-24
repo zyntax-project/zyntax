@@ -2569,5 +2569,10 @@
     "id": "errors/postfix_assignment",
     "file": "cases/errors/postfix_assignment.ts",
     "mode": "check"
+  },
+  {
+    "id": "numeric/unary_boolean",
+    "file": "cases/numeric/unary_boolean.ts",
+    "mode": "run"
   }
 ]
