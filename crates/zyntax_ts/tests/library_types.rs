@@ -56,3 +56,23 @@ fn library_values_and_unmodelled_forms_are_gaps() {
     .unwrap_err();
     assert_eq!(error.kind, zyntax_ts::ErrorKind::Type, "{error}");
 }
+
+#[test]
+fn ambient_functions_are_typed_and_calls_are_gaps() {
+    let typed = "declare function f(x: number): string;\nconst a = 1;\nconsole.log(a);";
+    zyntax_ts::parse_program(typed, "ambient.ts", Default::default()).unwrap();
+    for (source, kind) in [
+        (
+            "declare function f(x: number): string;\nconst s = f(1);",
+            zyntax_ts::ErrorKind::Unsupported,
+        ),
+        (
+            "declare function f(x: number): string;\nf(\"x\");",
+            zyntax_ts::ErrorKind::Type,
+        ),
+        ("declare function f(x: number);", zyntax_ts::ErrorKind::Type),
+    ] {
+        let error = zyntax_ts::parse_program(source, "ambient.ts", Default::default()).unwrap_err();
+        assert_eq!(error.kind, kind, "{source}: {error}");
+    }
+}

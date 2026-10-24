@@ -1317,6 +1317,8 @@ struct Lowerer<'ast, 'program> {
     ambient: FxHashSet<InternedString>,
     /// Every declaration in a `.d.ts` file is ambient.
     declaration_file: bool,
+    /// Native names of `declare function` signatures, which have no body to call.
+    ambient_functions: FxHashSet<InternedString>,
     source_text: &'ast str,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
@@ -1404,6 +1406,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             top_level: false,
             ambient: FxHashSet::default(),
             declaration_file: false,
+            ambient_functions: FxHashSet::default(),
             source_text: "",
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
@@ -1579,6 +1582,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         for item in &program.body {
             if let Some(f) = modules::function(item) {
                 self.signature(f)?;
+                if f.declare {
+                    let name = self.name(modules::function_name(f));
+                    self.ambient_functions.insert(self.signatures[&name].native);
+                    self.lowered.insert(name);
+                }
             }
         }
         self.class_signatures()?;
@@ -1714,10 +1722,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let mut dependencies = FxHashMap::default();
         for (name, function) in &self.functions {
+            let Some(body) = &function.body else {
+                continue;
+            };
             calls.seen.clear();
             calls.owner = function.id.as_ref().and_then(|id| id.symbol_id.get());
             calls.self_calls = false;
-            calls.visit_function_body(function.body.as_ref().unwrap());
+            calls.visit_function_body(body);
             if self.signatures[name].ret.is_none() {
                 if calls.self_calls {
                     self.self_recursive.insert(*name);
@@ -2181,11 +2192,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         component: &str,
         role: FunctionRole,
     ) -> Result<()> {
-        if f.r#async || f.generator || f.this_param.is_some() || f.body.is_none() {
+        // A `declare function` is typed like any other; its value comes from outside.
+        let ambient = f.declare && role == FunctionRole::Plain;
+        if f.r#async || f.generator || f.this_param.is_some() || (f.body.is_none() && !ambient) {
             return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
         if self.signatures.contains_key(&key) {
             return self.unsupported("function overloads", f.span);
+        }
+        if ambient && f.return_type.is_none() {
+            return self.error(
+                ErrorKind::Type,
+                "an ambient function without a return type annotation implicitly has an 'any' return type",
+                f.span,
+            );
         }
         self.active_types.clear();
         self.active_type_rules = None;
@@ -5474,6 +5494,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             return self.unsupported("calls of private fields", p.span);
         }
         let direct = self.direct_signature(&c.callee)?.cloned();
+        if direct
+            .as_ref()
+            .is_some_and(|sig| self.ambient_functions.contains(&sig.native))
+        {
+            // Arguments are checked first, as TypeScript reports them.
+            self.call_with_signature(
+                direct.unwrap(),
+                &c.arguments,
+                c.type_arguments.as_deref(),
+                None,
+                at,
+            )?;
+            return self.unsupported("calls of ambient functions", at);
+        }
         let Some(sig) = direct else {
             let callee = self.expr(&c.callee)?;
             let Type::Function {

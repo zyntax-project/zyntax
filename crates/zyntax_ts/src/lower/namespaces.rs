@@ -280,6 +280,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     pub(super) fn function_value(&self, signature: &Signature, at: oxc_span::Span) -> Result<Expr> {
+        if self.ambient_functions.contains(&signature.native) {
+            return self.unsupported("values of ambient functions", at);
+        }
         if !signature.type_params.is_empty() {
             return self.unsupported("generic function values", at);
         }
