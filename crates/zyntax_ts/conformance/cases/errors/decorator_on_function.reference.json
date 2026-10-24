@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1206,
+      "start": 36,
+      "length": 1,
+      "file": "decorator_on_function.ts",
+      "message": "Decorators are not valid here."
+    }
+  ],
+  "source_sha256": "404c4cab83086c1ed49453c057c35edd1ee1735b7510af4608f5fd57a827a9a6",
+  "options": {}
+}

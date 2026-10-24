@@ -759,8 +759,14 @@ pub(crate) fn with_parsed<T, E>(
         .with_options(options)
         .parse();
     if let Some(diagnostic) = parsed.diagnostics.first() {
-        let kind = parse_error_kind(&diagnostic.message);
-        return Err(error(Error::from_oxc(kind, diagnostic)));
+        let reported = Error::from_oxc(parse_error_kind(&diagnostic.message), diagnostic);
+        let at = oxc_span::Span::new(reported.start as u32, reported.end as u32);
+        return Err(error(
+            match reference_grammar_form(&diagnostic.message, source, at) {
+                Some((kind, message)) => Error::new(kind, message, at),
+                None => reported,
+            },
+        ));
     }
     let semantic = oxc_semantic::SemanticBuilder::new()
         .with_check_syntax_error(true)
@@ -879,6 +885,39 @@ const CHECKER_GRAMMAR_ERRORS: &[&str] = &[
     "Decorators are not valid here",
     "Modifiers cannot appear here",
     "An accessibility modifier cannot be used with",
+    "Classes can't have an element named '#constructor'",
+    "Classes can't have a field named 'constructor'",
+    "A definite assignment assertion '!' is not permitted in this context",
+    "Declarations with initializers cannot also have definite assignment assertions",
+    "A rest element cannot have an initializer",
+    "A rest element cannot follow another rest element",
+    "Logical expressions and coalesce expressions cannot be mixed",
+    "Tagged template expressions are not permitted in an optional chain",
+    "The only valid property accesses on import are",
+    "An interface can only extend an identifier/qualified-name",
+    "An accessor cannot have type parameters",
+    "'extends' clause must precede 'implements' clause",
+    "'extends' list cannot be empty",
+    "'implements' list cannot be empty",
+    "Type annotation cannot appear on a constructor declaration",
+    "Type parameters cannot appear on a constructor declaration",
+    "Type parameter list cannot be empty",
+    "Type argument list cannot be empty",
+    "An enum member cannot have a numeric name",
+    "An export assignment cannot be used in a namespace",
+    "A default export can only be used in an ECMAScript-style module",
+    "An index signature parameter type must be",
+    "A 'set' accessor must have exactly one parameter",
+    "A 'set' accessor cannot have an optional parameter",
+    "Only ambient modules can use quoted names",
+    "in regular expression literal",
+    "statement may not be `async`",
+    "Constructor can't have get/set modifier",
+    "Constructor can't be a generator",
+    "Using declarations may not have binding patterns",
+    "'readonly' type modifier is only permitted on array and tuple literal types",
+    "modifier cannot be used on a type parameter",
+    "String literal expected",
 ];
 
 fn parse_error_kind(message: &str) -> ErrorKind {
@@ -890,6 +929,256 @@ fn parse_error_kind(message: &str) -> ErrorKind {
     } else {
         ErrorKind::Syntax
     }
+}
+
+/// A form TypeScript parses and rejects from its checker, or rejects while parsing, where oxc's
+/// parser reports a generic message. Returns TypeScript's category and message for the form.
+fn reference_grammar_form(
+    message: &str,
+    source: &str,
+    at: oxc_span::Span,
+) -> Option<(ErrorKind, &'static str)> {
+    let start = (at.start as usize).min(source.len());
+    let end = (at.end as usize).clamp(start, source.len());
+    let before = source[..start].trim_end();
+    let token = source[start..].trim_start();
+    let line = before
+        .rsplit(['\n', '\r'])
+        .next()
+        .unwrap_or("")
+        .trim_start();
+    let ends_statement = token.is_empty() || token.starts_with([';', '}', ')']);
+    let checker = |message| Some((ErrorKind::Type, message));
+    match message {
+        "Unexpected token" => {
+            if is_decorator(line) && starts_with_word(token, DECORATED_STATEMENTS) {
+                return checker("Decorators are not valid here.");
+            }
+            if empty_for_declaration(source, start) {
+                return checker("Variable declaration list cannot be empty.");
+            }
+            if ends_statement {
+                if ends_with_word(before, "var") || ends_with_word(before, "const") {
+                    return checker("Variable declaration list cannot be empty.");
+                }
+                if ends_with_word(before, "let") {
+                    return checker(
+                        "Identifier expected. 'let' is a reserved word in strict mode.",
+                    );
+                }
+                if before.ends_with(',') && starts_with_word(line, &["var", "let", "const"]) {
+                    return checker("Trailing comma not allowed.");
+                }
+            }
+            if token.starts_with('{') && ends_with_word(before, "implements") {
+                return checker("'implements' list cannot be empty.");
+            }
+            if line == "[" && token.starts_with(']') {
+                return checker("An index signature must have exactly one parameter.");
+            }
+            if token.starts_with('#')
+                && enclosing_brace(source, start).is_some_and(|open| {
+                    let head = source[..open]
+                        .trim_end()
+                        .trim_end_matches(is_identifier_char);
+                    ends_with_word(head.trim_end(), "enum")
+                })
+            {
+                return checker("An enum member cannot be named with a private identifier.");
+            }
+            if token.starts_with("...")
+                && ["public", "private", "protected", "readonly"]
+                    .iter()
+                    .any(|modifier| ends_with_word(before, modifier))
+            {
+                return checker("A parameter property cannot be declared using a rest parameter.");
+            }
+            let specifier = before.trim_end_matches(is_identifier_char).trim_end();
+            if starts_with_word(line, &["import"])
+                && specifier
+                    .strip_suffix('(')
+                    .is_some_and(|callee| ends_with_word(callee.trim_end(), "require"))
+            {
+                return checker("String literal expected.");
+            }
+            None
+        }
+        "Expected `;` but found `Identifier`"
+        | "Identifier expected. 'in' is a reserved word that cannot be used here."
+            if empty_for_declaration(source, start) =>
+        {
+            checker("Variable declaration list cannot be empty.")
+        }
+        "Expected `,` or `}` but found `?`" if in_object_literal(source, start) => {
+            checker("An object member cannot be declared optional.")
+        }
+        "Expected `,` or `}` but found `!`" if in_object_literal(source, start) => {
+            checker("A definite assignment assertion '!' is not permitted in this context.")
+        }
+        _ if message.starts_with("Expected `{` but found") && empty_extends(before) => {
+            checker("'extends' list cannot be empty.")
+        }
+        // TypeScript parses an assignment or update only on a left-hand-side expression.
+        "Cannot assign to this expression" => {
+            let target = source[start..end].trim();
+            let same_line = source[..start].rsplit('\n').next().unwrap_or("").trim_end();
+            let (update, operand) = match target
+                .strip_prefix("++")
+                .or_else(|| target.strip_prefix("--"))
+            {
+                Some(operand) => (true, operand.trim_start()),
+                None => (
+                    same_line.ends_with("++") || same_line.ends_with("--"),
+                    target,
+                ),
+            };
+            let unary = operand.starts_with(['+', '-', '!', '~'])
+                || starts_with_word(operand, &["await", "delete", "typeof", "void"]);
+            let postfix = operand.ends_with("++") || operand.ends_with("--");
+            if update && (unary || postfix) {
+                Some((ErrorKind::Syntax, "Expression expected."))
+            } else if (unary || postfix) && assignment_follows(&source[end..]) {
+                Some((ErrorKind::Syntax, "';' expected."))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn assignment_follows(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    let operator = rest
+        .find(|c: char| !"=+-*/%<>&|^?!".contains(c))
+        .map_or(rest, |end| &rest[..end]);
+    operator.ends_with('=') && !matches!(operator, "==" | "===" | "!=" | "!==" | "<=" | ">=")
+}
+
+const DECORATED_STATEMENTS: &[&str] = &[
+    "enum",
+    "function",
+    "var",
+    "let",
+    "const",
+    "interface",
+    "type",
+    "namespace",
+    "module",
+    "import",
+    "declare",
+    "async",
+];
+
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn starts_with_word(text: &str, words: &[&str]) -> bool {
+    words.iter().any(|word| {
+        text.strip_prefix(word)
+            .is_some_and(|rest| !rest.starts_with(is_identifier_char))
+    })
+}
+
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|rest| !rest.ends_with(|c: char| is_identifier_char(c) || c == '.'))
+}
+
+/// `@name` or `@name(...)` alone on its line.
+fn is_decorator(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('@') else {
+        return false;
+    };
+    let name = rest
+        .find(|c: char| !(is_identifier_char(c) || c == '.'))
+        .unwrap_or(rest.len());
+    let arguments = &rest[name..];
+    name > 0 && (arguments.is_empty() || arguments.starts_with('(') && arguments.ends_with(')'))
+}
+
+/// `for (var of x)` and `for (var in x)`: TypeScript reads `of` and `in` as the loop keyword.
+fn empty_for_declaration(source: &str, at: usize) -> bool {
+    let Some(keyword) = source[..at].rfind("for") else {
+        return false;
+    };
+    if source[..keyword].ends_with(is_identifier_char) {
+        return false;
+    }
+    let head = &source[keyword + 3..];
+    let Some(close) = head.find(')') else {
+        return false;
+    };
+    if at > keyword + 3 + close {
+        return false;
+    }
+    let Some(inner) = head[..close].trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let words: Vec<&str> = inner.split_whitespace().collect();
+    match words.as_slice() {
+        ["var" | "const", "in", ..] => true,
+        ["var" | "const", "of", name] => name.chars().all(is_identifier_char),
+        _ => false,
+    }
+}
+
+/// The innermost `{` still open at `at`.
+fn enclosing_brace(source: &str, at: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, c) in source[..at].char_indices().rev() {
+        match c {
+            '}' => depth += 1,
+            '{' if depth == 0 => return Some(index),
+            '{' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The innermost open `{` before `at` starts an object literal rather than a block or pattern.
+fn in_object_literal(source: &str, at: usize) -> bool {
+    let Some(open) = enclosing_brace(source, at) else {
+        return false;
+    };
+    let before = source[..open].trim_end();
+    if before.ends_with("=>") {
+        return false;
+    }
+    if before.ends_with([':', '=']) || ends_with_word(before, "return") {
+        return true;
+    }
+    // A call argument: `f({ ... })`, but not a parameter list or statement head.
+    let Some(callee) = before.strip_suffix('(') else {
+        return false;
+    };
+    let callee = callee.trim_end();
+    let name_start = callee
+        .rfind(|c: char| !is_identifier_char(c))
+        .map_or(0, |i| i + 1);
+    let name = &callee[name_start..];
+    !name.is_empty()
+        && !matches!(
+            name,
+            "function" | "if" | "while" | "for" | "catch" | "switch" | "with"
+        )
+        && !ends_with_word(callee[..name_start].trim_end(), "function")
+}
+
+/// `class C extends {` or `class C extends implements I {`.
+fn empty_extends(before: &str) -> bool {
+    let mut search = before;
+    while let Some(index) = search.rfind("extends") {
+        let rest = &before[index + "extends".len()..];
+        if !before[..index].ends_with(is_identifier_char) && !rest.starts_with(is_identifier_char) {
+            let rest = rest.trim_start();
+            return rest.starts_with('{') || starts_with_word(rest, &["implements"]);
+        }
+        search = &before[..index];
+    }
+    false
 }
 
 fn is_legacy_numeric_literal(message: &str) -> bool {

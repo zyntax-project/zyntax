@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Syntax",
+  "diagnostics": [
+    {
+      "code": 1005,
+      "start": 15,
+      "length": 1,
+      "file": "postfix_assignment.ts",
+      "message": "';' expected."
+    }
+  ],
+  "source_sha256": "98f5082694ae1ec62f954fcc6bdc169a393a1cf32633eab6d911016289df4550",
+  "options": {}
+}

@@ -2554,5 +2554,20 @@
     "id": "interfaces/implements_private_error",
     "file": "cases/interfaces/implements_private_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "errors/decorator_on_function",
+    "file": "cases/errors/decorator_on_function.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/empty_var_list",
+    "file": "cases/errors/empty_var_list.ts",
+    "mode": "check"
+  },
+  {
+    "id": "errors/postfix_assignment",
+    "file": "cases/errors/postfix_assignment.ts",
+    "mode": "check"
   }
 ]

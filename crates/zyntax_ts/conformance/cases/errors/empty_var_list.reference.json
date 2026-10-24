@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 1123,
+      "start": 18,
+      "length": 0,
+      "file": "empty_var_list.ts",
+      "message": "Variable declaration list cannot be empty."
+    }
+  ],
+  "source_sha256": "21294325d1aa1c158c96729e8d40fa9d66eee986d1389e69a163efc76afd1588",
+  "options": {}
+}

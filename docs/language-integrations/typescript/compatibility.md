@@ -105,4 +105,7 @@ values, namespace re-export objects and runtime property indexing remain gaps.
 
 Diagnostics use the shared Ariadne formatter, including source labels and related
 locations. `NO_COLOR` disables colors; `CLICOLOR_FORCE` enables them.
-`--diagnostics=json` emits categories, filenames and byte ranges.
+`--diagnostics=json` emits categories, filenames and byte ranges. A grammar error
+TypeScript reports from its checker, such as a decorator on a function or an empty
+variable declaration list, is a type error with TypeScript's message, even where the
+parser rejects it first.

@@ -147,3 +147,87 @@ fn checker_grammar_errors_are_type_errors_and_parse_failures_are_syntax_errors()
         assert_eq!(error.kind, kind, "{source}");
     }
 }
+
+#[test]
+fn forms_the_reference_checks_after_parsing_report_its_category_and_message() {
+    for (source, kind, message) in [
+        (
+            "declare function dec(t: any): any;\n@dec\nenum E { A }\n",
+            ErrorKind::Type,
+            "Decorators are not valid here.",
+        ),
+        (
+            "var ;\n",
+            ErrorKind::Type,
+            "Variable declaration list cannot be empty.",
+        ),
+        (
+            "let a = [1];\nfor (var of a) {}\n",
+            ErrorKind::Type,
+            "Variable declaration list cannot be empty.",
+        ),
+        (
+            "var a, b,;\n",
+            ErrorKind::Type,
+            "Trailing comma not allowed.",
+        ),
+        (
+            "let a = 1;\nlet o = { a? };\n",
+            ErrorKind::Type,
+            "An object member cannot be declared optional.",
+        ),
+        (
+            "class A {}\nclass C extends A implements {}\n",
+            ErrorKind::Type,
+            "'implements' list cannot be empty.",
+        ),
+        (
+            "class C extends {}\n",
+            ErrorKind::Type,
+            "'extends' list cannot be empty.",
+        ),
+        (
+            "interface I {\n  []: number\n}\n",
+            ErrorKind::Type,
+            "An index signature must have exactly one parameter.",
+        ),
+        (
+            "enum E {\n  #x\n}\n",
+            ErrorKind::Type,
+            "An enum member cannot be named with a private identifier.",
+        ),
+        ("let x = 1;\nx++ = 4;\n", ErrorKind::Syntax, "';' expected."),
+        (
+            "let x = 1;\n++-x;\n",
+            ErrorKind::Syntax,
+            "Expression expected.",
+        ),
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "grammar.ts", Default::default()).expect_err(source);
+        assert_eq!(
+            (error.kind, error.message.as_str()),
+            (kind, message),
+            "{source}"
+        );
+    }
+    // The same messages from forms the reference also rejects while parsing stay syntax errors.
+    for source in [
+        "const {a?} = {a: 1};\n",
+        "let f = ({a?}) => 1;\n",
+        "var 1 = 2;\n",
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "grammar.ts", Default::default()).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::Syntax, "{source}: {}", error.message);
+    }
+    // Invalid targets the reference parses as assignments are checker errors.
+    for source in [
+        "let x = 1;\n1 = x;\n",
+        "let v: number = 1;\nfor (v++ of []) {}\n",
+    ] {
+        let error =
+            zyntax_ts::parse_program(source, "grammar.ts", Default::default()).expect_err(source);
+        assert_eq!(error.kind, ErrorKind::Type, "{source}: {}", error.message);
+    }
+}
