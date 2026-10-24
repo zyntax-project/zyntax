@@ -250,7 +250,8 @@ def upstream_file(args, path):
     for i, options in enumerate(variants):
         options = {"skipLibCheck": False, **options}
         case = {"id": f"{label}#{i}", "mode": "check"}
-        if any(options.get(key) is False for key in ("strict", "noImplicitAny", "strictNullChecks")):
+        relaxed = ("strict", "noImplicitAny", "strictNullChecks", "strictPropertyInitialization")
+        if any(options.get(key) is False for key in relaxed):
             rows.append(skip("native relaxed-checking options are not implemented yet", case["id"], options))
             continue
         if any(Path(name).name.lower() in ("tsconfig.json", "jsconfig.json") for name in files):

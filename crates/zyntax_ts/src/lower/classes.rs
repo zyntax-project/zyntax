@@ -147,17 +147,40 @@ pub(super) struct Class<'ast, 'program> {
 
 /// Names assigned as `this.name = ...` anywhere in a body.
 struct ThisAssignments<'a> {
+    source: &'a str,
     names: FxHashSet<&'a str>,
 }
 
 impl<'a> Visit<'a> for ThisAssignments<'a> {
     fn visit_assignment_expression(&mut self, it: &js::AssignmentExpression<'a>) {
-        if let js::AssignmentTarget::StaticMemberExpression(m) = &it.left {
-            if matches!(m.object, js::Expression::ThisExpression(_)) {
+        match &it.left {
+            js::AssignmentTarget::StaticMemberExpression(m)
+                if matches!(m.object, js::Expression::ThisExpression(_)) =>
+            {
                 self.names.insert(m.property.name.as_str());
             }
+            js::AssignmentTarget::PrivateFieldExpression(p)
+                if matches!(p.object, js::Expression::ThisExpression(_)) =>
+            {
+                self.names.insert(private_name(self.source, &p.field));
+            }
+            _ => {}
         }
         walk::walk_assignment_expression(self, it);
+    }
+}
+
+/// A private name as its source text, `#name`, which no public member can be called.
+pub(super) fn private_name<'a>(source: &'a str, name: &js::PrivateIdentifier<'_>) -> &'a str {
+    &source[name.span.start as usize..name.span.end as usize]
+}
+
+/// A member's access: `#name` is private wherever it is declared.
+fn member_access(name: &str, accessibility: Option<js::TSAccessibility>) -> Access {
+    if name.starts_with('#') {
+        Access::Private
+    } else {
+        access(accessibility)
     }
 }
 
@@ -289,7 +312,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         p.value.is_some(),
                         p.span,
                     )?;
-                    let access = access(p.accessibility);
+                    let access = member_access(field, p.accessibility);
                     if let Some(index) = redeclared {
                         self.check_field_visibility(source, &fields[index], access, p.span)?;
                     }
@@ -351,7 +374,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                     m.span,
                                 );
                             }
-                            let access = access(m.accessibility);
+                            let access = member_access(method, m.accessibility);
                             let (table, key) = if m.r#static {
                                 (&mut statics, intern(&format!("{source}::{method}")))
                             } else {
@@ -359,6 +382,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 (&mut methods, intern(&format!("{source}.{method}")))
                             };
                             if let Some(inherited) = table.get(method) {
+                                if method.starts_with('#') {
+                                    return self.unsupported(
+                                        "private names redeclared in subclasses",
+                                        m.span,
+                                    );
+                                }
                                 self.check_override_access(
                                     source, method, inherited, access, m.span,
                                 )?;
@@ -647,6 +676,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let inherited_field = fields
             .iter()
             .position(|f| f.name == name && f.owner.is_some());
+        // A private name is a new member in each class that declares it.
+        if name.starts_with('#')
+            && (inherited_field.is_some() || methods.get(name).is_some_and(|m| m.owner.is_some()))
+        {
+            return self.unsupported("private names redeclared in subclasses", at);
+        }
         let incompatible = match (inherited_field, field_type) {
             (Some(index), Some(ty)) if fields[index].ty == ty => {
                 // Without a value, the redeclaration's effect depends on the class field
@@ -797,7 +832,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     pub(super) fn class_key(&self, key: &js::PropertyKey<'ast>) -> Result<&'ast str> {
         match key {
             js::PropertyKey::StaticIdentifier(i) => Ok(i.name.as_str()),
-            js::PropertyKey::PrivateIdentifier(p) => self.unsupported("private names", p.span),
+            js::PropertyKey::PrivateIdentifier(p) => Ok(private_name(self.source_text, p)),
             _ => self.unsupported("computed property names", key.span()),
         }
     }
@@ -1338,6 +1373,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         constructor: &js::Function<'ast>,
     ) -> Result<()> {
         let mut assigned = ThisAssignments {
+            source: self.source_text,
             names: FxHashSet::default(),
         };
         assigned.visit_function_body(constructor.body.as_ref().unwrap());
@@ -1546,8 +1582,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         c: &js::CallExpression<'ast>,
         m: &js::StaticMemberExpression<'ast>,
     ) -> Result<Option<Expr>> {
-        let name = m.property.name.as_str();
-        if let Some((view, through_this)) = self.static_receiver(&m.object) {
+        self.member_method_call(c, &m.object, m.property.name.as_str(), m.span)
+    }
+
+    /// `object.name(...)` for a class member `name`, public or private.
+    pub(super) fn member_method_call(
+        &mut self,
+        c: &js::CallExpression<'ast>,
+        object: &js::Expression<'ast>,
+        name: &str,
+        at: oxc_span::Span,
+    ) -> Result<Option<Expr>> {
+        if let Some((view, through_this)) = self.static_receiver(object) {
             let Some(member) = self.classes[&view].statics.get(name) else {
                 if self.classes[&view]
                     .static_fields
@@ -1559,7 +1605,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return self.error(
                     ErrorKind::Type,
                     format!("property `{name}` does not exist on this class"),
-                    m.span,
+                    at,
                 );
             };
             // In a static method `this` is whichever class the call names.
@@ -1570,21 +1616,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         && self.classes[other].statics[name].owner.is_none()
                 })
             {
-                return self
-                    .unsupported("static this with methods overridden in subclasses", m.span);
+                return self.unsupported("static this with methods overridden in subclasses", at);
             }
             let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
-            self.check_member_access(owner, access, name, m.span)?;
+            self.check_member_access(owner, access, name, at)?;
             let sig = self.signatures[&key].clone();
             return self
                 .call_with_signature(sig, &c.arguments, c.type_arguments.as_deref(), None, c.span)
                 .map(Some);
         }
-        if let js::Expression::Super(s) = &m.object {
+        if let js::Expression::Super(s) = object {
             return self.super_method_call(c, name, s.span).map(Some);
         }
         let Some(view) = self
-            .view_of(&m.object)
+            .view_of(object)
             .filter(|v| self.classes.contains_key(v))
         else {
             return Ok(None);
@@ -1595,16 +1640,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 return Ok(None);
             }
             // Errors in the receiver come first, as TypeScript reports them in source order.
-            self.expr(&m.object)?;
+            self.expr(object)?;
             return self.error(
                 ErrorKind::Type,
                 format!("property `{name}` does not exist on this class"),
-                m.span,
+                at,
             );
         };
         let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
-        self.check_member_access(owner, access, name, m.span)?;
-        let receiver = self.expr(&m.object)?;
+        self.check_member_access(owner, access, name, at)?;
+        let receiver = self.expr(object)?;
         let call = self.member_call(key, owner, receiver, c)?;
         let call = self.dispatch(view, name, key, call, c.span)?;
         // A method whose result is inferred from `return this` has TypeScript's polymorphic
@@ -1616,7 +1661,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             && self.functions[&key].return_type.is_none()
             && self.signatures[&key].ret_view == Some(owner)
         {
-            return self.unsupported("inferred class results through subclasses", m.span);
+            return self.unsupported("inferred class results through subclasses", at);
         }
         Ok(Some(call))
     }

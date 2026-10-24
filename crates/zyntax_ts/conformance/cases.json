@@ -2649,5 +2649,10 @@
     "id": "classes/static_tdz",
     "file": "cases/classes/static_tdz.ts",
     "mode": "run"
+  },
+  {
+    "id": "classes/private_names",
+    "file": "cases/classes/private_names.ts",
+    "mode": "run"
   }
 ]

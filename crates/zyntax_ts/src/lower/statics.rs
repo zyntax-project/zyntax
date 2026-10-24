@@ -43,6 +43,12 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let inherited = fields
             .iter()
             .position(|f| f.name == field && f.owner.is_some());
+        // A private name is a new member in each class that declares it.
+        if field.starts_with('#')
+            && (inherited.is_some() || statics.get(field).is_some_and(|m| m.owner.is_some()))
+        {
+            return self.unsupported("private names redeclared in subclasses", p.span);
+        }
         let ty = match (&p.type_annotation, &p.value) {
             (Some(annotation), _) => {
                 let (ty, view) = self.ty(&annotation.type_annotation)?;
@@ -64,7 +70,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         {
             return self.error(ErrorKind::Type, "duplicate identifier", p.span);
         }
-        let access = classes::access(p.accessibility);
+        let access = if field.starts_with('#') {
+            Access::Private
+        } else {
+            classes::access(p.accessibility)
+        };
         if let Some(index) = inherited {
             let base = &fields[index];
             let narrower = match base.access {
@@ -312,11 +322,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         &mut self,
         m: &js::StaticMemberExpression<'ast>,
     ) -> Result<Option<Expr>> {
-        let name = m.property.name.as_str();
-        let Some((_, field)) = self.static_field(&m.object, name, m.span)? else {
+        self.static_member_read(&m.object, m.property.name.as_str(), m.span)
+    }
+
+    /// `object.name` as a value, when the object names a class with that static field.
+    pub(super) fn static_member_read(
+        &mut self,
+        object: &js::Expression<'ast>,
+        name: &str,
+        at: oxc_span::Span,
+    ) -> Result<Option<Expr>> {
+        let Some((_, field)) = self.static_field(object, name, at)? else {
             return Ok(None);
         };
-        let at = m.span;
         let ty = Type::Primitive(field.ty);
         let global = self.globals.get(&field.global);
         let mut checks = vec![];
@@ -328,7 +346,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if let Some(assigned) = field.assigned {
             checks.push((assigned, "$TS$assigned_check"));
         }
-        let source = global.map_or_else(|| self.name(name), |g| g.source);
+        let source = global.map_or_else(|| intern(name), |g| g.source);
         let mut statements: Vec<Stmt> = checks
             .into_iter()
             .map(|(flag, check)| {

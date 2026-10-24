@@ -1317,6 +1317,7 @@ struct Lowerer<'ast, 'program> {
     ambient: FxHashSet<InternedString>,
     /// Every declaration in a `.d.ts` file is ambient.
     declaration_file: bool,
+    source_text: &'ast str,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
     class_order: Vec<InternedString>,
@@ -1403,6 +1404,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             top_level: false,
             ambient: FxHashSet::default(),
             declaration_file: false,
+            source_text: "",
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
             class_order: vec![],
@@ -1479,6 +1481,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         dependencies: &[ModuleDependency<'_>],
     ) -> Result<TypedProgram> {
         self.declaration_file = program.source_type.is_typescript_definition();
+        self.source_text = program.source_text;
         let scoping = semantic.scoping();
         self.unreferenced = scoping
             .symbol_ids()
@@ -4913,6 +4916,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             {
                 return self.super_member(m);
             }
+            js::Expression::PrivateFieldExpression(p) if !p.optional => {
+                let name = classes::private_name(self.source_text, &p.field);
+                if let Some(read) = self.static_member_read(&p.object, name, p.span)? {
+                    return Ok(read);
+                }
+                self.field_read(&p.object, name, at)?
+            }
             js::Expression::StaticMemberExpression(m) if !m.optional => {
                 if let Some(read) = self.static_field_read(m)? {
                     return Ok(read);
@@ -5454,6 +5464,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
         }
+        if let js::Expression::PrivateFieldExpression(p) = &c.callee
+            && !p.optional
+        {
+            let name = classes::private_name(self.source_text, &p.field);
+            if let Some(call) = self.member_method_call(c, &p.object, name, p.span)? {
+                return Ok(call);
+            }
+            return self.unsupported("calls of private fields", p.span);
+        }
         let direct = self.direct_signature(&c.callee)?.cloned();
         let Some(sig) = direct else {
             let callee = self.expr(&c.callee)?;
@@ -5714,6 +5733,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 self.field_target(&m.object, m.property.name.as_str(), m.span)
             }
+            js::SimpleAssignmentTarget::PrivateFieldExpression(p) if !p.optional => {
+                let name = classes::private_name(self.source_text, &p.field);
+                self.field_target(&p.object, name, p.span)
+            }
             js::SimpleAssignmentTarget::ComputedMemberExpression(m)
                 if !m.optional && Self::string_key(&m.expression).is_some() =>
             {
@@ -5791,6 +5814,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             }
             js::AssignmentTarget::StaticMemberExpression(m) => {
                 self.field_target(&m.object, m.property.name.as_str(), m.span)?
+            }
+            js::AssignmentTarget::PrivateFieldExpression(p) if !p.optional => {
+                let name = classes::private_name(self.source_text, &p.field);
+                self.field_target(&p.object, name, p.span)?
             }
             js::AssignmentTarget::ComputedMemberExpression(m)
                 if !m.optional && Self::string_key(&m.expression).is_some() =>
