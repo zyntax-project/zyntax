@@ -21,6 +21,14 @@ pub const BUILD_INPUTS: &[&str] = &[
     "crates/compiler/build_fingerprint.rs",
 ];
 
+/// Build inputs a checkout may lack: the lockfile is not committed, so a
+/// fresh clone or a git dependency has none until cargo writes one.
+const OPTIONAL_INPUTS: &[&str] = &["Cargo.lock"];
+
+fn optional(input: &Path) -> bool {
+    OPTIONAL_INPUTS.iter().any(|o| Path::new(o) == input)
+}
+
 pub fn watched_inputs(root: &Path) -> Vec<PathBuf> {
     SOURCE_ROOTS
         .iter()
@@ -30,7 +38,12 @@ pub fn watched_inputs(root: &Path) -> Vec<PathBuf> {
                 root.join(source).join("Cargo.toml"),
             ]
         })
-        .chain(BUILD_INPUTS.iter().map(|input| root.join(input)))
+        .chain(
+            BUILD_INPUTS
+                .iter()
+                .filter(|input| !optional(Path::new(input)) || root.join(input).exists())
+                .map(|input| root.join(input)),
+        )
         .collect()
 }
 
@@ -54,7 +67,14 @@ pub fn fingerprint(root: &Path) -> io::Result<[u8; 32]> {
             })?
             .replace('\\', "/");
         feed(&mut hash, name.as_bytes());
-        feed(&mut hash, &std::fs::read(root.join(file))?);
+        match std::fs::read(root.join(&file)) {
+            Ok(bytes) => feed(&mut hash, &bytes),
+            // Absent, which no file's contents read as.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && optional(&file) => {
+                hash.update(u64::MAX.to_le_bytes())
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(hash.finalize().into())
 }
