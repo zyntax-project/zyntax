@@ -81,3 +81,17 @@ fn implicit_constructors_forward_base_parameters() {
     .unwrap_err();
     assert_eq!(error.kind, zyntax_ts::ErrorKind::Type, "{error}");
 }
+
+#[test]
+fn field_initializers_infer_from_operators_and_earlier_fields() {
+    let source = "class Box { width = 2; height = this.width * 3; big = this.height > 5; neg = -123; }\nconsole.log(new Box().height);";
+    zyntax_ts::parse_program(source, "fields.ts", Default::default()).unwrap();
+    // A parameter property's value at field initialization depends on the target.
+    let error = zyntax_ts::parse_program(
+        "class Box { constructor(public d: number) {} twice = this.d * 2; }",
+        "fields.ts",
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, zyntax_ts::ErrorKind::Unsupported, "{error}");
+}

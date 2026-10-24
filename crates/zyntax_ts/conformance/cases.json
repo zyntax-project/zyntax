@@ -2654,5 +2654,10 @@
     "id": "classes/private_names",
     "file": "cases/classes/private_names.ts",
     "mode": "run"
+  },
+  {
+    "id": "classes/field_inference",
+    "file": "cases/classes/field_inference.ts",
+    "mode": "run"
   }
 ]

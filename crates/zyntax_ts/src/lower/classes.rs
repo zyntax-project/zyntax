@@ -52,6 +52,25 @@ pub(super) enum Access {
     Private,
 }
 
+/// Whether an expression reads `this.name` for one of `names`, outside nested functions.
+struct ThisReads<'n> {
+    names: &'n FxHashSet<&'n str>,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for ThisReads<'_> {
+    fn visit_static_member_expression(&mut self, it: &js::StaticMemberExpression<'a>) {
+        if matches!(it.object, js::Expression::ThisExpression(_))
+            && self.names.contains(it.property.name.as_str())
+        {
+            self.found = true;
+        }
+        walk::walk_static_member_expression(self, it);
+    }
+
+    fn visit_function(&mut self, _: &js::Function<'a>, _: oxc_semantic::ScopeFlags) {}
+}
+
 /// Counts a body's `return this` statements and its other returns, outside nested functions.
 struct ThisReturns {
     this: usize,
@@ -297,6 +316,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 fields.iter().find(|f| f.name == field && f.owner.is_some()) =>
                         {
                             inherited.ty
+                        }
+                        (None, Some(init)) => {
+                            match self.field_initializer_type(init, class, &fields) {
+                                Some(ty) => ty,
+                                None => {
+                                    return self.unsupported("class field type inference", p.span);
+                                }
+                            }
                         }
                         _ => return self.unsupported("class field type inference", p.span),
                     };
@@ -641,6 +668,56 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             format!("cannot find name `{}`", base.name),
             at,
         )
+    }
+
+    /// The type of an instance field initializer before any body is lowered: literals, operators
+    /// on them and fields declared before it.
+    fn field_initializer_type(
+        &self,
+        e: &js::Expression<'ast>,
+        class: &js::Class<'ast>,
+        fields: &[ClassField<'ast, 'program>],
+    ) -> Option<PrimitiveType> {
+        let operand = |e| self.field_initializer_type(e, class, fields);
+        match e {
+            js::Expression::NumericLiteral(_) => Some(PrimitiveType::F64),
+            js::Expression::BooleanLiteral(_) => Some(PrimitiveType::Bool),
+            js::Expression::StringLiteral(s) if !s.lone_surrogates => Some(PrimitiveType::String),
+            js::Expression::TemplateLiteral(_) => Some(PrimitiveType::String),
+            js::Expression::ParenthesizedExpression(p) => operand(&p.expression),
+            js::Expression::UnaryExpression(u) => match u.operator.as_str() {
+                "-" | "+" | "~" => Some(PrimitiveType::F64),
+                "!" => Some(PrimitiveType::Bool),
+                "typeof" => Some(PrimitiveType::String),
+                _ => None,
+            },
+            js::Expression::BinaryExpression(b) => match b.operator.as_str() {
+                "-" | "*" | "/" | "%" | "**" | "|" | "&" | "^" | "<<" | ">>" | ">>>" => {
+                    Some(PrimitiveType::F64)
+                }
+                "<" | "<=" | ">" | ">=" | "===" | "!==" | "==" | "!=" => Some(PrimitiveType::Bool),
+                "+" => match (operand(&b.left)?, operand(&b.right)?) {
+                    (PrimitiveType::String, _) | (_, PrimitiveType::String) => {
+                        Some(PrimitiveType::String)
+                    }
+                    (PrimitiveType::F64, PrimitiveType::F64) => Some(PrimitiveType::F64),
+                    _ => None,
+                },
+                _ => None,
+            },
+            js::Expression::StaticMemberExpression(m)
+                if !m.optional && matches!(m.object, js::Expression::ThisExpression(_)) =>
+            {
+                let name = m.property.name.as_str();
+                // Parameter properties are assigned before or after field initializers
+                // depending on the class field semantics the target selects.
+                fields
+                    .iter()
+                    .find(|f| f.name == name && !f.parameter)
+                    .map(|f| f.ty)
+            }
+            _ => None,
+        }
     }
 
     /// The field names and types of a class layout, in layout order.
@@ -1171,10 +1248,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     .push(self.field_assignment(this, &ty, field.name, field.ty, value, p.span));
             }
         }
+        let parameters: FxHashSet<&str> = fields
+            .iter()
+            .filter(|f| f.parameter)
+            .map(|f| f.name)
+            .collect();
         for field in fields.iter().filter(|f| !f.parameter) {
             let Some(initializer) = field.initializer else {
                 continue;
             };
+            // Parameter properties are assigned before or after field initializers depending on
+            // the class field semantics the target selects.
+            let mut reads = ThisReads {
+                names: &parameters,
+                found: false,
+            };
+            reads.visit_expression(initializer);
+            if reads.found {
+                return self.unsupported(
+                    "field initializers reading parameter properties",
+                    field.span,
+                );
+            }
             let expected = Type::Primitive(field.ty);
             let value = self.expr_expected(initializer, &expected)?;
             self.expect(&value.ty, &expected, field.span)?;
