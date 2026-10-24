@@ -1321,6 +1321,8 @@ struct Lowerer<'ast, 'program> {
     method_views: FxHashMap<InternedString, Vec<InternedString>>,
     /// Native names of `declare function` signatures, which have no body to call.
     ambient_functions: FxHashSet<InternedString>,
+    /// Keys of abstract methods, which have a signature and no body.
+    abstract_methods: FxHashSet<InternedString>,
     source_text: &'ast str,
     classes: FxHashMap<InternedString, classes::Class<'ast, 'program>>,
     class_names: FxHashMap<InternedString, InternedString>,
@@ -1410,6 +1412,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             declaration_file: false,
             method_views: FxHashMap::default(),
             ambient_functions: FxHashSet::default(),
+            abstract_methods: FxHashSet::default(),
             source_text: "",
             classes: FxHashMap::default(),
             class_names: FxHashMap::default(),
@@ -2227,16 +2230,17 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     ) -> Result<()> {
         // A `declare function` is typed like any other; its value comes from outside.
         let ambient = f.declare && role == FunctionRole::Plain;
-        if f.r#async || f.generator || f.this_param.is_some() || (f.body.is_none() && !ambient) {
+        let bodiless = ambient || self.abstract_methods.contains(&key);
+        if f.r#async || f.generator || f.this_param.is_some() || (f.body.is_none() && !bodiless) {
             return self.unsupported("async, generator, rest or ambient functions", f.span);
         }
         if self.signatures.contains_key(&key) {
             return self.unsupported("function overloads", f.span);
         }
-        if ambient && f.return_type.is_none() {
+        if bodiless && f.return_type.is_none() {
             return self.error(
                 ErrorKind::Type,
-                "an ambient function without a return type annotation implicitly has an 'any' return type",
+                "a declaration without a body or return type annotation implicitly has an 'any' return type",
                 f.span,
             );
         }

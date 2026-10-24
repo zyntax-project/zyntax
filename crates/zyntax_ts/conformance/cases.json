@@ -2659,5 +2659,15 @@
     "id": "classes/field_inference",
     "file": "cases/classes/field_inference.ts",
     "mode": "run"
+  },
+  {
+    "id": "classes/abstract",
+    "file": "cases/classes/abstract.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/abstract_missing_error",
+    "file": "cases/classes/abstract_missing_error.ts",
+    "mode": "check"
   }
 ]

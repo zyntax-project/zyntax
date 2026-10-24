@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2515,
+      "start": 49,
+      "length": 1,
+      "file": "abstract_missing_error.ts",
+      "message": "Non-abstract class 'B' does not implement inherited abstract member m from class 'A'."
+    }
+  ],
+  "source_sha256": "5403360856938978fcaf4e6a728e9b7ac91e0106783ad5e93727267230fce075",
+  "options": {}
+}

@@ -95,3 +95,39 @@ fn field_initializers_infer_from_operators_and_earlier_fields() {
     .unwrap_err();
     assert_eq!(error.kind, zyntax_ts::ErrorKind::Unsupported, "{error}");
 }
+
+#[test]
+fn abstract_classes_follow_typescript() {
+    let kind = |source: &str| {
+        zyntax_ts::parse_program(source, "abstract.ts", Default::default())
+            .map(|_| ())
+            .map_err(|error| error.kind)
+    };
+    use zyntax_ts::ErrorKind::{Type, Unsupported};
+    for (source, expected) in [
+        (
+            "abstract class A { abstract m(): number; run(): number { return this.m(); } }\nclass B extends A { m(): number { return 1; } }\nconsole.log(new B().run());",
+            Ok(()),
+        ),
+        (
+            "abstract class A { abstract m(): number; }\nnew A();",
+            Err(Type),
+        ),
+        (
+            "abstract class A { abstract m(): number; }\nclass B extends A {}",
+            Err(Type),
+        ),
+        (
+            "abstract class A { abstract m(): number; }\nclass B extends A { m(): number { return super.m(); } }",
+            Err(Type),
+        ),
+        ("abstract class A { abstract m(); }", Err(Type)),
+        ("abstract class A { abstract x: number; }", Err(Unsupported)),
+        (
+            "abstract class A { abstract m(): number; run(): number { return this.m(); } }",
+            Err(Unsupported),
+        ),
+    ] {
+        assert_eq!(kind(source), expected, "{source}");
+    }
+}

@@ -152,6 +152,7 @@ pub(super) struct Class<'ast, 'program> {
     )>,
     pub base: Option<InternedString>,
     pub constructor_access: Access,
+    pub is_abstract: bool,
     /// The hidden class field's value, for classes in a hierarchy.
     pub tag: Option<f64>,
     /// The initializer's key and native component, for classes others extend.
@@ -211,11 +212,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if class.type_parameters.is_some() {
             return self.unsupported("generic classes", class.span);
         }
-        if class.r#abstract
-            || class.declare
-            || self.declaration_file
-            || !class.decorators.is_empty()
-        {
+        if class.declare || self.declaration_file || !class.decorators.is_empty() {
             return self.unsupported("abstract, ambient or decorated classes", class.span);
         }
         let base = match &class.heritage {
@@ -282,6 +279,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         for element in &class.body.body {
             match element {
                 js::ClassElement::PropertyDefinition(p) => {
+                    if p.r#type == js::PropertyDefinitionType::TSAbstractPropertyDefinition {
+                        return self.unsupported("abstract properties", p.span);
+                    }
                     if p.r#static {
                         let name =
                             self.declare_static_field(source, p, &mut static_fields, &statics)?;
@@ -365,6 +365,15 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     if m.computed || m.optional || m.r#override || !m.decorators.is_empty() {
                         return self.unsupported("this class method form", m.span);
                     }
+                    let is_abstract =
+                        m.r#type == js::MethodDefinitionType::TSAbstractMethodDefinition;
+                    if is_abstract
+                        && (!class.r#abstract
+                            || m.r#static
+                            || m.kind != js::MethodDefinitionKind::Method)
+                    {
+                        return self.unsupported("this abstract member form", m.span);
+                    }
                     match m.kind {
                         js::MethodDefinitionKind::Constructor => {
                             if constructor.is_some() {
@@ -443,6 +452,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             } else {
                                 format!("{source}.{method}")
                             };
+                            if is_abstract {
+                                self.abstract_methods.insert(key);
+                            }
                             bodies.push((key, component, &*m.value, m.r#static));
                         }
                         js::MethodDefinitionKind::Get | js::MethodDefinitionKind::Set => {
@@ -517,6 +529,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
         }
+        // A concrete class implements every abstract method it inherits.
+        if !class.r#abstract
+            && let Some((name, member)) = methods
+                .iter()
+                .find(|(_, m)| self.abstract_methods.contains(&m.key))
+        {
+            let owner = member.owner.map_or_else(String::new, |owner| {
+                self.classes[&owner]
+                    .component
+                    .trim_end_matches("\0new")
+                    .to_owned()
+            });
+            return self.error(
+                ErrorKind::Type,
+                format!("non-abstract class `{source}` does not implement inherited abstract member `{name}` from class `{owner}`"),
+                id.span,
+            );
+        }
         // A subclass keeps its base's layout as a prefix, so a base view reads it in place.
         let mut key: SmallVec<[(InternedString, PrimitiveType); 4]> = match base {
             Some(base) => self.layout_key(&self.classes[&base].ty),
@@ -584,6 +614,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 bodies,
                 base,
                 constructor_access,
+                is_abstract: class.r#abstract,
                 tag,
                 init,
                 static_fields,
@@ -1060,7 +1091,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
             }
             for (key, _, f, role) in bodies {
-                self.function_as(f, key, role)?;
+                if !self.abstract_methods.contains(&key) {
+                    self.function_as(f, key, role)?;
+                }
             }
         }
         Ok(())
@@ -1798,6 +1831,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(base));
         self.check_member_access(owner, access, name, at)?;
+        if self.abstract_methods.contains(&key) {
+            return self.error(
+                ErrorKind::Type,
+                format!("abstract method `{name}` cannot be accessed via super expression"),
+                at,
+            );
+        }
         let this = self.this_expr(at)?;
         self.member_call(key, owner, this, c)
     }
@@ -1896,7 +1936,11 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 None => overrides.push((member.key, owner, vec![tag])),
             }
         }
+        let abstract_key = self.abstract_methods.contains(&key);
         if overrides.is_empty() {
+            if abstract_key {
+                return self.unsupported("calls of abstract methods no class implements", at);
+            }
             return Ok(call);
         }
         let base_sig = self.signatures[&key].clone();
@@ -1964,7 +2008,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             )
         };
-        let mut selected = invoke(base_sig.native, receiver.clone());
+        // An abstract method has no body; no instance of its own class exists to run it.
+        let mut selected = if abstract_key {
+            let (implementation, owner, _) = overrides.pop().unwrap();
+            let native = self.signatures[&implementation].native;
+            let ty = self.classes[&owner].ty.clone();
+            let receiver = node(
+                TypedExpression::Cast(TypedCast {
+                    expr: Box::new(receiver.clone()),
+                    target_type: ty.clone(),
+                }),
+                ty,
+                at,
+            );
+            invoke(native, receiver)
+        } else {
+            invoke(base_sig.native, receiver.clone())
+        };
         for (implementation, owner, tags) in overrides.into_iter().rev() {
             let condition = tags
                 .into_iter()
@@ -2044,6 +2104,13 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         };
         if n.type_arguments.is_some() {
             return self.error(ErrorKind::Type, "class is not generic", n.span);
+        }
+        if self.classes[&view].is_abstract {
+            return self.error(
+                ErrorKind::Type,
+                "cannot create an instance of an abstract class",
+                n.span,
+            );
         }
         let allowed = match self.classes[&view].constructor_access {
             Access::Public => true,
