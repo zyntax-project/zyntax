@@ -669,25 +669,24 @@ pub fn osr_layout_with(
                 &mut live_in_types,
             );
         }
-        // A phi inside the region can name a value produced before it. The
-        // header's own phis are the exception: their incoming values are
-        // precisely what resuming replaces, and pulling them in would ask
-        // the frame for the entry values it exists to supersede.
-        if block_id != header {
-            for phi in &block.phis {
-                for (value_id, predecessor) in &phi.incoming {
-                    if !in_region.contains(predecessor) {
-                        continue;
-                    }
-                    consider_live_in(
-                        function,
-                        *value_id,
-                        &local_defs,
-                        &mut seen_extra,
-                        &mut live_ins,
-                        &mut live_in_types,
-                    );
+        // A phi inside the region can name a value produced before it. An
+        // incoming from outside the region is what resuming replaces, and
+        // the frame does not carry it. One from inside is taken again,
+        // the header's own included: an enclosing loop leads back to the
+        // header's loop-entry edge, which reads its value afresh.
+        for phi in &block.phis {
+            for (value_id, predecessor) in &phi.incoming {
+                if !in_region.contains(predecessor) {
+                    continue;
                 }
+                consider_live_in(
+                    function,
+                    *value_id,
+                    &local_defs,
+                    &mut seen_extra,
+                    &mut live_ins,
+                    &mut live_in_types,
+                );
             }
         }
     }
@@ -1851,6 +1850,131 @@ mod tests {
         assert!(!order.contains(&entry));
         assert!(!order.contains(&orphan));
         assert_eq!(order.len(), 7);
+    }
+
+    /// A probe at an inner loop's header resumes code the outer loop
+    /// leads back to the inner loop's entry edge from, so what that edge
+    /// brings in, computed before both loops, arrives in the frame.
+    #[test]
+    fn an_inner_loops_entry_value_is_a_live_in() {
+        use crate::hir::{
+            BinaryOp, HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi,
+            HirTerminator, HirValueKind,
+        };
+        use zyntax_typed_ast::InternedString;
+
+        let n = HirId::new();
+        let signature = HirFunctionSignature {
+            params: vec![HirParam {
+                id: n,
+                name: InternedString::new_global("n"),
+                ty: HirType::I64,
+                attributes: Default::default(),
+                ownership: Default::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut function = HirFunction::new(InternedString::new_global("f"), signature);
+        let entry = function.entry_block;
+        function.blocks.clear();
+        let [outer, pre, inner, latch, done, exit] = [(); 6].map(|_| HirId::new());
+        let start = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let more = function.create_value(HirType::Bool, HirValueKind::Instruction);
+        let i = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let go = function.create_value(HirType::Bool, HirValueKind::Instruction);
+        let next = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let block = |id, instructions, terminator| HirBlock {
+            id,
+            label: None,
+            phis: Vec::new(),
+            instructions,
+            terminator,
+            dominance_frontier: Default::default(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        let binary = |op, result, left, right| HirInstruction::Binary {
+            op,
+            result,
+            ty: HirType::I64,
+            left,
+            right,
+        };
+        // entry → outer ⇄ (pre → inner ⇄ latch, inner → done → outer),
+        // outer → exit; `start` is made in the entry and read only on the
+        // edge from `pre` into `inner`.
+        function.blocks.insert(
+            entry,
+            block(
+                entry,
+                vec![binary(BinaryOp::Sub, start, n, n)],
+                HirTerminator::Branch { target: outer },
+            ),
+        );
+        function.blocks.insert(
+            outer,
+            block(
+                outer,
+                vec![binary(BinaryOp::Ne, more, n, n)],
+                HirTerminator::CondBranch {
+                    condition: more,
+                    true_target: pre,
+                    false_target: exit,
+                },
+            ),
+        );
+        function.blocks.insert(
+            pre,
+            block(pre, Vec::new(), HirTerminator::Branch { target: inner }),
+        );
+        let mut head = block(
+            inner,
+            vec![binary(BinaryOp::Gt, go, i, n)],
+            HirTerminator::CondBranch {
+                condition: go,
+                true_target: latch,
+                false_target: done,
+            },
+        );
+        head.phis.push(HirPhi {
+            result: i,
+            ty: HirType::I64,
+            incoming: vec![(start, pre), (next, latch)],
+        });
+        function.blocks.insert(inner, head);
+        function.blocks.insert(
+            latch,
+            block(
+                latch,
+                vec![binary(BinaryOp::Add, next, i, n)],
+                HirTerminator::Branch { target: inner },
+            ),
+        );
+        function.blocks.insert(
+            done,
+            block(done, Vec::new(), HirTerminator::Branch { target: outer }),
+        );
+        function.blocks.insert(
+            exit,
+            block(exit, Vec::new(), HirTerminator::Return { values: vec![n] }),
+        );
+        function.rebuild_cfg_edges();
+
+        let layout = osr_layout(&function, inner).expect("layout");
+        assert_eq!(layout.live_ins.first(), Some(&i));
+        assert!(
+            layout.live_ins.contains(&start),
+            "the entry edge's value is read when the outer loop comes round: {:?}",
+            layout.live_ins
+        );
     }
 
     /// A region whose entry reaches its header through code that only
