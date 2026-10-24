@@ -497,6 +497,11 @@ impl BuiltinClass for ListClass {
                 ssa.emit_list_append_all(block_id, receiver, elem, &args[0])
                     .map(Some)
             }
+            "append_range" => {
+                arity(3)?;
+                ssa.emit_list_append_range(block_id, receiver, elem, &args[0], &args[1], &args[2])
+                    .map(Some)
+            }
             "resize_filled" => {
                 arity(2)?;
                 ssa.emit_list_resize_filled(block_id, receiver, elem, &args[0], &args[1])

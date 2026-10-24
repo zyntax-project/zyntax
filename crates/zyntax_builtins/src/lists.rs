@@ -1527,6 +1527,12 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         k.list.clone(),
         vec![
             out.decl(empty()),
+            expr(mcall(
+                out.e(),
+                "reserve",
+                vec![add(len(xs.e()), len(ys.e()))],
+                unit(),
+            )),
             expr(call(&name("extend"), vec![out.e(), xs.e()], unit())),
             expr(call(&name("extend"), vec![out.e(), ys.e()], unit())),
             ret(out.e()),
@@ -1639,10 +1645,24 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
             ),
             out.decl(empty()),
             i.decl(lo.e()),
+            // A unit step is one copy of the run; the bounds are clamped
+            // to the list already.
             if_(
-                gt(st.e(), int(0)),
-                vec![while_(lt(i.e(), hi.e()), step_body(&i))],
-                vec![while_(gt(i.e(), hi.e()), step_body(&i))],
+                eq(st.e(), int(1)),
+                vec![when(
+                    gt(hi.e(), lo.e()),
+                    vec![expr(mcall(
+                        out.e(),
+                        "append_range",
+                        vec![xs.e(), lo.e(), hi.e()],
+                        unit(),
+                    ))],
+                )],
+                vec![if_(
+                    gt(st.e(), int(0)),
+                    vec![while_(lt(i.e(), hi.e()), step_body(&i))],
+                    vec![while_(gt(i.e(), hi.e()), step_body(&i))],
+                )],
             ),
             ret(out.e()),
         ],

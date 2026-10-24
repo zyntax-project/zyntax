@@ -12136,6 +12136,49 @@ impl SsaBuilder {
         Ok(self.create_undef(HirType::Void))
     }
 
+    /// `xs.append_range(ys, lo, hi)`: the elements of `ys` from `lo` up
+    /// to `hi` after those of `xs`, as one copy of the bytes. The caller
+    /// keeps `0 <= lo <= hi <= len(ys)`.
+    pub(crate) fn emit_list_append_range(
+        &mut self,
+        block: HirId,
+        receiver: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        elem_ty: &Type,
+        other: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        lo: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+        hi: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.element_storage_type(elem_ty);
+        let mut cur = block;
+        let list = self.translate_operand(&mut cur, receiver)?;
+        let ys = self.translate_operand(&mut cur, other)?;
+        let lo = self.translate_operand(&mut cur, lo)?;
+        let lo = self.coerce_scalar_to(cur, lo, &HirType::I64);
+        let hi = self.translate_operand(&mut cur, hi)?;
+        let hi = self.coerce_scalar_to(cur, hi, &HirType::I64);
+        let len = self.list_len(cur, list);
+        let more = self.emit_bin(cur, B::Sub, &HirType::I64, hi, lo);
+        let needed = self.emit_bin(cur, B::Add, &HirType::I64, len, more);
+        self.list_reserve(&mut cur, list, needed, needed, &elem);
+        // Read after the reserve: `ys` may be `xs`, whose storage moved.
+        let data = self.list_data(cur, list, &elem);
+        let to = self.emit_elem_gep(cur, data, len, elem.clone());
+        let source = self.list_data(cur, ys, &elem);
+        let from = self.emit_elem_gep(cur, source, lo, elem.clone());
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, more, size);
+        self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Memcpy,
+            vec![to, from, bytes],
+            &HirType::Void,
+        );
+        self.list_set_len(cur, list, needed);
+        self.settle(block, cur);
+        Ok(self.create_undef(HirType::Void))
+    }
+
     /// `list.resize_filled(n, byte)`: `n` elements, every byte of the
     /// ones past the old length set to `byte`.
     pub(crate) fn emit_list_resize_filled(

@@ -6707,18 +6707,73 @@ impl<'m> Lowerer<'m> {
         if let Some((table, walk)) = self.table_walk(f)? {
             return self.for_table(f, table, walk, extra, span);
         }
-        let range = match &*f.iter {
-            py::Expr::Call(c)
-                if types::is_name(&c.func, "range") && c.arguments.keywords.is_empty() =>
+        fn is_range(e: &py::Expr) -> Option<&py::ExprCall> {
+            match e {
+                py::Expr::Call(c)
+                    if types::is_name(&c.func, "range") && c.arguments.keywords.is_empty() =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            }
+        }
+        // `reversed(range(a, b))` counts down from `b - 1` to `a`.
+        let reversed = match &*f.iter {
+            py::Expr::Call(r)
+                if types::is_name(&r.func, "reversed")
+                    && r.arguments.keywords.is_empty()
+                    && r.arguments.args.len() == 1 =>
             {
-                Some(c)
+                is_range(&r.arguments.args[0]).filter(|c| (1..=2).contains(&c.arguments.args.len()))
             }
             _ => None,
         };
+        let range = is_range(&f.iter).or(reversed);
         let (Some(c), py::Expr::Name(target)) = (range, &*f.target) else {
             return self.for_sequence(f, extra, span);
         };
         let (start, end, step) = match c.arguments.args.as_ref() {
+            // Each bound is read once, the first before the second.
+            _ if reversed.is_some() => {
+                let (low, high) = match c.arguments.args.as_ref() {
+                    [end] => (None, end),
+                    [start, end] => (Some(start), end),
+                    _ => unreachable!("reversed ranges take one or two bounds"),
+                };
+                let mut held = Vec::new();
+                let low = match low {
+                    Some(low) => {
+                        let low = self.expr_as(low, Ty::Int)?;
+                        let low = self.hold(
+                            Val {
+                                node: low,
+                                ty: Ty::Int,
+                            },
+                            &mut held,
+                            span,
+                        );
+                        self.hoisted.append(&mut held);
+                        Some(low.node)
+                    }
+                    None => None,
+                };
+                let high = self.expr_as(high, Ty::Int)?;
+                let high = self.hold(
+                    Val {
+                        node: high,
+                        ty: Ty::Int,
+                    },
+                    &mut held,
+                    span,
+                );
+                self.hoisted.append(&mut held);
+                let less_one = |n: Node| binary(BinaryOp::Sub, n, int_lit(1, span), Ty::Int, span);
+                (
+                    less_one(high.node),
+                    low.map(less_one).unwrap_or_else(|| int_lit(-1, span)),
+                    Some(int_lit(-1, span)),
+                )
+            }
             [end] => (int_lit(0, span), self.expr_as(end, Ty::Int)?, None),
             [start, end] => (
                 self.expr_as(start, Ty::Int)?,
@@ -6792,6 +6847,7 @@ impl<'m> Lowerer<'m> {
             .bound
             .contains(target.id.as_str());
         let step_sign = match c.arguments.args.get(2) {
+            _ if reversed.is_some() => Some(-1),
             None => Some(1),
             Some(e) => types::int_literal(e).map(|v| v.signum()),
         };
