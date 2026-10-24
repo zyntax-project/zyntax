@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2430,
+      "start": 36,
+      "length": 1,
+      "file": "extends_conflict_error.ts",
+      "message": "Interface 'B' incorrectly extends interface 'A'.\n  Types of property 'x' are incompatible.\n    Type 'string' is not assignable to type 'number'."
+    }
+  ],
+  "source_sha256": "faf9ac6072b3c3987510fdd3453bbe8179a70ee9ae7672ac17c40545f0c50907",
+  "options": {}
+}

@@ -91,9 +91,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if class.heritage.is_some() {
             return self.unsupported("class inheritance", class.span);
         }
-        if !class.implements.is_empty() {
-            return self.unsupported("classes implementing interfaces", class.span);
-        }
+
         if class.r#abstract || class.declare || !class.decorators.is_empty() {
             return self.unsupported("abstract, ambient or decorated classes", class.span);
         }
@@ -272,6 +270,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 (key, component, f, role)
             })
             .collect();
+        self.check_implements(class, &fields)?;
         self.aliases.insert(name, (ty.clone(), Some(view)));
         self.class_names.insert(name, view);
         self.class_order.push(view);
@@ -289,6 +288,62 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 span: class.span,
             },
         );
+        Ok(())
+    }
+
+    /// A class implementing record interfaces declares each of their fields, publicly and with
+    /// the same type.
+    fn check_implements(
+        &self,
+        class: &js::Class<'ast>,
+        fields: &[ClassField<'ast, 'program>],
+    ) -> Result<()> {
+        for clause in &class.implements {
+            let js::TSTypeName::IdentifierReference(name) = &clause.expression else {
+                return self.unsupported("implementing qualified type names", clause.span);
+            };
+            if clause.type_arguments.is_some() {
+                return self.unsupported("implementing generic interfaces", clause.span);
+            }
+            let key = self.name(name.name.as_str());
+            let Some((_, view)) = self.aliases.get(&key) else {
+                if self.declared_types.contains(&key) {
+                    return self.unsupported(UNRESOLVED_REFERENCE, clause.span);
+                }
+                if library_type(name.name.as_str()) {
+                    return self.unsupported(&format!("library type `{}`", name.name), clause.span);
+                }
+                return self.error(
+                    ErrorKind::Type,
+                    format!("cannot find name `{}`", name.name),
+                    clause.span,
+                );
+            };
+            if self.class_names.contains_key(&key) {
+                return self.unsupported("classes implementing classes", clause.span);
+            }
+            let Some(view) = view.and_then(|v| self.views.get(&v)) else {
+                return self.unsupported("implementing this type", clause.span);
+            };
+            for required in &view.fields {
+                let property = required.name.resolve_global().unwrap_or_default();
+                let found = fields.iter().find(|f| self.name(f.name) == required.name);
+                let matches = found.is_some_and(|f| {
+                    !f.private && Some(Type::Primitive(f.ty)) == Some(required.ty.clone())
+                });
+                if !matches {
+                    return self.error(
+                        ErrorKind::Type,
+                        format!(
+                            "class `{}` incorrectly implements `{}`: property `{property}`",
+                            class.id.as_ref().map_or("", |id| id.name.as_str()),
+                            name.name
+                        ),
+                        clause.span,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

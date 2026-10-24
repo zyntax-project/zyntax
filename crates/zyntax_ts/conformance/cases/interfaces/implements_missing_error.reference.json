@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2420,
+      "start": 53,
+      "length": 5,
+      "file": "implements_missing_error.ts",
+      "message": "Class 'Thing' incorrectly implements interface 'Named'.\n  Property 'size' is missing in type 'Thing' but required in type 'Named'."
+    }
+  ],
+  "source_sha256": "5de4efeda6f036c45ac7bb34ad37092c257158c8667dbd3eb892588bcef99d97",
+  "options": {}
+}

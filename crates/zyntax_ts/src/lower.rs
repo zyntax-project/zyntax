@@ -780,7 +780,20 @@ pub(crate) fn with_parsed<T, E>(
     if let Some(at) = missing_member_separator(&parsed.program, source) {
         return Err(error(Error::new(ErrorKind::Syntax, "';' expected", at)));
     }
-    lower(&parsed.program, &semantic.semantic)
+    // `@ts-nocheck` turns TypeScript's semantic errors off; native code cannot be built past one.
+    let nocheck = parsed
+        .program
+        .comments
+        .iter()
+        .find(|c| source[c.span.start as usize..c.span.end as usize].contains("@ts-nocheck"));
+    match (lower(&parsed.program, &semantic.semantic), nocheck) {
+        (Err(_), Some(comment)) => Err(error(Error::new(
+            ErrorKind::Unsupported,
+            "type errors in files that disable checking with @ts-nocheck are not implemented yet",
+            comment.span,
+        ))),
+        (result, _) => result,
+    }
 }
 
 /// Type members on one line need a `;` or `,` between them, which the parser does not require.
@@ -821,6 +834,9 @@ fn missing_member_separator(program: &js::Program<'_>, source: &str) -> Option<o
     members.visit_program(program);
     members.found
 }
+
+/// A type naming a declaration that has not resolved yet.
+const UNRESOLVED_REFERENCE: &str = "recursive or unresolved type references";
 
 // Grammar rules oxc enforces while parsing but TypeScript reports from its checker.
 const CHECKER_GRAMMAR_ERRORS: &[&str] = &[
@@ -899,6 +915,8 @@ struct Lowerer<'ast, 'program> {
     prefix_len: usize,
     registry: TypeRegistry,
     aliases: FxHashMap<InternedString, (Type, Option<InternedString>)>,
+    /// Type declarations in this module, resolved or not.
+    declared_types: FxHashSet<InternedString>,
     /// Inline object type literals with known layouts, by source offset.
     type_literals: FxHashMap<u32, (Type, Option<InternedString>)>,
     imported_exports: FxHashMap<InternedString, CheckerExport>,
@@ -978,6 +996,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             registry,
             aliases: FxHashMap::default(),
             type_literals: FxHashMap::default(),
+            declared_types: FxHashSet::default(),
             imported_exports: FxHashMap::default(),
             namespaces: vec![],
             namespace_references: FxHashMap::default(),
@@ -1113,21 +1132,47 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 )
             })
             .collect();
+        for item in &pending {
+            let (name, span) = match item {
+                js::Declaration::TSInterfaceDeclaration(i) => (i.id.name.as_str(), i.span),
+                js::Declaration::TSTypeAliasDeclaration(a) => (a.id.name.as_str(), a.span),
+                js::Declaration::ClassDeclaration(c) => match &c.id {
+                    Some(id) => (id.name.as_str(), c.span),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let name = self.name(name);
+            if !self.declared_types.insert(name) {
+                return self.unsupported("declaration merging", span);
+            }
+        }
         while !pending.is_empty() {
             let before = pending.len();
             let mut next = vec![];
-            let mut last = None;
+            let mut errors = vec![];
             for item in pending {
                 match self.type_declaration(item) {
                     Ok(()) => {}
                     Err(e) => {
-                        last = Some(e);
+                        errors.push(e);
                         next.push(item);
                     }
                 }
             }
             if next.len() == before {
-                return Err(last.unwrap());
+                // A program error wins over a gap; a gap is reported where it occurs, not at a
+                // declaration waiting on it.
+                let at = errors
+                    .iter()
+                    .position(|e| e.kind != ErrorKind::Unsupported)
+                    .or_else(|| {
+                        errors
+                            .iter()
+                            .position(|e| !e.message.starts_with(UNRESOLVED_REFERENCE))
+                    })
+                    .unwrap_or(errors.len() - 1);
+                return Err(errors.swap_remove(at));
             }
             pending = next;
         }
@@ -1321,7 +1366,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         match item {
             js::Declaration::ClassDeclaration(class) => self.declare_class(class)?,
             js::Declaration::TSInterfaceDeclaration(i) => {
-                if i.type_parameters.is_some() || !i.extends.is_empty() {
+                if i.type_parameters.is_some() {
                     return self.unsupported("generic or extending interfaces", i.span);
                 }
                 let name = self.name(i.id.name.as_str());
@@ -1329,9 +1374,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     return self.unsupported("declaration merging", i.span);
                 }
                 let fields = self.fields(&i.body.body)?;
-                let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
-                let view = self.record_view(i.id.name.as_str(), &ty, fields);
-                self.aliases.insert(name, (ty, Some(view)));
+                if i.extends.is_empty() {
+                    let ty = self.layout(fields.iter().map(|(name, field)| (*name, field.ty)));
+                    let view = self.record_view(i.id.name.as_str(), &ty, fields);
+                    self.aliases.insert(name, (ty, Some(view)));
+                } else {
+                    let (ty, view) = self.extended_interface(i, fields)?;
+                    self.aliases.insert(name, (ty, Some(view)));
+                }
             }
             js::Declaration::TSTypeAliasDeclaration(a) => {
                 if a.type_parameters.is_some() {
@@ -1421,10 +1471,6 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     fn record_view(&mut self, name: &str, ty: &Type, fields: Fields<'ast>) -> InternedString {
-        self.name_buffer.truncate(self.prefix_len);
-        self.name_buffer.push_str("view$");
-        crate::modules::append_component(&mut self.name_buffer, name);
-        let name = intern(&self.name_buffer);
         let fields = fields
             .into_iter()
             .map(|(name, field)| CheckerField {
@@ -1433,6 +1479,19 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 readonly: field.readonly,
             })
             .collect();
+        self.record_view_of(name, ty, fields)
+    }
+
+    fn record_view_of(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        fields: Vec<CheckerField>,
+    ) -> InternedString {
+        self.name_buffer.truncate(self.prefix_len);
+        self.name_buffer.push_str("view$");
+        crate::modules::append_component(&mut self.name_buffer, name);
+        let name = intern(&self.name_buffer);
         self.views.insert(
             name,
             Arc::new(CheckerView {
@@ -1444,9 +1503,90 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         name
     }
 
+    /// An interface's own fields joined with those of the record interfaces it extends: a field
+    /// both declare must have one type.
+    fn extended_interface(
+        &mut self,
+        interface: &js::TSInterfaceDeclaration<'ast>,
+        own: Fields<'ast>,
+    ) -> Result<(Type, InternedString)> {
+        let mut fields: SmallVec<[CheckerField; 4]> = own
+            .iter()
+            .map(|(name, field)| CheckerField {
+                name: self.name(name),
+                ty: Type::Primitive(field.ty),
+                readonly: field.readonly,
+            })
+            .collect();
+        let declared = fields.len();
+        for heritage in &interface.extends {
+            let js::TSTypeName::IdentifierReference(base) = &heritage.type_name else {
+                return self.unsupported("extending qualified type names", heritage.span);
+            };
+            if heritage.type_arguments.is_some() {
+                return self.unsupported("extending generic interfaces", heritage.span);
+            }
+            let base_name = self.name(base.name.as_str());
+            let Some((_, base_view)) = self.aliases.get(&base_name).cloned() else {
+                if self.declared_types.contains(&base_name) {
+                    return self.unsupported(UNRESOLVED_REFERENCE, heritage.span);
+                }
+                if library_type(base.name.as_str()) {
+                    return self
+                        .unsupported(&format!("library type `{}`", base.name), heritage.span);
+                }
+                return self.error(
+                    ErrorKind::Type,
+                    format!("cannot find name `{}`", base.name),
+                    heritage.span,
+                );
+            };
+            if self.class_names.contains_key(&base_name) {
+                return self.unsupported("interfaces extending classes", heritage.span);
+            }
+            let Some(view) = base_view.and_then(|v| self.views.get(&v)).cloned() else {
+                return self.unsupported("interfaces extending this type", heritage.span);
+            };
+            for field in &view.fields {
+                match fields.iter().position(|f| f.name == field.name) {
+                    Some(index) if fields[index].ty != field.ty => {
+                        let property = field.name.resolve_global().unwrap_or_default();
+                        let message = if index < declared {
+                            format!(
+                                "interface `{}` incorrectly extends `{}`: property `{property}` has another type",
+                                interface.id.name, base.name
+                            )
+                        } else {
+                            format!(
+                                "interface `{}` cannot extend two types whose property `{property}` differs",
+                                interface.id.name
+                            )
+                        };
+                        return self.error(ErrorKind::Type, message, heritage.span);
+                    }
+                    Some(_) => {}
+                    None => fields.push(field.clone()),
+                }
+            }
+        }
+        // Record layouts order fields by name.
+        fields.sort_by_key(|f| f.name.resolve_global().unwrap_or_default());
+        let key: SmallVec<[(InternedString, PrimitiveType); 4]> = fields
+            .iter()
+            .map(|f| (f.name, field_primitive(&f.ty).unwrap()))
+            .collect();
+        let ty = self.layout_of(key);
+        let view = self.record_view_of(interface.id.name.as_str(), &ty, fields.into_vec());
+        Ok((ty, view))
+    }
+
     fn layout(&mut self, fields: impl Iterator<Item = (&'ast str, PrimitiveType)>) -> Type {
         let key: SmallVec<[(InternedString, PrimitiveType); 4]> =
             fields.map(|(name, ty)| (self.name(name), ty)).collect();
+        self.layout_of(key)
+    }
+
+    fn layout_of(&mut self, key: SmallVec<[(InternedString, PrimitiveType); 4]>) -> Type {
         let id = if let Some(id) = self.layouts.get(key.as_slice()) {
             *id
         } else {
@@ -1592,6 +1732,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 if let Some(found) = self.aliases.get(&name) {
                     return Ok(found.clone());
+                }
+                if self.declared_types.contains(&name) {
+                    return self.unsupported(UNRESOLVED_REFERENCE, r.span);
                 }
                 let source = name.resolve_global().unwrap_or_default();
                 if library_type(&source) {

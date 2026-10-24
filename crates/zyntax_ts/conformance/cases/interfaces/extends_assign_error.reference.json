@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2741,
+      "start": 92,
+      "length": 1,
+      "file": "extends_assign_error.ts",
+      "message": "Property 'z' is missing in type '{ x: number; y: number; }' but required in type 'Point3'."
+    }
+  ],
+  "source_sha256": "2e290a642912537a8512d9cfeb7279ef0ac7095faeeedaced6cf05bafb0dc377",
+  "options": {}
+}

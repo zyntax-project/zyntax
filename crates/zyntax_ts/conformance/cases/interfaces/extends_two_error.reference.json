@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2320,
+      "start": 63,
+      "length": 1,
+      "file": "extends_two_error.ts",
+      "message": "Interface 'C' cannot simultaneously extend types 'A' and 'B'.\n  Named property 'x' of types 'A' and 'B' are not identical."
+    }
+  ],
+  "source_sha256": "82d77c3462fac35190b2caa42c8966bdfaf379f36ac81e3aee6f4e0f0f8c74cd",
+  "options": {}
+}

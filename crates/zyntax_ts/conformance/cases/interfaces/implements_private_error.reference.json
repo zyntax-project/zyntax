@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2420,
+      "start": 39,
+      "length": 5,
+      "file": "implements_private_error.ts",
+      "message": "Class 'Thing' incorrectly implements interface 'Sized'.\n  Property 'size' is private in type 'Thing' but not in type 'Sized'."
+    }
+  ],
+  "source_sha256": "a0006f5fb7f8e917d482c4b58be165a6e8edaa0eacd594afaf49e5baaa601782",
+  "options": {}
+}

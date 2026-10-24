@@ -2524,5 +2524,35 @@
     "id": "classes/string_field_error",
     "file": "cases/classes/string_field_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "interfaces/extends",
+    "file": "cases/interfaces/extends.ts",
+    "mode": "run"
+  },
+  {
+    "id": "interfaces/extends_assign_error",
+    "file": "cases/interfaces/extends_assign_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "interfaces/extends_conflict_error",
+    "file": "cases/interfaces/extends_conflict_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "interfaces/extends_two_error",
+    "file": "cases/interfaces/extends_two_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "interfaces/implements_missing_error",
+    "file": "cases/interfaces/implements_missing_error.ts",
+    "mode": "check"
+  },
+  {
+    "id": "interfaces/implements_private_error",
+    "file": "cases/interfaces/implements_private_error.ts",
+    "mode": "check"
   }
 ]
