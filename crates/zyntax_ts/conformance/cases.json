@@ -2624,5 +2624,15 @@
     "id": "classes/inheritance_fluent",
     "file": "cases/classes/inheritance_fluent.ts",
     "mode": "run"
+  },
+  {
+    "id": "types/literal_unions",
+    "file": "cases/types/literal_unions.ts",
+    "mode": "run"
+  },
+  {
+    "id": "types/literal_widened_error",
+    "file": "cases/types/literal_widened_error.ts",
+    "mode": "check"
   }
 ]

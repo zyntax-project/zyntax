@@ -1,0 +1,16 @@
+{
+  "compiler": "7.1.0-beta",
+  "accepted": false,
+  "kind": "Type",
+  "diagnostics": [
+    {
+      "code": 2322,
+      "start": 65,
+      "length": 1,
+      "file": "literal_widened_error.ts",
+      "message": "Type 'string' is not assignable to type 'Direction'."
+    }
+  ],
+  "source_sha256": "e9f5e73e16fdc05e50197ee86f84d2a035e379e79a465b4c89f31b8d149be0cc",
+  "options": {}
+}

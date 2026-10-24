@@ -379,10 +379,28 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     test.span(),
                 );
             }
-            if let (enums::Static::Enum { view, members }, enums::Static::Enum { view: other, .. }) =
-                (self.static_value(test), self.static_value(&s.discriminant))
-                && view == other
+            let tested_members = match (self.static_value(test), self.static_value(&s.discriminant))
             {
+                (
+                    enums::Static::Enum { view, members },
+                    enums::Static::Enum { view: other, .. },
+                ) if view == other => Some(members),
+                // A literal case covers the member of a literal type with its value.
+                (literal, enums::Static::Enum { view, .. }) => self
+                    .enum_of(Some(view))
+                    .filter(|enumeration| enumeration.literal)
+                    .and_then(|enumeration| match literal {
+                        enums::Static::Text(text) => {
+                            Some(enumeration.valued(enums::Value::Text(text)))
+                        }
+                        enums::Static::Number(n) => {
+                            Some(enumeration.valued(enums::Value::Number(n)))
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            if let Some(members) = tested_members {
                 covered = Some(match covered {
                     Some(earlier) => earlier.union(&members),
                     None => members,

@@ -59,7 +59,7 @@ fn nocheck_files_that_need_a_type_error_are_gaps() {
 
 #[test]
 fn unresolved_declarations_report_the_declaration_that_fails() {
-    let source = "type S = \"a\" | \"b\";\ntype T = S[] | S;\nconst t = 1;";
+    let source = "type S = [number, string];\ntype T = S[] | S;\nconst t = 1;";
     let error = zyntax_ts::parse_program(source, "aliases.ts", Default::default()).unwrap_err();
     assert_eq!(error.kind, zyntax_ts::ErrorKind::Unsupported, "{error}");
     assert!(

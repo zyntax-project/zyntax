@@ -29,6 +29,9 @@ pub(super) struct Enum {
     pub view: InternedString,
     pub constant: bool,
     pub ambient: bool,
+    /// The module's string or number literal types: a literal type is a member type, and a
+    /// matching literal value is assignable to it.
+    pub literal: bool,
     pub members: Vec<Member>,
     /// Set once the module body has run the declaration, when a call may run before it.
     pub ready: Option<InternedString>,
@@ -139,6 +142,25 @@ pub(super) enum Static {
 }
 
 /// ToInt32, for bitwise operators in constant enum expressions.
+/// The value of a string or number literal type.
+fn literal_type_value(literal: &js::TSLiteral<'_>) -> Option<Value> {
+    match literal {
+        js::TSLiteral::StringLiteral(s) if !s.lone_surrogates => {
+            Some(Value::Text(InternedString::new_global(s.value.as_str())))
+        }
+        js::TSLiteral::NumericLiteral(n) => Some(Value::Number(n.value)),
+        js::TSLiteral::UnaryExpression(u) if u.operator.as_str() == "-" => match &u.argument {
+            js::Expression::NumericLiteral(n) => Some(Value::Number(-n.value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn literal_source(kind: &str) -> InternedString {
+    InternedString::new_global(&format!("\0{kind} literals"))
+}
+
 fn int32(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -287,11 +309,105 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 view,
                 constant,
                 ambient,
+                literal: false,
                 members,
                 ready: None,
             },
         );
         Ok(())
+    }
+
+    /// Declares the string and number literal types the module writes as two literal enums,
+    /// so literal unions share the enum checks, narrowing and exhaustiveness.
+    pub(super) fn declare_literal_types(&mut self, program: &js::Program<'ast>) {
+        #[derive(Default)]
+        struct Literals {
+            texts: Vec<InternedString>,
+            numbers: Vec<f64>,
+        }
+        impl<'a> Visit<'a> for Literals {
+            fn visit_ts_literal_type(&mut self, it: &js::TSLiteralType<'a>) {
+                match literal_type_value(&it.literal) {
+                    Some(Value::Text(text)) if !self.texts.contains(&text) => {
+                        self.texts.push(text);
+                    }
+                    Some(Value::Number(n))
+                        if !self.numbers.iter().any(|m| m.to_bits() == n.to_bits()) =>
+                    {
+                        self.numbers.push(n);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut literals = Literals::default();
+        literals.visit_program(program);
+        let kinds = [
+            (
+                "string",
+                literals
+                    .texts
+                    .into_iter()
+                    .map(|text| Member {
+                        name: text,
+                        value: Value::Text(text),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "number",
+                literals
+                    .numbers
+                    .into_iter()
+                    .map(|n| Member {
+                        name: intern(&number_text(n)),
+                        value: Value::Number(n),
+                    })
+                    .collect(),
+            ),
+        ];
+        for (kind, members) in kinds {
+            if members.is_empty() {
+                continue;
+            }
+            let source = literal_source(kind);
+            self.name_buffer.truncate(self.prefix_len);
+            self.name_buffer.push_str("literal$");
+            self.name_buffer.push_str(kind);
+            let view = intern(&self.name_buffer);
+            self.enum_views.insert(view, source);
+            self.enums.insert(
+                source,
+                Enum {
+                    source,
+                    view,
+                    constant: true,
+                    ambient: false,
+                    literal: true,
+                    members,
+                    ready: None,
+                },
+            );
+        }
+    }
+
+    /// A string or number literal type: its member type in the literal enum.
+    pub(super) fn literal_type(
+        &self,
+        literal: &js::TSLiteralType<'ast>,
+    ) -> Option<Result<(Type, Option<InternedString>)>> {
+        let value = literal_type_value(&literal.literal)?;
+        let kind = if matches!(value, Value::Text(_)) {
+            "string"
+        } else {
+            "number"
+        };
+        let enumeration = &self.enums[&literal_source(kind)];
+        let members = enumeration.valued(value);
+        Some(Ok((
+            enumeration.physical(),
+            Some(self.member_view(enumeration, members)),
+        )))
     }
 
     fn member_name(id: &js::TSEnumMemberName<'ast>) -> Option<&'ast str> {
@@ -854,6 +970,24 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
 
     fn describe_static(&self, value: &Static) -> String {
         match value {
+            Static::Enum { view, members } if self.enum_of(Some(*view)).unwrap().literal => {
+                let enumeration = self.enum_of(Some(*view)).unwrap();
+                (0..enumeration.members.len())
+                    .filter(|index| {
+                        !members
+                            .intersect(&Members::single(enumeration.members.len(), *index))
+                            .is_empty()
+                    })
+                    .map(|index| match enumeration.members[index].value {
+                        Value::Text(text) => {
+                            format!("\"{}\"", text.resolve_global().unwrap_or_default())
+                        }
+                        Value::Number(n) => number_text(n),
+                        Value::Computed => unreachable!(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
             Static::Enum { view, members } => {
                 let enumeration = self.enum_of(Some(*view)).unwrap();
                 let source = enumeration.source.resolve_global().unwrap_or_default();
@@ -963,9 +1097,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                             .intersect(&allowed)
                             .is_empty())
             }
-            Static::Text(_) => false,
+            Static::Text(text) => {
+                enumeration.literal
+                    && !enumeration
+                        .valued(Value::Text(*text))
+                        .intersect(&allowed)
+                        .is_empty()
+            }
+            // A number is assignable to a numeric enum, but not to a literal type.
             Static::Other => {
-                enumeration.kind() == Kind::Numeric && self.enum_of(self.view_of(source)).is_none()
+                !enumeration.literal
+                    && enumeration.kind() == Kind::Numeric
+                    && self.enum_of(self.view_of(source)).is_none()
             }
         };
         if accepted {
@@ -1096,7 +1239,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         what: &str,
         at: oxc_span::Span,
     ) -> Result<()> {
-        if self.enum_of(view).is_some() {
+        if let Some(enumeration) = self.enum_of(view) {
+            if enumeration.literal {
+                return self.unsupported(&what.replace("enum", "literal"), at);
+            }
             return self.unsupported(what, at);
         }
         Ok(())

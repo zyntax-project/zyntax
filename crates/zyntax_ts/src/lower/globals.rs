@@ -188,7 +188,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         if !candidates.is_empty() {
             captures.visit_program(program);
         }
-        if captures.captured.is_empty() && self.enums.is_empty() {
+        if captures.captured.is_empty() && self.enums.values().all(|e| e.literal) {
             return Ok(());
         }
         let mut runs = RunsCode {

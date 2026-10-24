@@ -1490,6 +1490,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let reexports = self.imports(program, semantic, dependencies)?;
         // Enum initializers may name constants; types may name enums.
         self.collect_constants(program);
+        self.declare_literal_types(program);
         self.declare_enums(program)?;
         self.inline_type_literals(program);
         self.class_heritage(program);
@@ -2011,6 +2012,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             js::TSType::TSStringKeyword(_) => (string(), None),
             js::TSType::TSVoidKeyword(_) => (unit(), None),
             js::TSType::TSUndefinedKeyword(_) => (undefined(), None),
+            js::TSType::TSLiteralType(l) if self.literal_type(l).is_some() => {
+                return self.literal_type(l).unwrap();
+            }
             js::TSType::TSUnionType(u) => {
                 if let Some(members) = self.enum_union(u) {
                     return members;
