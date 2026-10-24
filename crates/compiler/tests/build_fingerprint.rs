@@ -62,6 +62,13 @@ fn shared_type_and_codec_changes_always_change_the_identity() {
         write(root, file, "build input");
     }
     std::fs::remove_file(root.join("Cargo.lock")).unwrap();
+    let unlocked = fingerprint(root).unwrap();
+    assert_ne!(
+        unlocked, original,
+        "an absent lockfile is part of the identity"
+    );
+    write(root, "Cargo.lock", "build input");
+    std::fs::remove_file(root.join("crates/compiler/build.rs")).unwrap();
     assert!(
         fingerprint(root).is_err(),
         "missing inputs must not silently produce a partial identity"
