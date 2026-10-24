@@ -52,6 +52,25 @@ pub(super) enum Access {
     Private,
 }
 
+/// Counts a body's `return this` statements and its other returns, outside nested functions.
+struct ThisReturns {
+    this: usize,
+    other: usize,
+}
+
+impl<'a> Visit<'a> for ThisReturns {
+    fn visit_return_statement(&mut self, it: &js::ReturnStatement<'a>) {
+        match &it.argument {
+            Some(js::Expression::ThisExpression(_)) => self.this += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    fn visit_function(&mut self, _: &js::Function<'a>, _: oxc_semantic::ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _: &js::ArrowFunctionExpression<'a>) {}
+}
+
 /// Whether a `super(...)` call occurs.
 struct SuperCalls {
     found: bool,
@@ -83,6 +102,8 @@ pub(super) struct ClassField<'ast, 'program> {
     pub initializer: Option<&'program js::Expression<'ast>>,
     /// Declared by a constructor parameter.
     pub parameter: bool,
+    /// Redeclares an inherited field, whose layout slot it keeps.
+    pub inherited_slot: bool,
     pub definite: bool,
     pub span: oxc_span::Span,
 }
@@ -225,31 +246,49 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                         (None, Some(js::Expression::NumericLiteral(_))) => PrimitiveType::F64,
                         (None, Some(js::Expression::BooleanLiteral(_))) => PrimitiveType::Bool,
                         (None, Some(js::Expression::StringLiteral(_))) => PrimitiveType::String,
+                        // A redeclared field's initializer is checked against the inherited
+                        // type; a different type is TypeScript's incompatible override.
+                        (None, Some(_))
+                            if let Some(inherited) =
+                                fields.iter().find(|f| f.name == field && f.owner.is_some()) =>
+                        {
+                            inherited.ty
+                        }
                         _ => return self.unsupported("class field type inference", p.span),
                     };
                     if fields.iter().any(|f| f.name == field && f.owner.is_none()) {
                         return self.error(ErrorKind::Type, "duplicate identifier", p.span);
                     }
-                    self.check_inherited_member(
+                    let redeclared = self.check_inherited_member(
                         source,
                         &fields,
                         &methods,
                         field,
                         Some(ty),
+                        p.value.is_some(),
                         p.span,
                     )?;
-                    nominal |= access(p.accessibility) != Access::Public;
-                    fields.push(ClassField {
+                    let access = access(p.accessibility);
+                    if let Some(index) = redeclared {
+                        self.check_field_visibility(source, &fields[index], access, p.span)?;
+                    }
+                    nominal |= access != Access::Public;
+                    let declared = ClassField {
                         name: field,
                         ty,
                         readonly: p.readonly,
-                        access: access(p.accessibility),
+                        access,
                         owner: None,
                         initializer: p.value.as_ref(),
                         parameter: false,
+                        inherited_slot: redeclared.is_some(),
                         definite: p.definite,
                         span: p.span,
-                    });
+                    };
+                    match redeclared {
+                        Some(index) => fields[index] = declared,
+                        None => fields.push(declared),
+                    }
                 }
                 js::ClassElement::MethodDefinition(m) => {
                     if m.computed || m.optional || m.r#override || !m.decorators.is_empty() {
@@ -294,6 +333,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                     &FxHashMap::default(),
                                     method,
                                     None,
+                                    true,
                                     m.span,
                                 )?;
                             }
@@ -352,19 +392,36 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 if fields.iter().any(|f| f.name == field && f.owner.is_none()) {
                     return self.error(ErrorKind::Type, "duplicate identifier", p.span);
                 }
-                self.check_inherited_member(source, &fields, &methods, field, Some(ty), p.span)?;
-                nominal |= access(p.accessibility) != Access::Public;
-                fields.push(ClassField {
+                let redeclared = self.check_inherited_member(
+                    source,
+                    &fields,
+                    &methods,
+                    field,
+                    Some(ty),
+                    true,
+                    p.span,
+                )?;
+                let access = access(p.accessibility);
+                if let Some(index) = redeclared {
+                    self.check_field_visibility(source, &fields[index], access, p.span)?;
+                }
+                nominal |= access != Access::Public;
+                let declared = ClassField {
                     name: field,
                     ty,
                     readonly: p.readonly,
-                    access: access(p.accessibility),
+                    access,
                     owner: None,
                     initializer: None,
                     parameter: true,
+                    inherited_slot: redeclared.is_some(),
                     definite: false,
                     span: p.span,
-                });
+                };
+                match redeclared {
+                    Some(index) => fields[index] = declared,
+                    None => fields.push(declared),
+                }
             }
         }
         // A subclass keeps its base's layout as a prefix, so a base view reads it in place.
@@ -375,8 +432,10 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 .collect(),
             None => SmallVec::new(),
         };
-        let mut own: Vec<&ClassField<'ast, 'program>> =
-            fields.iter().filter(|f| f.owner.is_none()).collect();
+        let mut own: Vec<&ClassField<'ast, 'program>> = fields
+            .iter()
+            .filter(|f| f.owner.is_none() && !f.inherited_slot)
+            .collect();
         own.sort_by_key(|f| f.name);
         key.extend(own.iter().map(|f| (self.name(f.name), f.ty)));
         let ty = self.layout_of(key);
@@ -532,6 +591,8 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
     }
 
     /// A member a subclass declares must agree in kind and type with the one it inherits.
+    /// Returns the inherited field a field declaration redeclares, which must give it a value.
+    #[allow(clippy::too_many_arguments)]
     fn check_inherited_member(
         &self,
         class: &str,
@@ -539,12 +600,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         methods: &FxHashMap<&'ast str, Member>,
         name: &str,
         field_type: Option<PrimitiveType>,
+        valued: bool,
         at: oxc_span::Span,
-    ) -> Result<()> {
-        let inherited_field = fields.iter().find(|f| f.name == name && f.owner.is_some());
+    ) -> Result<Option<usize>> {
+        let inherited_field = fields
+            .iter()
+            .position(|f| f.name == name && f.owner.is_some());
         let incompatible = match (inherited_field, field_type) {
-            (Some(inherited), Some(ty)) if inherited.ty == ty => {
-                return self.unsupported("redeclared inherited fields", at);
+            (Some(index), Some(ty)) if fields[index].ty == ty => {
+                // Without a value, the redeclaration's effect depends on the class field
+                // semantics the compiler options select.
+                if !valued {
+                    return self.unsupported("redeclared inherited fields without a value", at);
+                }
+                return Ok(Some(index));
             }
             (Some(_), _) => true,
             (None, Some(_)) => methods.get(name).is_some_and(|m| m.owner.is_some()),
@@ -559,7 +628,23 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 at,
             );
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// A redeclared field keeps the inherited one at least as visible.
+    fn check_field_visibility(
+        &self,
+        class: &str,
+        inherited: &ClassField<'ast, 'program>,
+        access: Access,
+        at: oxc_span::Span,
+    ) -> Result<()> {
+        let member = Member {
+            key: intern(""),
+            access: inherited.access,
+            owner: inherited.owner,
+        };
+        self.check_override_access(class, inherited.name, &member, access, at)
     }
 
     /// An override keeps the inherited member at least as visible, and cannot replace a
@@ -686,18 +771,18 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             let bodies = class.bodies.clone();
             let init = class.init.clone();
             let base = class.base;
-            let at = class.span;
-            if constructor.is_none()
-                && let Some(base) = base
-            {
-                let (base_init, _) = self.classes[&base].init.as_ref().unwrap();
-                if self.signatures[base_init].params.len() > 1 {
-                    return self.unsupported(
-                        "implicit constructors forwarding base constructor parameters",
-                        at,
-                    );
+            // An implicit derived constructor takes its base constructor's parameters.
+            let (forwarded, arity) = match base {
+                Some(base) if constructor.is_none() => {
+                    let (base_init, _) = self.classes[&base].init.as_ref().unwrap();
+                    let sig = &self.signatures[base_init];
+                    (
+                        sig.params[1..].to_vec(),
+                        self.arities.get(&sig.native).copied(),
+                    )
                 }
-            }
+                _ => (vec![], None),
+            };
             match constructor {
                 Some(f) => {
                     self.signature_as(f, key, &component, FunctionRole::Constructor(view))?;
@@ -707,13 +792,16 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                 }
                 None => {
                     let native = self.native_name(&component);
+                    if let Some(arity) = arity {
+                        self.arities.insert(native, arity);
+                    }
                     self.signatures.insert(
                         key,
                         Arc::new(Signature {
                             native,
                             type_params: vec![],
                             type_rules: None,
-                            params: vec![],
+                            params: forwarded.clone(),
                             ret: Some(ty),
                             ret_view: Some(view),
                             array_result: None,
@@ -721,6 +809,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                     );
                     if let Some((init, component)) = &init {
                         let native = self.native_name(component);
+                        if let Some(arity) = arity {
+                            self.arities.insert(native, arity);
+                        }
                         let this = self.this_parameter(view);
                         self.signatures.insert(
                             *init,
@@ -728,7 +819,7 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
                                 native,
                                 type_params: vec![],
                                 type_rules: None,
-                                params: vec![this],
+                                params: std::iter::once(this).chain(forwarded).collect(),
                                 ret: Some(unit()),
                                 ret_view: None,
                                 array_result: None,
@@ -968,12 +1059,14 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         this: InternedString,
     ) -> Result<Vec<Stmt>> {
         let ty = self.classes[&view].ty.clone();
-        let fields: Vec<_> = self.classes[&view]
+        let mut fields: Vec<_> = self.classes[&view]
             .fields
             .iter()
             .filter(|f| f.owner.is_none())
             .cloned()
             .collect();
+        // Initializers run in source order; a redeclared field keeps its inherited position.
+        fields.sort_by_key(|f| f.span.start);
         let mut statements = vec![];
         if let Some(f) = f {
             for p in &f.params.items {
@@ -1266,10 +1359,40 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             } else {
                 self.allocate_instance(view, None, &mut statements)
             };
-            let initialized = if self.classes[&view].base.is_some() {
-                self.super_call(view, None, &[], at)?
-            } else {
-                self.initialize_fields(view, None, this)?
+            let mut arguments = vec![];
+            for forwarded in &sig.params[usize::from(initializer)..] {
+                let unique = self.fresh("argument");
+                let mut parameter = TypedParameter::regular(
+                    unique,
+                    forwarded.ty.clone(),
+                    Mutability::Mutable,
+                    span(at),
+                );
+                parameter.ownership = ParamOwnership::Borrowed;
+                params.push(parameter);
+                arguments.push(var(unique, forwarded.ty.clone(), at));
+            }
+            let initialized = match self.classes[&view].base {
+                Some(base) => {
+                    let (init, _) = self.classes[&base].init.clone().unwrap();
+                    let native = self.signatures[&init].native;
+                    let receiver =
+                        self.upcast(var(this, self.classes[&view].ty.clone(), at), base, at);
+                    let call = node(
+                        TypedExpression::Call(TypedCall {
+                            callee: Box::new(var(native, Type::Any, at)),
+                            positional_args: std::iter::once(receiver).chain(arguments).collect(),
+                            named_args: vec![],
+                            type_args: vec![],
+                        }),
+                        unit(),
+                        at,
+                    );
+                    let mut statements = vec![expression(call)];
+                    statements.extend(self.initialize_fields(view, None, this)?);
+                    statements
+                }
+                None => self.initialize_fields(view, None, this)?,
             };
             statements.extend(initialized);
             Ok(this)
@@ -1429,16 +1552,20 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
         let (key, access, owner) = (member.key, member.access, member.owner.unwrap_or(view));
         self.check_member_access(owner, access, name, m.span)?;
         let receiver = self.expr(&m.object)?;
+        let call = self.member_call(key, owner, receiver, c)?;
+        let call = self.dispatch(view, name, key, call, c.span)?;
         // A method whose result is inferred from `return this` has TypeScript's polymorphic
-        // `this` type, which the native signature records as the declaring class.
+        // `this` type: the result is the receiver, seen through the receiver's class.
+        if owner != view && self.returns_this(key) {
+            return Ok(Some(self.downcast(call, view, c.span)));
+        }
         if owner != view
             && self.functions[&key].return_type.is_none()
             && self.signatures[&key].ret_view == Some(owner)
         {
-            return self.unsupported("polymorphic this results through subclasses", m.span);
+            return self.unsupported("inferred class results through subclasses", m.span);
         }
-        let call = self.member_call(key, owner, receiver, c)?;
-        self.dispatch(view, name, key, call, c.span).map(Some)
+        Ok(Some(call))
     }
 
     /// `super.method(...)`: the base class's implementation, called on `this`.
@@ -1499,6 +1626,33 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             c.type_arguments.as_deref(),
             Some(receiver),
             c.span,
+        )
+    }
+
+    /// Whether the method `key` infers its result from `return this` on every path.
+    pub(super) fn returns_this(&self, key: InternedString) -> bool {
+        let f = self.functions[&key];
+        if f.return_type.is_some() {
+            return false;
+        }
+        let mut returns = ThisReturns { this: 0, other: 0 };
+        returns.visit_function_body(f.body.as_ref().unwrap());
+        returns.this > 0 && returns.other == 0
+    }
+
+    /// The receiver returned by a polymorphic-`this` method, as an instance of `class`.
+    fn downcast(&self, value: Expr, class: InternedString, at: oxc_span::Span) -> Expr {
+        let ty = self.classes[&class].ty.clone();
+        if value.ty == ty {
+            return value;
+        }
+        node(
+            TypedExpression::Cast(TypedCast {
+                expr: Box::new(value),
+                target_type: ty.clone(),
+            }),
+            ty,
+            at,
         )
     }
 
@@ -1673,6 +1827,9 @@ impl<'ast, 'program> Lowerer<'ast, 'program> {
             .view_of(&m.object)
             .filter(|v| self.classes.contains_key(v))?;
         let member = self.classes[&view].methods.get(name)?;
+        if member.owner.is_some() && self.returns_this(member.key) {
+            return Some(view);
+        }
         self.signatures[&member.key].ret_view
     }
 

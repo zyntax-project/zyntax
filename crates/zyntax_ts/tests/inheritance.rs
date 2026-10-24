@@ -4,18 +4,14 @@
 fn unmodelled_inheritance_forms_are_gaps() {
     for (source, message) in [
         (
-            "class B { x = 1; }\nclass D extends B { x = 2; }",
-            "redeclared inherited fields",
+            "class B { x = 1; }\nclass D extends B { x!: number; }",
+            "redeclared inherited fields without a value",
         ),
         (
             "function F() {}\nclass D extends F {}",
             "extending values that are not class declarations",
         ),
         ("class D extends null {}", "classes extending null"),
-        (
-            "class B { constructor(public n: number) {} }\nclass D extends B {}",
-            "implicit constructors forwarding",
-        ),
         (
             "class B { m(a: number): number { return a; } }\nclass D extends B { m(): number { return 1; } }\nfunction f(b: B): number { return b.m(1); }",
             "overrides with a different signature",
@@ -57,6 +53,9 @@ fn inheritance_errors_follow_typescript() {
         "class D extends 42 {}",
         "class B { private constructor() {} }\nclass D extends B {}",
         "class B { protected constructor() {} }\nconst b = new B();",
+        "class B { private x = 1; }\nclass D extends B { x = 2; }",
+        "class B { x = 1; }\nclass D extends B { protected x = 2; }",
+        "class B { x = 1; }\nclass D extends B { x = 'two'; }",
     ] {
         let error = zyntax_ts::parse_program(source, "inheritance.ts", Default::default())
             .expect_err(source);
@@ -68,4 +67,17 @@ fn inheritance_errors_follow_typescript() {
 fn protected_constructors_are_reachable_from_subclasses() {
     let source = "class B { protected constructor() {} }\nclass D extends B { static make(): number { new B(); return 1; } }\nconsole.log(D.make());";
     zyntax_ts::parse_program(source, "inheritance.ts", Default::default()).unwrap();
+}
+
+#[test]
+fn implicit_constructors_forward_base_parameters() {
+    let source = "class B { constructor(public n: number, public m: number = 2) {} }\nclass D extends B {}\nconst d = new D(1);\nconsole.log(d.n + d.m);";
+    zyntax_ts::parse_program(source, "inheritance.ts", Default::default()).unwrap();
+    let error = zyntax_ts::parse_program(
+        "class B { constructor(public n: number) {} }\nclass D extends B {}\nconst d = new D();",
+        "inheritance.ts",
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, zyntax_ts::ErrorKind::Type, "{error}");
 }

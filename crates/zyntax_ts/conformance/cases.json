@@ -2609,5 +2609,20 @@
     "id": "classes/inherited_private_error",
     "file": "cases/classes/inherited_private_error.ts",
     "mode": "check"
+  },
+  {
+    "id": "classes/inheritance_forwarding",
+    "file": "cases/classes/inheritance_forwarding.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/inheritance_redeclared",
+    "file": "cases/classes/inheritance_redeclared.ts",
+    "mode": "run"
+  },
+  {
+    "id": "classes/inheritance_fluent",
+    "file": "cases/classes/inheritance_fluent.ts",
+    "mode": "run"
   }
 ]
