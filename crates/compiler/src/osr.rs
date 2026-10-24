@@ -121,7 +121,7 @@ pub fn body_tag(function: &HirFunction) -> u16 {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&discriminant, &mut hasher);
             mix(std::hash::Hasher::finish(&hasher));
-            if let Some(r) = instruction_result(inst) {
+            if let Some(r) = inst.result_id() {
                 mix(r.as_u32() as u64);
             }
             inst.for_each_operand(|u| mix(u.as_u32() as u64));
@@ -757,7 +757,7 @@ pub fn osr_layout_with(
             .iter()
             .map(|p| (p.result, p.ty.clone()))
             .chain(block.instructions.iter().filter_map(|i| {
-                instruction_result(i)
+                i.result_id()
                     .and_then(|r| function.values.get(&r).map(|v| (r, v.ty.clone())))
             }))
             .collect();
@@ -1224,7 +1224,6 @@ pub fn outline(
     let resumed = resumable_body(function, layout);
     let reachable = reachable_from(&resumed, layout.header);
     let in_region: IdSet = reachable.iter().copied().collect();
-
     // The region's function: parameters for the live-ins, the header's
     // phis fed from the entry, every other way in gone.
     let entry = HirId::new();
@@ -1555,39 +1554,12 @@ fn locally_defined_in(function: &HirFunction, blocks: &[HirId]) -> IdSet {
             defs.insert(phi.result);
         }
         for inst in &block.instructions {
-            if let Some(result) = instruction_result(inst) {
+            if let Some(result) = inst.result_id() {
                 defs.insert(result);
             }
         }
     }
     defs
-}
-
-fn instruction_result(inst: &crate::hir::HirInstruction) -> Option<HirId> {
-    use crate::hir::HirInstruction as I;
-    match inst {
-        I::Binary { result, .. }
-        | I::Unary { result, .. }
-        | I::Alloca { result, .. }
-        | I::Load { result, .. }
-        | I::Cast { result, .. }
-        | I::GetElementPtr { result, .. }
-        | I::Select { result, .. }
-        | I::ExtractValue { result, .. }
-        | I::InsertValue { result, .. }
-        | I::VectorSplat { result, .. }
-        | I::VectorExtractLane { result, .. }
-        | I::VectorInsertLane { result, .. }
-        | I::VectorHorizontalReduce { result, .. }
-        | I::VectorLoad { result, .. }
-        | I::VectorUnaryOp { result, .. }
-        | I::VectorMinMax { result, .. } => Some(*result),
-        I::Call { result, .. }
-        | I::IndirectCall { result, .. }
-        | I::CallClosure { result, .. }
-        | I::TraitMethodCall { result, .. } => *result,
-        _ => None,
-    }
 }
 
 /// Conservatively enumerate the HirIds an instruction reads. This must
@@ -1850,6 +1822,142 @@ mod tests {
         assert!(!order.contains(&entry));
         assert!(!order.contains(&orphan));
         assert_eq!(order.len(), 7);
+    }
+
+    /// What a loop's body makes of a union is its own: a union built and
+    /// read in the body is no live-in, however it is used later in it.
+    #[test]
+    fn a_union_made_in_the_loop_is_no_live_in() {
+        use crate::hir::{
+            BinaryOp, HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi,
+            HirTerminator, HirValueKind,
+        };
+        use zyntax_typed_ast::InternedString;
+
+        let n = HirId::new();
+        let signature = HirFunctionSignature {
+            params: vec![HirParam {
+                id: n,
+                name: InternedString::new_global("n"),
+                ty: HirType::I64,
+                attributes: Default::default(),
+                ownership: Default::default(),
+            }],
+            returns: vec![HirType::I64],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        };
+        let mut function = HirFunction::new(InternedString::new_global("f"), signature);
+        let entry = function.entry_block;
+        function.blocks.clear();
+        let [header, body, exit] = [(); 3].map(|_| HirId::new());
+        let union_ty = HirType::Union(Box::new(crate::hir::HirUnionType {
+            name: None,
+            variants: vec![
+                crate::hir::HirUnionVariant {
+                    name: InternedString::new_global("None"),
+                    ty: HirType::Void,
+                    discriminant: 0,
+                },
+                crate::hir::HirUnionVariant {
+                    name: InternedString::new_global("Some"),
+                    ty: HirType::I64,
+                    discriminant: 1,
+                },
+            ],
+            discriminant_type: Box::new(HirType::U32),
+            is_c_union: false,
+        }));
+        let zero = function.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+        );
+        let i = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let go = function.create_value(HirType::Bool, HirValueKind::Instruction);
+        let made = function.create_value(union_ty.clone(), HirValueKind::Instruction);
+        let read = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let next = function.create_value(HirType::I64, HirValueKind::Instruction);
+        let block = |id, instructions, terminator| HirBlock {
+            id,
+            label: None,
+            phis: Vec::new(),
+            instructions,
+            terminator,
+            dominance_frontier: Default::default(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+        };
+        function.blocks.insert(
+            entry,
+            block(entry, Vec::new(), HirTerminator::Branch { target: header }),
+        );
+        let mut head = block(
+            header,
+            vec![HirInstruction::Binary {
+                op: BinaryOp::Lt,
+                result: go,
+                ty: HirType::I64,
+                left: i,
+                right: n,
+            }],
+            HirTerminator::CondBranch {
+                condition: go,
+                true_target: body,
+                false_target: exit,
+            },
+        );
+        head.phis.push(HirPhi {
+            result: i,
+            ty: HirType::I64,
+            incoming: vec![(zero, entry), (next, body)],
+        });
+        function.blocks.insert(header, head);
+        function.blocks.insert(
+            body,
+            block(
+                body,
+                vec![
+                    HirInstruction::CreateUnion {
+                        result: made,
+                        union_ty,
+                        variant_index: 1,
+                        value: i,
+                    },
+                    HirInstruction::ExtractUnionValue {
+                        result: read,
+                        ty: HirType::I64,
+                        union_val: made,
+                        variant_index: 1,
+                    },
+                    HirInstruction::Binary {
+                        op: BinaryOp::Add,
+                        result: next,
+                        ty: HirType::I64,
+                        left: read,
+                        right: n,
+                    },
+                ],
+                HirTerminator::Branch { target: header },
+            ),
+        );
+        function.blocks.insert(
+            exit,
+            block(exit, Vec::new(), HirTerminator::Return { values: vec![i] }),
+        );
+        function.rebuild_cfg_edges();
+
+        let layout = osr_layout(&function, header).expect("layout");
+        assert!(
+            !layout.live_ins.contains(&made) && !layout.live_ins.contains(&read),
+            "the body's own union values are not live-ins: {:?}",
+            layout.live_ins
+        );
     }
 
     /// A probe at an inner loop's header resumes code the outer loop
