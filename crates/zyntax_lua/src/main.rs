@@ -19,6 +19,7 @@ static ALLOCATOR: allocation_audit::CountingAllocator = allocation_audit::Counti
 const STACK_BYTES: usize = 1 << 30;
 
 fn main() -> ExitCode {
+    note_clock("main");
     let run = std::thread::Builder::new()
         .stack_size(STACK_BYTES)
         .spawn(run)
@@ -252,9 +253,32 @@ fn exit_now(rt: TieredRuntime, code: i32) -> ExitCode {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::mem::forget(rt);
+    note_clock("exit");
     // SAFETY: `_exit` ends the process without returning; nothing after
     // it runs, and the streams were flushed above.
     unsafe { libc::_exit(code) }
+}
+
+/// Under `ZYNTAX_TRACE_LOWER_PHASES`, the system's monotonic clock when
+/// the process reaches `what`: a launcher reading the same clock tells
+/// the time before `main` and after the exit from it.
+fn note_clock(what: &str) {
+    if std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_none() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a live local the call fills.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let ms = ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6;
+        eprintln!("[ZYLUA] clock at {what:<6} {ms:.3} ms");
+    }
+    #[cfg(not(unix))]
+    let _ = what;
 }
 
 #[cfg(not(unix))]
