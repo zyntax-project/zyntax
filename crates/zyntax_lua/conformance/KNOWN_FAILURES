@@ -21,7 +21,6 @@ official/db.lua               cecfe69
 official/errors.lua           8fd93ba
 official/files.lua            bb9a2cb   failing-on windows
 official/gc.lua               558e28e
-official/gengc.lua            558e28e   failing-on debug
 official/literals.lua         98b70eb
 official/locals.lua           8fd93ba
 official/pm.lua               3e444f9
