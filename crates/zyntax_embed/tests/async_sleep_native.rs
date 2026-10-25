@@ -110,12 +110,15 @@ fn async_set_timeout_is_cooperative_non_blocking() {
     // `drive_next_timer`. Assert it returns fast and scheduled a timer.
     use zyntax_embed::host_futures::{drive_next_timer, has_pending_timers};
 
+    // The timer is long beside scheduling noise on a loaded machine: a
+    // call that blocked would take all of it.
+    const TIMER_MS: u64 = 400;
     clear_for_tests();
     let start = Instant::now();
-    __zyntax_async_set_timeout(123456, 50);
+    __zyntax_async_set_timeout(123456, TIMER_MS as i64);
     let elapsed = start.elapsed();
     assert!(
-        elapsed.as_millis() < 25,
+        elapsed.as_millis() < (TIMER_MS / 2) as u128,
         "cooperative set_timeout must return immediately, not block; took {:?}",
         elapsed
     );
@@ -124,10 +127,9 @@ fn async_set_timeout_is_cooperative_non_blocking() {
     // Draining the timer sleeps to the deadline, then resolves the
     // (unknown) handle — a no-op resolve, but it blocks here, not in
     // set_timeout, and only when the executor chooses to.
-    let drain_start = Instant::now();
     let _ = drive_next_timer();
     assert!(
-        drain_start.elapsed().as_millis() >= 45,
+        start.elapsed().as_millis() >= TIMER_MS as u128,
         "draining the timer should wait out the deadline"
     );
     assert!(!has_pending_timers(), "timer consumed");

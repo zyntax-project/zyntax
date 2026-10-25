@@ -1691,14 +1691,57 @@ fn query_stack() -> (usize, usize) {
 
 #[cfg(windows)]
 fn query_stack() -> (usize, usize) {
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+        fn VirtualQuery(
+            address: *const std::ffi::c_void,
+            info: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
     }
     let (mut low, mut high) = (0usize, 0usize);
     // SAFETY: both pointers are to live locals.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
-    (low, high)
+    // The low limit is the base of the thread's stack reservation. The
+    // high one is the TEB's stack base, which a fiber switch replaces
+    // with the fiber's, so the top is where the reservation ends.
+    let mut end = low;
+    loop {
+        let mut info = std::mem::MaybeUninit::<MemoryBasicInformation>::zeroed();
+        // SAFETY: `info` has room for the structure whose size is passed.
+        let got = unsafe {
+            VirtualQuery(
+                end as *const std::ffi::c_void,
+                info.as_mut_ptr(),
+                std::mem::size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if got == 0 {
+            break;
+        }
+        // SAFETY: zeroed, then filled by VirtualQuery.
+        let info = unsafe { info.assume_init() };
+        if info.allocation_base != low || info.region_size == 0 {
+            break;
+        }
+        end = info.base + info.region_size;
+    }
+    if low == 0 || end <= low {
+        return (0, 0);
+    }
+    (low, end)
 }
 
 #[cfg(not(any(unix, windows)))]
