@@ -3903,6 +3903,40 @@ impl HirInterpreter {
         self.call_by_id(module, func_id, args, dest)
     }
 
+    /// Run `func_id` for a native caller: `words` holds one word per
+    /// parameter, as this interpreter's thunks pass them, and the
+    /// result's word is written to `out`. `Ok(false)` before anything
+    /// runs when the call is not one a word per parameter carries: the
+    /// function returns through a destination, or the count differs.
+    pub fn call_from_native(
+        &mut self,
+        module: &HirModule,
+        func_id: HirId,
+        words: &[u64],
+        out: *mut u8,
+    ) -> Result<bool, InterpError> {
+        let Some(func) = module.functions.get(&func_id) else {
+            return Ok(false);
+        };
+        let taken = self.is_address_taken(module, func_id);
+        let sig = NativeSig::of_function(func, taken);
+        if sig.destination || sig.params.len() != words.len() {
+            return Ok(false);
+        }
+        let args = sig
+            .params
+            .iter()
+            .zip(words)
+            .map(|(ty, w)| value_from_word(ty, *w))
+            .collect();
+        let result = self.call_by_id(module, func_id, args, core::ptr::null_mut())?;
+        if !matches!(sig.ret, HirType::Void) {
+            // SAFETY: the caller gives room for one word.
+            unsafe { (out as *mut u64).write_unaligned(word_of(&result)) };
+        }
+        Ok(true)
+    }
+
     /// Call `func_id` from the host or from bytecode. `dest` is where a
     /// callee that returns a struct through a destination writes it;
     /// null when it returns nothing that way.

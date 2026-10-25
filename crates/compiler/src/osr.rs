@@ -249,12 +249,13 @@ pub const OSR_PROBE_SYMBOL: &str = "__zyntax_osr_probe";
 /// `(name, function_pointer)` pairs to feed
 /// `CraneliftBackend::with_runtime_symbols` so JIT'd code can resolve
 /// the OSR runtime functions at link time.
-pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 4] {
+pub fn osr_runtime_symbols() -> [(&'static str, *const u8); 5] {
     [
         (OSR_PROBE_SYMBOL, osr_probe as *const u8),
         (OSR_TRANSFER_SYMBOL, osr_transfer as *const u8),
         (OSR_REQUEST_SYMBOL, osr_request_promotion as *const u8),
         (LAZY_COMPILE_SYMBOL, lazy_compile as *const u8),
+        (LAZY_INTERPRET_SYMBOL, lazy_interpret as *const u8),
     ]
 }
 
@@ -2831,6 +2832,14 @@ pub fn published_entry(bead_id: u64) -> usize {
     }
 }
 
+/// Where `bead_id`'s published entry is kept, for a stub to read it
+/// itself; `None` past the table.
+pub fn published_entry_slot(bead_id: u64) -> Option<usize> {
+    PUBLISHED
+        .get(bead_id as usize)
+        .map(|slot| slot as *const AtomicUsize as usize)
+}
+
 /// Record `entry` as what `bead_id`'s stub calls from now on.
 pub fn set_published_entry(bead_id: u64, entry: usize) {
     if let Some(slot) = PUBLISHED.get(bead_id as usize) {
@@ -2863,6 +2872,89 @@ pub extern "C" fn lazy_compile(bead_id: u64) -> *const u8 {
         std::process::abort();
     }
     entry
+}
+
+/// Symbol a stub calls before its function has code, to run the call
+/// in the interpreter rather than wait for a compile.
+pub const LAZY_INTERPRET_SYMBOL: &str = "__zyntax_lazy_interpret";
+
+/// Installed by the runtime: run the function behind a bead in an
+/// interpreter for a native caller, the arguments one word each, the
+/// result's word written to the third argument. False when it cannot,
+/// before anything ran.
+pub type LazyInterpreter = Arc<dyn Fn(u64, &[u64], *mut u8) -> bool + Send + Sync>;
+
+fn lazy_interpreter() -> &'static RwLock<Option<LazyInterpreter>> {
+    static R: OnceLock<RwLock<Option<LazyInterpreter>>> = OnceLock::new();
+    R.get_or_init(|| RwLock::new(None))
+}
+
+/// Register how a stub's call runs before its function has code; `None`
+/// leaves every such call to wait for a compile.
+pub fn set_lazy_interpreter(f: Option<LazyInterpreter>) {
+    *lazy_interpreter().write().unwrap() = f;
+}
+
+/// The stack an interpreted call from native code needs left on the
+/// thread's own stack. A call on a fiber's stack waits for a compile.
+const LAZY_INTERPRET_STACK: usize = 1 << 20;
+
+/// Called by a stub before its function has code: runs the call in an
+/// interpreter while the function's compile is asked of the workers.
+/// Returns 1 when it ran, with the result in `out`; 0 when the stub is
+/// to compile and call the code instead: there is code now, there is no
+/// interpreter, or the stack is not the thread's own with room.
+///
+/// # Safety
+/// Called from generated code with C ABI: `words` holds `count` words
+/// and `out` has room for one.
+#[unsafe(no_mangle)]
+pub extern "C" fn lazy_interpret(bead_id: u64, words: *const u64, count: u64, out: *mut u8) -> u64 {
+    if published_entry(bead_id) != 0 {
+        return 0;
+    }
+    if !crate::collector::stack_room().is_some_and(|room| room >= LAZY_INTERPRET_STACK) {
+        note_lazy_declined(bead_id, "not on the thread's own stack with room");
+        return 0;
+    }
+    let Some(interpret) = lazy_interpreter().read().unwrap().clone() else {
+        note_lazy_declined(bead_id, "no interpreter serves native calls");
+        return 0;
+    };
+    // SAFETY: the stub passes its own argument words and their count.
+    let words = unsafe { std::slice::from_raw_parts(words, count as usize) };
+    let ran = interpret(bead_id, words, out);
+    // `ZYNTAX_TRACE_LAZY=1` names each bead the first time a call of it
+    // from native code ran interpreted.
+    if ran && std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+        static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+        if SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(bead_id)
+        {
+            eprintln!("[lazy] interpreted a call of bead {bead_id} from native code");
+        }
+    }
+    ran as u64
+}
+
+/// `ZYNTAX_TRACE_LAZY=1` says, once per bead, why a call of it from
+/// native code waits for its compile instead of running interpreted.
+pub fn note_lazy_declined(bead_id: u64, why: &str) {
+    if std::env::var_os("ZYNTAX_TRACE_LAZY").is_none() {
+        return;
+    }
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    if SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(bead_id)
+    {
+        eprintln!("[lazy] a call of bead {bead_id} from native code waits for its compile: {why}");
+    }
 }
 
 /// The entry of the function behind `bead_id`, compiled now if it is not

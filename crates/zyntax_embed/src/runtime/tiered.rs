@@ -861,29 +861,15 @@ impl TieredRuntime {
         // code, which holds the interpreter. Such a chunk is entered by
         // native pointer and runs natively, so it needs no binding, and
         // its constants are initialised natively too.
+        let binding = self
+            .backend
+            .interpreter_binding(&self.plugin_signatures, self.function_ids.values().copied());
+        // Calls native code makes before a function has code run in
+        // interpreters bound the same way, the chunk's functions included.
+        binding.serve_native_calls();
         let interpreter_bound = match self.interpreter.try_lock() {
             Ok(mut interp) => {
-                let (symbols, globals) = self.backend.interpreter_bindings();
-                for (name, ptr) in symbols {
-                    if let Some(sig) = self.plugin_signatures.get(&name) {
-                        interp.register_symbol_typed(name, ptr, *sig);
-                    } else {
-                        interp.register_symbol(name, ptr, 0);
-                    }
-                }
-                for (id, ptr) in globals {
-                    interp.bind_global_slot(id, ptr);
-                }
-                for id in self.function_ids.values().copied() {
-                    if let Some(tick) = self.backend.interpreter_tick_callback(id) {
-                        interp.register_tick_callback(id, tick);
-                    }
-                }
-                interp.set_body_source(self.backend.interpreter_body_source());
-                interp.set_frame_exit_hook(self.backend.interpreter_frame_exit_hook());
-                interp.set_address_source(self.backend.interpreter_address_source());
-                let (thunk, entry, bead) = self.backend.interpreter_bridge();
-                interp.set_native_bridge(thunk, entry, bead);
+                binding.bind(&mut interp);
                 true
             }
             Err(std::sync::TryLockError::WouldBlock) => false,
@@ -2054,14 +2040,14 @@ impl TieredRuntime {
     /// a reload or a rollback replaces. Skipped while the interpreter
     /// is running, as at load.
     fn rebind_interpreter_ticks(&self) {
+        let binding = self
+            .backend
+            .interpreter_binding(&self.plugin_signatures, self.function_ids.values().copied());
+        binding.serve_native_calls();
         let Ok(mut interp) = self.interpreter.try_lock() else {
             return;
         };
-        for id in self.function_ids.values().copied() {
-            if let Some(tick) = self.backend.interpreter_tick_callback(id) {
-                interp.register_tick_callback(id, tick);
-            }
-        }
+        binding.bind_ticks(&mut interp);
     }
 
     /// Choose what a reload does with live handler state whose layout

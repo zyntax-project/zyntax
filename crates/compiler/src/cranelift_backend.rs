@@ -17,6 +17,20 @@ use cranelift_codegen::ir::{
 fn ba(args: &[Value]) -> Vec<BlockArg> {
     args.iter().map(|&v| BlockArg::Value(v)).collect()
 }
+
+/// Whether each parameter and the result of `sig` travel as one word an
+/// interpreter decodes: an integer of up to 64 bits or a float, with no
+/// struct return and at most one result.
+fn word_shaped(sig: &Signature) -> bool {
+    let word = |p: &AbiParam| {
+        p.purpose == cranelift_codegen::ir::ArgumentPurpose::Normal
+            && matches!(
+                p.value_type,
+                types::I8 | types::I16 | types::I32 | types::I64 | types::F32 | types::F64
+            )
+    };
+    sig.params.iter().all(word) && sig.returns.len() <= 1 && sig.returns.iter().all(word)
+}
 use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
@@ -1862,6 +1876,30 @@ impl CraneliftBackend {
                 &compile_sig,
             )
             .map_err(|e| CompilerError::Backend(format!("Failed to declare lazy compile: {e}")))?;
+        // Before the function has code the call can run in an interpreter
+        // while its compile is asked of the workers (see
+        // `osr::lazy_interpret`): for a signature whose parameters and
+        // result each travel as one word.
+        let interpret_fn = if word_shaped(&sig) {
+            let mut interpret_sig = self.module.make_signature();
+            for _ in 0..4 {
+                interpret_sig.params.push(AbiParam::new(types::I64));
+            }
+            interpret_sig.returns.push(AbiParam::new(types::I64));
+            Some(
+                self.module
+                    .declare_function(
+                        crate::osr::LAZY_INTERPRET_SYMBOL,
+                        Linkage::Import,
+                        &interpret_sig,
+                    )
+                    .map_err(|e| {
+                        CompilerError::Backend(format!("Failed to declare lazy interpret: {e}"))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         let frontend_config = self.module.target_config();
         self.codegen_context.clear();
@@ -1874,10 +1912,83 @@ impl CraneliftBackend {
         builder.seal_block(entry);
         let args: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
         let compile_ref = self.module.declare_func_in_func(compile_fn, builder.func);
+        let sig_ref = builder.import_signature(sig.clone());
         let bead_v = builder.ins().iconst(types::I64, bead_id as i64);
+        // Once the function has code the stub reads its entry from the
+        // published table and calls it, with no call into the runtime: a
+        // caller that kept the stub's address (a dispatch table, a value
+        // made before the compile) calls through it for good.
+        if let Some(slot) = crate::osr::published_entry_slot(bead_id) {
+            let ptr_ty = frontend_config.pointer_type();
+            let slot_v = builder.ins().iconst(ptr_ty, slot as i64);
+            let published = builder
+                .ins()
+                .atomic_load(ptr_ty, MemFlags::trusted(), slot_v);
+            let has_code = builder.create_block();
+            let no_code = builder.create_block();
+            builder.ins().brif(published, has_code, &[], no_code, &[]);
+            builder.switch_to_block(has_code);
+            builder.seal_block(has_code);
+            let call = builder.ins().call_indirect(sig_ref, published, &args);
+            let results: Vec<cranelift_codegen::ir::Value> = builder.inst_results(call).to_vec();
+            builder.ins().return_(&results);
+            builder.switch_to_block(no_code);
+            builder.seal_block(no_code);
+        }
+        if let Some(interpret_fn) = interpret_fn {
+            let ptr_ty = frontend_config.pointer_type();
+            let words = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (8 * args.len().max(1)) as u32,
+                3,
+            ));
+            let words_addr = builder.ins().stack_addr(ptr_ty, words, 0);
+            for (i, (&arg, param)) in args.iter().zip(&sig.params).enumerate() {
+                let word = match param.value_type {
+                    types::I64 => arg,
+                    types::F64 => builder.ins().bitcast(types::I64, MemFlags::new(), arg),
+                    types::F32 => {
+                        let bits = builder.ins().bitcast(types::I32, MemFlags::new(), arg);
+                        builder.ins().uextend(types::I64, bits)
+                    }
+                    _ => builder.ins().uextend(types::I64, arg),
+                };
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), word, words_addr, (8 * i) as i32);
+            }
+            let out = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let out_addr = builder.ins().stack_addr(ptr_ty, out, 0);
+            let count = builder.ins().iconst(types::I64, args.len() as i64);
+            let interpret_ref = self.module.declare_func_in_func(interpret_fn, builder.func);
+            let ran = builder
+                .ins()
+                .call(interpret_ref, &[bead_v, words_addr, count, out_addr]);
+            let ran = builder.inst_results(ran)[0];
+            let interpreted = builder.create_block();
+            let compile = builder.create_block();
+            builder.ins().brif(ran, interpreted, &[], compile, &[]);
+            builder.switch_to_block(interpreted);
+            builder.seal_block(interpreted);
+            let results: Vec<cranelift_codegen::ir::Value> = sig
+                .returns
+                .iter()
+                .map(|r| {
+                    builder
+                        .ins()
+                        .load(r.value_type, MemFlags::trusted(), out_addr, 0)
+                })
+                .collect();
+            builder.ins().return_(&results);
+            builder.switch_to_block(compile);
+            builder.seal_block(compile);
+        }
         let compiled = builder.ins().call(compile_ref, &[bead_v]);
         let target = builder.inst_results(compiled)[0];
-        let sig_ref = builder.import_signature(sig.clone());
         let call = builder.ins().call_indirect(sig_ref, target, &args);
         let results: Vec<cranelift_codegen::ir::Value> = builder.inst_results(call).to_vec();
         builder.ins().return_(&results);

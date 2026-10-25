@@ -879,6 +879,18 @@ impl CompileQueue {
         self.ready.notify_one();
     }
 
+    /// Ask for `bead_id`'s compile ahead of every request but frames'
+    /// and replacements: native code calls the function, which runs in
+    /// an interpreter until the code lands. Never stale.
+    fn request_for_native_caller(&self, bead_id: u64) {
+        let mut compile = self.compile.lock().unwrap();
+        if !self.queued.lock().unwrap().insert(bead_id) {
+            compile.retain(|job| job.0 != bead_id);
+        }
+        compile.push_front((bead_id, None, web_time::Instant::now()));
+        self.ready.notify_one();
+    }
+
     /// The counter the interpreter keeps for `bead_id`'s calls.
     fn count_of(&self, bead_id: u64) -> Arc<std::sync::atomic::AtomicU32> {
         Arc::clone(
@@ -3135,270 +3147,37 @@ impl TieredBackend {
 
     /// Entry callback for the bytecode interpreter: ticks the function's
     /// bead as a native call would and hands back the native entry once
-    /// there is one. The baseline of a function compiled at load is the
-    /// code already in its cell; that of a function left for its first
-    /// call is made by the same first-call compiler its stub uses, so
-    /// the two never compile one function twice.
+    /// there is one. See [`InterpreterBinding`].
     pub fn interpreter_tick_callback(
         &self,
         func_id: HirId,
     ) -> Option<Box<dyn FnMut() -> Option<*const u8> + Send>> {
-        let entry = self.functions.get(&func_id)?;
-        // Everything a compile needs, behind one count the closure
-        // handed to beadie clones per call.
-        struct Compile {
-            /// The body a reload swapped in; otherwise the module's,
-            /// read when a compile needs it rather than copied out per
-            /// function at load.
-            swapped: Option<Arc<HirFunction>>,
-            source: Option<Arc<LazyModule>>,
-            module: Arc<HirModule>,
-            cranelift: Arc<ZyntaxCraneliftBackend>,
-            #[cfg(feature = "llvm-backend")]
-            llvm: Option<Arc<ZyntaxLlvmBackend>>,
-            tier2_backend: Tier2Backend,
-            verbosity: u8,
-            func_id: HirId,
-            bead_id: u64,
-        }
-        let ctx = Arc::new(Compile {
-            swapped: entry.function.clone(),
-            source: entry.body_source.clone(),
-            module: Arc::clone(&entry.module),
-            cranelift: Arc::clone(&self.cranelift),
-            #[cfg(feature = "llvm-backend")]
-            llvm: self.llvm.as_ref().map(Arc::clone),
-            tier2_backend: self.config.tier2_backend,
-            verbosity: self.config.verbosity,
-            func_id,
-            bead_id: entry.bead_id,
-        });
-        let bound = entry.bound.clone();
-        let adapter = Arc::clone(&self.adapter);
-        let lazy = self.lazy.contains(&func_id);
-        let threshold = self.config.baseline_threshold.max(1);
-        // Calls at which a function counts as warm: it will cross the
-        // threshold if the program goes on as it has, so its compile is
-        // asked of the worker then, and is done by the time the
-        // threshold comes.
-        let warm = (threshold / 4).max(2);
-        let optimized_bodies = Arc::clone(&self.optimized_bodies);
-        let queue = self.compile_queue.clone();
-        let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
-        let mut compile_first = self.static_hot.get(&func_id).copied().unwrap_or(false);
-        Some(Box::new(move || {
-            if lazy && bound.bead().compiled().is_none() {
-                // A loop hot before the first call: that call waits for
-                // the code the worker is making, or makes it, and runs
-                // it. Once: a compile that failed leaves the function to
-                // the interpreter.
-                if std::mem::take(&mut compile_first) {
-                    let code = osr::try_lazy_compile(ctx.bead_id);
-                    if !code.is_null() {
-                        return Some(code);
-                    }
-                }
-                // Counted here until the first-call compiler has made
-                // the baseline and installed it in the bead; beadie's
-                // own ladder takes over from there.
-                let (count, _) = bound.bead().tick();
-                if let Some(counter) = &counter {
-                    counter.store(count, std::sync::atomic::Ordering::Relaxed);
-                }
-                if count >= threshold {
-                    // Hot: queued already, so its code is on the way and
-                    // the call runs interpreted meanwhile; else asked of
-                    // the worker if it is free, else compiled here.
-                    match &queue {
-                        Some(queue) if queue.is_queued(ctx.bead_id) => {}
-                        Some(queue) if queue.idle() => {
-                            queue.request_compile(ctx.bead_id, Some(count))
-                        }
-                        _ => {
-                            let code = osr::try_lazy_compile(ctx.bead_id);
-                            if !code.is_null() {
-                                return Some(code);
-                            }
-                        }
-                    }
-                } else if count >= warm
-                    && let Some(queue) = &queue
-                {
-                    // Warm: asked of the worker now, whatever it is doing,
-                    // so the code is there by the time the threshold
-                    // comes; nobody waits on this one.
-                    queue.request_compile(ctx.bead_id, Some(count));
-                }
-                return None;
-            }
-            let ctx = Arc::clone(&ctx);
-            let optimized_bodies = Arc::clone(&optimized_bodies);
-            let code = adapter.on_invoke(&bound, move |tier, bead| {
-                let c = &*ctx;
-                // The baseline was compiled at load; the ladder above it
-                // compiles anew, from the function's tier body. A quick
-                // baseline has none until its replacement: the body is
-                // optimised now, once, for both.
-                if tier == 0 {
-                    if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
-                        return p as *mut ();
-                    }
-                }
-                let Some(body) = tier_body(
-                    c.func_id,
-                    c.bead_id,
-                    c.swapped.as_ref(),
-                    &optimized_bodies,
-                    lazy,
-                    &c.module,
-                    c.source.as_ref(),
-                ) else {
-                    return ptr::null_mut();
-                };
-                let entry = compile_at_tier(
-                    tier,
-                    bead,
-                    c.func_id,
-                    c.bead_id,
-                    &body,
-                    &c.module,
-                    &c.cranelift,
-                    #[cfg(feature = "llvm-backend")]
-                    c.llvm.as_ref(),
-                    c.tier2_backend,
-                    c.verbosity,
-                );
-                entry
-            })?;
-            Some(code as *const u8)
-        }))
+        self.binding_parts().tick_callback(func_id)
     }
 
-    /// The body the interpreter runs for each lazy function: the
-    /// optimised one once its first compile has made it, so a frame can
-    /// move to the code compiled from it; before that, the module's as
-    /// lowered with its releases placed, since optimising a body before
-    /// its first run cost every function the whole pipeline, run once or
-    /// not, and a frame that warms leaves into a resume point optimised
-    /// on its own. A body that arrived optimised gets what little the
-    /// optimiser does to it. `None` leaves the module's body to the
-    /// interpreter.
+    /// The body the interpreter runs for each lazy function. See
+    /// [`InterpreterBinding`].
     pub fn interpreter_body_source(
         &self,
     ) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
-        let beads: HashMap<HirId, u64> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bead_id))
-            .collect();
-        let optimized_bodies = Arc::clone(&self.optimized_bodies);
-        let interp_bodies = Arc::clone(&self.interp_bodies);
-        let make_interp_body = self.make_interp_body.clone();
-        let finished = self.finished.clone();
-        // A finished body kept encoded is decoded as it was stored when
-        // no optimiser answers for it, as the module's own copy would be.
-        let sources: HashMap<HirId, Arc<LazyModule>> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| finished.contains(id))
-            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
-            .collect();
-        // A joined module's bodies, kept encoded once its code is
-        // installed: the only functions outside `lazy` with a source.
-        let kept: HashMap<HirId, Arc<LazyModule>> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| !self.lazy.contains(id))
-            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
-            .collect();
-        Box::new(move |id: HirId| {
-            if let Some(source) = kept.get(&id) {
-                return source.function(id).map(Arc::new);
-            }
-            let bead = beads.get(&id)?;
-            let tier = match optimized_bodies.get(id) {
-                Some(body) => Some(body),
-                None if finished.contains(&id) => {
-                    Some(osr::lazy_optimized_body(*bead).or_else(|| {
-                        sources
-                            .get(&id)
-                            .and_then(|source| source.function(id))
-                            .map(Arc::new)
-                    })?)
-                }
-                None => None,
-            };
-            if let Some(body) = tier {
-                interp_bodies
-                    .lock()
-                    .unwrap()
-                    .entry(id)
-                    .or_default()
-                    .tier_weak = Arc::downgrade(&body);
-                return Some(body);
-            }
-            interp_body(&interp_bodies, id, *bead, make_interp_body.as_ref())
-        })
+        self.binding_parts().body_source()
     }
 
     /// What the interpreter tells when the first frame run from a body
-    /// [`Self::interpreter_body_source`] gave returns: the interp body is
-    /// let go once the function has native code, or then for a large
-    /// body the first time, which is mostly run once. Answers whether
-    /// it was.
+    /// [`Self::interpreter_body_source`] gave returns. See
+    /// [`InterpreterBinding`].
     pub fn interpreter_frame_exit_hook(&self) -> Box<dyn FnMut(HirId) -> bool + Send> {
-        let beads: HashMap<HirId, TieredBound> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bound.clone()))
-            .collect();
-        let interp_bodies = Arc::clone(&self.interp_bodies);
-        Box::new(move |id: HirId| {
-            let Some(bound) = beads.get(&id) else {
-                return false;
-            };
-            let mut bodies = interp_bodies.lock().unwrap();
-            let Some(entry) = bodies.get_mut(&id) else {
-                return false;
-            };
-            let Some(body) = &entry.interp else {
-                return false;
-            };
-            let native = bound.bead().compiled().is_some();
-            if native || (!entry.remade && instruction_count(body) >= RUN_ONCE_INSTRUCTIONS) {
-                entry.interp = None;
-                return true;
-            }
-            false
-        })
+        self.binding_parts().frame_exit_hook()
     }
 
-    /// The module function behind a code address, for the interpreter's
-    /// calls through pointers: a body the ground tier published, a
-    /// stub, or the code a tier above installed in a bead.
+    /// The module function behind a code address. See
+    /// [`InterpreterBinding`].
     pub fn interpreter_address_source(&self) -> Box<dyn Fn(usize) -> Option<HirId> + Send + Sync> {
-        let cranelift = Arc::clone(&self.cranelift);
-        let beads: Vec<(HirId, TieredBound)> = self
-            .functions
-            .iter()
-            .map(|(id, e)| (*id, e.bound.clone()))
-            .collect();
-        Box::new(move |addr: usize| {
-            if let Some(id) = cranelift.with_lock(|be| be.function_at(addr)) {
-                return Some(id);
-            }
-            beads
-                .iter()
-                .find(|(_, bound)| bound.bead().compiled().is_some_and(|p| p as usize == addr))
-                .map(|(id, _)| *id)
-        })
+        self.binding_parts().address_source()
     }
 
-    /// The interpreter's bridge into native code: a thunk maker for
-    /// call shapes, and the current entry of a function as compiled
-    /// callers reach it (its cell, else the code compiled at load).
+    /// The interpreter's bridge into native code. See
+    /// [`InterpreterBinding`].
     #[allow(clippy::type_complexity)]
     pub fn interpreter_bridge(
         &self,
@@ -3407,31 +3186,79 @@ impl TieredBackend {
         Box<dyn Fn(HirId) -> Option<*const u8> + Send + Sync>,
         Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>,
     ) {
-        let cranelift = Arc::clone(&self.cranelift);
-        let thunk = Box::new(move |sig: &crate::hir_interp::NativeSig| {
-            cranelift.with_lock(|be| be.interp_thunk(sig).ok())
-        });
-        let cranelift = Arc::clone(&self.cranelift);
-        let key = self.cranelift.with_lock(|be| be.reload_key());
-        let entry = Box::new(move |id: HirId| {
-            let cell = crate::reload::call_target(key, id);
-            if cell != 0 {
-                return Some(cell as *const u8);
-            }
-            cranelift.with_lock(|be| be.entry_or_stub(id))
-        });
-        // With OSR off an interpreted loop stays where it is, as a
-        // native one does.
-        let beads: HashMap<HirId, u64> = if self.config.enable_osr {
-            self.functions
-                .iter()
-                .map(|(id, e)| (*id, e.bead_id))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-        let bead = Box::new(move |id: HirId| beads.get(&id).copied());
-        (thunk, entry, bead)
+        self.binding_parts().bridge()
+    }
+
+    /// Everything an interpreter needs to run the loaded functions as
+    /// they stand now: runtime symbols (typed where `typed` names one),
+    /// global slots, an entry callback for each of `ticks`, bodies,
+    /// addresses and the bridge into native code. Bound into the
+    /// runtime's interpreter and into those native calls enter.
+    pub fn interpreter_binding(
+        &self,
+        typed: &HashMap<String, crate::zrtl::ZrtlSymbolSig>,
+        ticks: impl IntoIterator<Item = HirId>,
+    ) -> InterpreterBinding {
+        let (symbols, globals) = self.interpreter_bindings();
+        InterpreterBinding {
+            parts: Arc::new(self.binding_parts()),
+            symbols: Arc::new(
+                symbols
+                    .into_iter()
+                    .map(|(name, ptr)| {
+                        let sig = typed.get(&name).copied();
+                        (name, ptr as usize, sig)
+                    })
+                    .collect(),
+            ),
+            globals: Arc::new(
+                globals
+                    .into_iter()
+                    .map(|(id, ptr)| (id, ptr as usize))
+                    .collect(),
+            ),
+            ticks: Arc::new(ticks.into_iter().collect()),
+        }
+    }
+
+    /// The loaded functions as the interpreter's bindings see them.
+    fn binding_parts(&self) -> BindingParts {
+        let functions: HashMap<HirId, BoundFunction> = self
+            .functions
+            .iter()
+            .map(|(id, e)| {
+                (
+                    *id,
+                    BoundFunction {
+                        bound: e.bound.clone(),
+                        module: Arc::clone(&e.module),
+                        function: e.function.clone(),
+                        body_source: e.body_source.clone(),
+                        bead_id: e.bead_id,
+                    },
+                )
+            })
+            .collect();
+        BindingParts {
+            by_bead: functions.iter().map(|(id, f)| (f.bead_id, *id)).collect(),
+            functions,
+            lazy: self.lazy.clone(),
+            finished: self.finished.clone(),
+            static_hot: self.static_hot.clone(),
+            cranelift: Arc::clone(&self.cranelift),
+            #[cfg(feature = "llvm-backend")]
+            llvm: self.llvm.as_ref().map(Arc::clone),
+            tier2_backend: self.config.tier2_backend,
+            verbosity: self.config.verbosity,
+            baseline_threshold: self.config.baseline_threshold,
+            enable_osr: self.config.enable_osr,
+            adapter: Arc::clone(&self.adapter),
+            optimized_bodies: Arc::clone(&self.optimized_bodies),
+            interp_bodies: Arc::clone(&self.interp_bodies),
+            make_interp_body: self.make_interp_body.clone(),
+            compile_queue: self.compile_queue.clone(),
+            reload_key: self.cranelift.with_lock(|be| be.reload_key()),
+        }
     }
 
     /// Record an invocation. Drives tier promotion via beadie.
@@ -4962,6 +4789,7 @@ impl TieredBackend {
         osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
         osr::set_lazy_optimizer(|_| None);
+        osr::set_lazy_interpreter(None);
         osr::set_compile_workers_present(false);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
@@ -5676,6 +5504,494 @@ fn promote_static_hot(bead_id: u64, body: &HirFunction) {
         osr::note_site_asked(bead_id, *site, true);
     }
     osr::osr_request_promotion(bead_id, first);
+}
+
+/// A loaded function as an interpreter's bindings see it.
+struct BoundFunction {
+    bound: TieredBound,
+    module: Arc<HirModule>,
+    function: Option<Arc<HirFunction>>,
+    body_source: Option<Arc<LazyModule>>,
+    bead_id: u64,
+}
+
+/// The loaded functions and the backend pieces an interpreter's
+/// callbacks reach, taken as they stand: every callback is made from
+/// it, as often as asked and on any thread.
+struct BindingParts {
+    functions: HashMap<HirId, BoundFunction>,
+    by_bead: HashMap<u64, HirId>,
+    lazy: HashSet<HirId>,
+    finished: HashSet<HirId>,
+    static_hot: HashMap<HirId, bool>,
+    cranelift: Arc<ZyntaxCraneliftBackend>,
+    #[cfg(feature = "llvm-backend")]
+    llvm: Option<Arc<ZyntaxLlvmBackend>>,
+    tier2_backend: Tier2Backend,
+    verbosity: u8,
+    baseline_threshold: u32,
+    enable_osr: bool,
+    adapter: Arc<TieredAdapter>,
+    optimized_bodies: Arc<OptimizedBodies>,
+    interp_bodies: Arc<InterpBodies>,
+    make_interp_body: Option<Arc<dyn Fn(u64) -> Option<Arc<HirFunction>> + Send + Sync>>,
+    compile_queue: Option<Arc<CompileQueue>>,
+    reload_key: u64,
+}
+
+impl BindingParts {
+    /// Entry callback for the bytecode interpreter: ticks the function's
+    /// bead as a native call would and hands back the native entry once
+    /// there is one. The baseline of a function compiled at load is the
+    /// code already in its cell; that of a function left for its first
+    /// call is made by the same first-call compiler its stub uses, so
+    /// the two never compile one function twice.
+    fn tick_callback(
+        &self,
+        func_id: HirId,
+    ) -> Option<Box<dyn FnMut() -> Option<*const u8> + Send>> {
+        let entry = self.functions.get(&func_id)?;
+        // Everything a compile needs, behind one count the closure
+        // handed to beadie clones per call.
+        struct Compile {
+            /// The body a reload swapped in; otherwise the module's,
+            /// read when a compile needs it rather than copied out per
+            /// function at load.
+            swapped: Option<Arc<HirFunction>>,
+            source: Option<Arc<LazyModule>>,
+            module: Arc<HirModule>,
+            cranelift: Arc<ZyntaxCraneliftBackend>,
+            #[cfg(feature = "llvm-backend")]
+            llvm: Option<Arc<ZyntaxLlvmBackend>>,
+            tier2_backend: Tier2Backend,
+            verbosity: u8,
+            func_id: HirId,
+            bead_id: u64,
+        }
+        let ctx = Arc::new(Compile {
+            swapped: entry.function.clone(),
+            source: entry.body_source.clone(),
+            module: Arc::clone(&entry.module),
+            cranelift: Arc::clone(&self.cranelift),
+            #[cfg(feature = "llvm-backend")]
+            llvm: self.llvm.as_ref().map(Arc::clone),
+            tier2_backend: self.tier2_backend,
+            verbosity: self.verbosity,
+            func_id,
+            bead_id: entry.bead_id,
+        });
+        let bound = entry.bound.clone();
+        let adapter = Arc::clone(&self.adapter);
+        let lazy = self.lazy.contains(&func_id);
+        let threshold = self.baseline_threshold.max(1);
+        // Calls at which a function counts as warm: it will cross the
+        // threshold if the program goes on as it has, so its compile is
+        // asked of the worker then, and is done by the time the
+        // threshold comes.
+        let warm = (threshold / 4).max(2);
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
+        let queue = self.compile_queue.clone();
+        let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
+        let mut compile_first = self.static_hot.get(&func_id).copied().unwrap_or(false);
+        Some(Box::new(move || {
+            if lazy && bound.bead().compiled().is_none() {
+                // A loop hot before the first call: that call waits for
+                // the code the worker is making, or makes it, and runs
+                // it. Once: a compile that failed leaves the function to
+                // the interpreter.
+                if std::mem::take(&mut compile_first) {
+                    let code = osr::try_lazy_compile(ctx.bead_id);
+                    if !code.is_null() {
+                        return Some(code);
+                    }
+                }
+                // Counted here until the first-call compiler has made
+                // the baseline and installed it in the bead; beadie's
+                // own ladder takes over from there.
+                let (count, _) = bound.bead().tick();
+                if let Some(counter) = &counter {
+                    counter.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+                if count >= threshold {
+                    // Hot: queued already, so its code is on the way and
+                    // the call runs interpreted meanwhile; else asked of
+                    // the worker if it is free, else compiled here.
+                    match &queue {
+                        Some(queue) if queue.is_queued(ctx.bead_id) => {}
+                        Some(queue) if queue.idle() => {
+                            queue.request_compile(ctx.bead_id, Some(count))
+                        }
+                        _ => {
+                            let code = osr::try_lazy_compile(ctx.bead_id);
+                            if !code.is_null() {
+                                return Some(code);
+                            }
+                        }
+                    }
+                } else if count >= warm
+                    && let Some(queue) = &queue
+                {
+                    // Warm: asked of the worker now, whatever it is doing,
+                    // so the code is there by the time the threshold
+                    // comes; nobody waits on this one.
+                    queue.request_compile(ctx.bead_id, Some(count));
+                }
+                return None;
+            }
+            let ctx = Arc::clone(&ctx);
+            let optimized_bodies = Arc::clone(&optimized_bodies);
+            let code = adapter.on_invoke(&bound, move |tier, bead| {
+                let c = &*ctx;
+                // The baseline was compiled at load; the ladder above it
+                // compiles anew, from the function's tier body. A quick
+                // baseline has none until its replacement: the body is
+                // optimised now, once, for both.
+                if tier == 0 {
+                    if let Some(p) = c.cranelift.with_lock(|be| be.get_function_ptr(c.func_id)) {
+                        return p as *mut ();
+                    }
+                }
+                let Some(body) = tier_body(
+                    c.func_id,
+                    c.bead_id,
+                    c.swapped.as_ref(),
+                    &optimized_bodies,
+                    lazy,
+                    &c.module,
+                    c.source.as_ref(),
+                ) else {
+                    return ptr::null_mut();
+                };
+                let entry = compile_at_tier(
+                    tier,
+                    bead,
+                    c.func_id,
+                    c.bead_id,
+                    &body,
+                    &c.module,
+                    &c.cranelift,
+                    #[cfg(feature = "llvm-backend")]
+                    c.llvm.as_ref(),
+                    c.tier2_backend,
+                    c.verbosity,
+                );
+                entry
+            })?;
+            Some(code as *const u8)
+        }))
+    }
+
+    /// The body the interpreter runs for each lazy function: the
+    /// optimised one once its first compile has made it, so a frame can
+    /// move to the code compiled from it; before that, the module's as
+    /// lowered with its releases placed, since optimising a body before
+    /// its first run cost every function the whole pipeline, run once or
+    /// not, and a frame that warms leaves into a resume point optimised
+    /// on its own. A body that arrived optimised gets what little the
+    /// optimiser does to it. `None` leaves the module's body to the
+    /// interpreter.
+    fn body_source(&self) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
+        let beads: HashMap<HirId, u64> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| self.lazy.contains(id))
+            .map(|(id, e)| (*id, e.bead_id))
+            .collect();
+        let optimized_bodies = Arc::clone(&self.optimized_bodies);
+        let interp_bodies = Arc::clone(&self.interp_bodies);
+        let make_interp_body = self.make_interp_body.clone();
+        let finished = self.finished.clone();
+        // A finished body kept encoded is decoded as it was stored when
+        // no optimiser answers for it, as the module's own copy would be.
+        let sources: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| finished.contains(id))
+            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
+            .collect();
+        // A joined module's bodies, kept encoded once its code is
+        // installed: the only functions outside `lazy` with a source.
+        let kept: HashMap<HirId, Arc<LazyModule>> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| !self.lazy.contains(id))
+            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
+            .collect();
+        Box::new(move |id: HirId| {
+            if let Some(source) = kept.get(&id) {
+                return source.function(id).map(Arc::new);
+            }
+            let bead = beads.get(&id)?;
+            let tier = match optimized_bodies.get(id) {
+                Some(body) => Some(body),
+                None if finished.contains(&id) => {
+                    Some(osr::lazy_optimized_body(*bead).or_else(|| {
+                        sources
+                            .get(&id)
+                            .and_then(|source| source.function(id))
+                            .map(Arc::new)
+                    })?)
+                }
+                None => None,
+            };
+            if let Some(body) = tier {
+                interp_bodies
+                    .lock()
+                    .unwrap()
+                    .entry(id)
+                    .or_default()
+                    .tier_weak = Arc::downgrade(&body);
+                return Some(body);
+            }
+            interp_body(&interp_bodies, id, *bead, make_interp_body.as_ref())
+        })
+    }
+
+    /// What the interpreter tells when the first frame run from a body
+    /// [`Self::body_source`] gave returns: the interp body is
+    /// let go once the function has native code, or then for a large
+    /// body the first time, which is mostly run once. Answers whether
+    /// it was.
+    fn frame_exit_hook(&self) -> Box<dyn FnMut(HirId) -> bool + Send> {
+        let beads: HashMap<HirId, TieredBound> = self
+            .functions
+            .iter()
+            .filter(|(id, _)| self.lazy.contains(id))
+            .map(|(id, e)| (*id, e.bound.clone()))
+            .collect();
+        let interp_bodies = Arc::clone(&self.interp_bodies);
+        Box::new(move |id: HirId| {
+            let Some(bound) = beads.get(&id) else {
+                return false;
+            };
+            let mut bodies = interp_bodies.lock().unwrap();
+            let Some(entry) = bodies.get_mut(&id) else {
+                return false;
+            };
+            let Some(body) = &entry.interp else {
+                return false;
+            };
+            let native = bound.bead().compiled().is_some();
+            if native || (!entry.remade && instruction_count(body) >= RUN_ONCE_INSTRUCTIONS) {
+                entry.interp = None;
+                return true;
+            }
+            false
+        })
+    }
+
+    /// The module function behind a code address, for the interpreter's
+    /// calls through pointers: a body the ground tier published, a
+    /// stub, or the code a tier above installed in a bead.
+    fn address_source(&self) -> Box<dyn Fn(usize) -> Option<HirId> + Send + Sync> {
+        let cranelift = Arc::clone(&self.cranelift);
+        let beads: Vec<(HirId, TieredBound)> = self
+            .functions
+            .iter()
+            .map(|(id, e)| (*id, e.bound.clone()))
+            .collect();
+        Box::new(move |addr: usize| {
+            if let Some(id) = cranelift.with_lock(|be| be.function_at(addr)) {
+                return Some(id);
+            }
+            beads
+                .iter()
+                .find(|(_, bound)| bound.bead().compiled().is_some_and(|p| p as usize == addr))
+                .map(|(id, _)| *id)
+        })
+    }
+
+    /// The interpreter's bridge into native code: a thunk maker for
+    /// call shapes, and the current entry of a function as compiled
+    /// callers reach it (its cell, else the code compiled at load).
+    #[allow(clippy::type_complexity)]
+    fn bridge(
+        &self,
+    ) -> (
+        Box<dyn FnMut(&crate::hir_interp::NativeSig) -> Option<*const u8> + Send>,
+        Box<dyn Fn(HirId) -> Option<*const u8> + Send + Sync>,
+        Box<dyn Fn(HirId) -> Option<u64> + Send + Sync>,
+    ) {
+        let cranelift = Arc::clone(&self.cranelift);
+        let thunk = Box::new(move |sig: &crate::hir_interp::NativeSig| {
+            cranelift.with_lock(|be| be.interp_thunk(sig).ok())
+        });
+        let cranelift = Arc::clone(&self.cranelift);
+        let key = self.reload_key;
+        let entry = Box::new(move |id: HirId| {
+            let cell = crate::reload::call_target(key, id);
+            if cell != 0 {
+                return Some(cell as *const u8);
+            }
+            cranelift.with_lock(|be| be.entry_or_stub(id))
+        });
+        // With OSR off an interpreted loop stays where it is, as a
+        // native one does.
+        let beads: HashMap<HirId, u64> = if self.enable_osr {
+            self.functions
+                .iter()
+                .map(|(id, e)| (*id, e.bead_id))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let bead = Box::new(move |id: HirId| beads.get(&id).copied());
+        (thunk, entry, bead)
+    }
+}
+
+/// What an interpreter needs to run the loaded functions, made by
+/// [`TieredBackend::interpreter_binding`]: bound into the runtime's own
+/// interpreter, and into those that native calls of functions with no
+/// code yet run in (see [`InterpreterBinding::serve_native_calls`]).
+#[derive(Clone)]
+pub struct InterpreterBinding {
+    parts: Arc<BindingParts>,
+    symbols: Arc<Vec<(String, usize, Option<crate::zrtl::ZrtlSymbolSig>)>>,
+    globals: Arc<Vec<(HirId, usize)>>,
+    ticks: Arc<Vec<HirId>>,
+}
+
+impl InterpreterBinding {
+    /// Give `interp` every symbol, global slot and callback.
+    pub fn bind(&self, interp: &mut crate::hir_interp::HirInterpreter) {
+        for (name, ptr, sig) in self.symbols.iter() {
+            match sig {
+                Some(sig) => interp.register_symbol_typed(name.clone(), *ptr as *const u8, *sig),
+                None => interp.register_symbol(name.clone(), *ptr as *const u8, 0),
+            }
+        }
+        for (id, ptr) in self.globals.iter() {
+            interp.bind_global_slot(*id, *ptr as *mut u8);
+        }
+        self.bind_ticks(interp);
+        interp.set_body_source(self.parts.body_source());
+        interp.set_frame_exit_hook(self.parts.frame_exit_hook());
+        interp.set_address_source(self.parts.address_source());
+        let (thunk, entry, bead) = self.parts.bridge();
+        interp.set_native_bridge(thunk, entry, bead);
+    }
+
+    /// Give `interp` each function's entry callback anew, as a reload
+    /// that swapped bodies needs.
+    pub fn bind_ticks(&self, interp: &mut crate::hir_interp::HirInterpreter) {
+        for id in self.ticks.iter() {
+            if let Some(tick) = self.parts.tick_callback(*id) {
+                interp.register_tick_callback(*id, tick);
+            }
+        }
+    }
+
+    /// The function behind `bead_id` and the module it runs in.
+    fn function_of_bead(&self, bead_id: u64) -> Option<(HirId, Arc<HirModule>)> {
+        let id = *self.parts.by_bead.get(&bead_id)?;
+        let f = self.parts.functions.get(&id)?;
+        Some((id, Arc::clone(&f.module)))
+    }
+
+    /// Run the calls native code makes to functions with no code yet in
+    /// interpreters bound from this binding, so the caller goes on while
+    /// the function's compile is asked of the workers, until another
+    /// binding is served. Each thread keeps its own interpreters, one
+    /// per call nested in another. `ZYNTAX_DISABLE_STUB_INTERPRETER=1`
+    /// leaves such a call waiting for the compile; safe to run with.
+    pub fn serve_native_calls(&self) {
+        if std::env::var_os("ZYNTAX_DISABLE_STUB_INTERPRETER").is_some() {
+            osr::set_lazy_interpreter(None);
+            return;
+        }
+        let generation = NATIVE_CALL_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        let binding = self.clone();
+        // A call runs interpreted while the function is warming: past
+        // that it waits for the compile, as an interpreted call to a hot
+        // function would, so a function native code calls often is not
+        // held in the interpreter behind a busy worker.
+        let warm = (binding.parts.baseline_threshold / 4).max(2);
+        // Which beads' calls run interpreted at all, and which have had
+        // their compile asked for.
+        let eligible: Mutex<HashMap<u64, bool>> = Mutex::new(HashMap::new());
+        let asked: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
+        osr::set_lazy_interpreter(Some(Arc::new(move |bead_id, words, out| {
+            let Some((func_id, module)) = binding.function_of_bead(bead_id) else {
+                osr::note_lazy_declined(bead_id, "not a function of this binding");
+                return false;
+            };
+            // A program function with no loop: a loop could hold the call
+            // in the interpreter for its whole run, and a library body is
+            // a shell in the module, compiled as it is.
+            let runs = *eligible.lock().unwrap().entry(bead_id).or_insert_with(|| {
+                binding.parts.lazy.contains(&func_id)
+                    && !binding.parts.finished.contains(&func_id)
+                    && module.functions.get(&func_id).is_some_and(|f| {
+                        !f.blocks.is_empty() && osr::find_loop_headers(f).is_empty()
+                    })
+            });
+            if !runs {
+                osr::note_lazy_declined(bead_id, "a library function or one with a loop");
+                return false;
+            }
+            if let Some(queue) = &binding.parts.compile_queue {
+                let calls = queue
+                    .count_of(bead_id)
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if calls >= warm {
+                    osr::note_lazy_declined(bead_id, "warm already");
+                    return false;
+                }
+                if asked.lock().unwrap().insert(bead_id) {
+                    queue.request_for_native_caller(bead_id);
+                }
+            }
+            let idle = NATIVE_CALL_INTERPRETERS.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                pool.retain(|(g, _)| *g == generation);
+                pool.pop().map(|(_, interp)| interp)
+            });
+            let mut interp = idle.unwrap_or_else(|| {
+                let started = web_time::Instant::now();
+                let mut interp = crate::hir_interp::HirInterpreter::new();
+                interp.use_native_allocator();
+                binding.bind(&mut interp);
+                if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                    eprintln!(
+                        "[lazy] bound an interpreter for native calls in {:.2} ms",
+                        started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                interp
+            });
+            let ran = interp.call_from_native(&module, func_id, words, out);
+            NATIVE_CALL_INTERPRETERS.with(|pool| pool.borrow_mut().push((generation, interp)));
+            match ran {
+                Ok(true) => true,
+                Ok(false) => {
+                    osr::note_lazy_declined(bead_id, "its call does not travel one word a value");
+                    false
+                }
+                // Native code has no way to take a failure back.
+                Err(e) => {
+                    let name = module
+                        .functions
+                        .get(&func_id)
+                        .and_then(|f| f.name.resolve_global())
+                        .unwrap_or_default();
+                    eprintln!("an interpreted call of {name} from native code failed: {e}");
+                    std::process::abort();
+                }
+            }
+        })));
+    }
+}
+
+/// Counts the bindings served to native calls: an interpreter bound
+/// from an earlier one is not used again.
+static NATIVE_CALL_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The idle interpreters native calls on this thread ran in, each
+    /// with the generation of the binding it was bound from.
+    static NATIVE_CALL_INTERPRETERS: std::cell::RefCell<Vec<(u64, crate::hir_interp::HirInterpreter)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub fn compile_at_tier(

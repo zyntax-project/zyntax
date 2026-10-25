@@ -1626,6 +1626,15 @@ fn mapped(_lo: usize, _hi: usize) -> bool {
     true
 }
 
+/// How far the calling thread's stack can still grow from the caller,
+/// or `None` when the caller runs on another stack (a fiber's) or the
+/// thread's cannot be found.
+pub fn stack_room() -> Option<usize> {
+    let mark = stack_mark();
+    let (lo, hi) = host_stack();
+    (lo < mark && mark <= hi).then(|| mark - lo)
+}
+
 /// The highest address of the calling thread's stack.
 fn host_stack_top() -> usize {
     host_stack().1

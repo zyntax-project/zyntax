@@ -1,8 +1,9 @@
 //! A kernel's first iteration pays for the compiles its calls make. A
-//! loop-free function first called from native code runs its body as
-//! lowered until the worker's optimised compile replaces it, or the
-//! optimised body when one is ready, so no call waits on the
-//! per-function pipeline for one.
+//! function first called from native code runs that call in an
+//! interpreter while the workers compile it. Where the interpreter
+//! declines, a loop-free function runs its body as lowered until the
+//! worker's optimised compile replaces it, or the optimised body when
+//! one is ready, so no call waits on the per-function pipeline for one.
 #![cfg(all(feature = "llvm-backend", not(debug_assertions)))]
 
 use std::fs;
@@ -25,8 +26,9 @@ fn stage(kernel: &str) -> PathBuf {
     dir
 }
 
-/// What the lazy compiler traced over a run of `iterations`.
-fn trace(kernel: &str, iterations: usize) -> String {
+/// What the lazy compiler traced over a run of `iterations`, with
+/// `env` set.
+fn trace(kernel: &str, iterations: usize, env: &[(&str, &str)]) -> String {
     let dir = stage(kernel);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zypy"));
     cmd.arg("run")
@@ -36,7 +38,9 @@ fn trace(kernel: &str, iterations: usize) -> String {
         .current_dir(&dir)
         .env("ZYPY_LLVM", "1")
         .env("ZYNTAX_TRACE_LAZY", "1")
-        .env_remove("ZYNTAX_DISABLE_WARM_UP");
+        .env_remove("ZYNTAX_DISABLE_WARM_UP")
+        .env_remove("ZYNTAX_DISABLE_STUB_INTERPRETER")
+        .envs(env.iter().copied());
     let output = cmd.output().expect("zypy starts");
     let _ = fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -50,21 +54,46 @@ fn trace(kernel: &str, iterations: usize) -> String {
     stderr
 }
 
-#[test]
-fn no_loop_free_function_waits_on_the_pipeline_at_its_first_call() {
-    let trace = trace("deltablue.py", 5);
-    assert!(
-        trace.contains("[lazy] quick baseline "),
-        "no quick baseline was compiled:\n{trace}"
-    );
-    let waited: Vec<&str> = trace
+/// The loop-free functions a trace shows compiled through the pipeline
+/// on a caller's thread.
+fn waited_on_the_pipeline(trace: &str) -> Vec<&str> {
+    trace
         .lines()
         .filter(|l| {
             l.starts_with("[lazy] compiled ")
                 && l.contains(", loop-free)")
                 && l.ends_with(" on zyntax-first-call-compile")
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn first_calls_from_native_code_run_interpreted() {
+    let trace = trace("deltablue.py", 5, &[]);
+    assert!(
+        trace.contains("[lazy] interpreted a call of bead "),
+        "no call from native code ran interpreted:\n{trace}"
+    );
+    let waited = waited_on_the_pipeline(&trace);
+    assert!(
+        waited.is_empty(),
+        "loop-free functions compiled through the pipeline on a caller's thread:\n{}",
+        waited.join("\n")
+    );
+}
+
+#[test]
+fn no_loop_free_function_waits_on_the_pipeline_at_its_first_call() {
+    let trace = trace(
+        "deltablue.py",
+        5,
+        &[("ZYNTAX_DISABLE_STUB_INTERPRETER", "1")],
+    );
+    assert!(
+        trace.contains("[lazy] quick baseline "),
+        "no quick baseline was compiled:\n{trace}"
+    );
+    let waited = waited_on_the_pipeline(&trace);
     assert!(
         waited.is_empty(),
         "loop-free functions compiled through the pipeline on a caller's thread:\n{}",
