@@ -3199,20 +3199,18 @@ pub fn osr_request_promotion_interpreted(bead_id: u64, site: u64) {
     request(bead_id, Requester::Interpreted { site });
 }
 
-/// The compile worker's busy flag, raised while it is in a job.
-fn compile_worker_busy() -> &'static RwLock<Option<Arc<std::sync::atomic::AtomicBool>>> {
-    static B: OnceLock<RwLock<Option<Arc<std::sync::atomic::AtomicBool>>>> = OnceLock::new();
-    B.get_or_init(|| RwLock::new(None))
-}
+/// Whether compile workers take requests.
+static COMPILE_WORKERS_PRESENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Register the flag the compile worker raises while it is in a job.
-pub fn set_compile_worker_busy(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
-    *compile_worker_busy().write().unwrap() = flag;
+/// Say whether compile workers take requests.
+pub fn set_compile_workers_present(present: bool) {
+    COMPILE_WORKERS_PRESENT.store(present, std::sync::atomic::Ordering::Release);
 }
 
 /// Whether there is a compile worker at all.
 pub fn compile_worker_present() -> bool {
-    compile_worker_busy().read().unwrap().is_some()
+    COMPILE_WORKERS_PRESENT.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Interpreted frames that asked for resume points and are still

@@ -754,11 +754,21 @@ impl std::fmt::Display for PromotionOutcome {
     }
 }
 
-/// Work for the warm-up thread while it has none of its own: an
+/// How many compile workers take requests. `ZYNTAX_COMPILE_WORKERS=<n>`
+/// runs n in place of one; safe to run with.
+fn compile_workers() -> usize {
+    std::env::var("ZYNTAX_COMPILE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// Work for the warm-up threads while they have none of their own: an
 /// interpreted loop that asked for its resume points comes first (it is
 /// running, slowly, until they land), a function whose calls crossed
-/// the baseline threshold next. A request made while the thread is in
-/// a job would wait behind it, so the asking thread does that one
+/// the baseline threshold next. A request made while every thread is in
+/// a job would wait behind one, so the asking thread does that one
 /// itself; the planned order of everything else fills the gaps.
 struct CompileQueue {
     /// Interpreted frames' requests, each with the OSR site it waits at.
@@ -778,12 +788,12 @@ struct CompileQueue {
     counts: Mutex<HashMap<u64, Arc<std::sync::atomic::AtomicU32>>>,
     ready: std::sync::Condvar,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the worker is in a job. A request made while it is
-    /// would wait behind that job; the asking thread does the work
-    /// itself then, as it did before there was a worker. Shared with
-    /// the interpreter, which asks early for a warm loop while the
-    /// worker is quiescent.
-    busy: Arc<std::sync::atomic::AtomicBool>,
+    /// The workers draining the queue.
+    workers: std::sync::atomic::AtomicUsize,
+    /// How many of them are in no job. A request made while none is
+    /// would wait behind a job; the asking thread does the work itself
+    /// then, as it did before there were workers.
+    idle_workers: std::sync::atomic::AtomicUsize,
 }
 
 enum Job {
@@ -792,7 +802,7 @@ enum Job {
 }
 
 impl CompileQueue {
-    fn new(stop: Arc<std::sync::atomic::AtomicBool>) -> Self {
+    fn new(stop: Arc<std::sync::atomic::AtomicBool>, workers: usize) -> Self {
         Self {
             promote: Mutex::new(std::collections::VecDeque::new()),
             compile: Mutex::new(std::collections::VecDeque::new()),
@@ -801,18 +811,41 @@ impl CompileQueue {
             counts: Mutex::new(HashMap::new()),
             ready: std::sync::Condvar::new(),
             stop,
-            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            workers: std::sync::atomic::AtomicUsize::new(workers),
+            idle_workers: std::sync::atomic::AtomicUsize::new(workers),
         }
     }
 
-    /// Whether the worker would take a request now.
-    fn idle(&self) -> bool {
-        !self.busy.load(std::sync::atomic::Ordering::Acquire)
+    /// A worker that could not start: neither counted nor ever idle.
+    fn retire_worker(&self) {
+        self.workers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.idle_workers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Whether the worker is in no job and no request waits for it.
+    /// Whether a worker would take a request now.
+    fn idle(&self) -> bool {
+        self.idle_workers.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// A worker starts on the requests waiting.
+    fn enter_job(&self) {
+        self.idle_workers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// A worker found no request and waits for one.
+    fn leave_job(&self) {
+        self.idle_workers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether every worker is in no job and no request waits for one.
     fn quiet(&self) -> bool {
-        if !self.idle() {
+        if self.idle_workers.load(std::sync::atomic::Ordering::Acquire)
+            < self.workers.load(std::sync::atomic::Ordering::Acquire)
+        {
             return false;
         }
         let promote = self.promote.lock().unwrap().is_empty();
@@ -1208,11 +1241,11 @@ pub struct TieredBackend {
     /// beadie's own counters).
     profile_data: ProfileData,
 
-    /// The thread compiling the library functions the program can reach
-    /// ahead of their first call, and the flag that stops it between
-    /// two compiles. Joined at shutdown, before anything it compiles
+    /// The threads compiling what the program's profile asks for ahead
+    /// of the calls that need it, and the flag that stops them between
+    /// two compiles. Joined at shutdown, before anything they compile
     /// into goes away.
-    warm_up: Option<std::thread::JoinHandle<()>>,
+    warm_up: Vec<std::thread::JoinHandle<()>>,
     warm_up_stop: Arc<std::sync::atomic::AtomicBool>,
     /// What the warm-up thread compiles next: the requests of frames
     /// waiting on code, ahead of its own order. `None` without the
@@ -1336,7 +1369,7 @@ impl TieredBackend {
             last_undo: None,
             state_migration: crate::reload::StateMigration::default(),
             profile_data: ProfileData::new(config.profile_config.clone()),
-            warm_up: None,
+            warm_up: Vec::new(),
             warm_up_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compile_queue: None,
             first_compiles: Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new())),
@@ -4134,72 +4167,90 @@ impl TieredBackend {
         };
         let compile_lazy_function = Arc::new(compile_lazy_function);
 
-        // The compile worker: what the program's own profile asks for,
-        // a loop or a function that is warm or hot, nothing else. It
-        // stands idle otherwise, so a request is taken at once, and the
+        // The compile workers: what the program's own profile asks for,
+        // a loop or a function that is warm or hot, nothing else. They
+        // stand idle otherwise, so a request is taken at once, and the
         // program is never made to wait behind a compile it did not
-        // ask for. `ZYNTAX_DISABLE_WARM_UP=1` leaves every compile to the
+        // ask for. More than one take requests side by side; Cranelift's
+        // own compile runs outside the backend's lock, so their compiles
+        // overlap. `ZYNTAX_DISABLE_WARM_UP=1` leaves every compile to the
         // asking thread; safe to run with.
         if std::env::var_os("ZYNTAX_DISABLE_WARM_UP").is_none() {
-            // A compile after the first retires the worker before it,
+            // A compile after the first retires the workers before it,
             // which served the module as it then was: told to stop and
-            // woken, it leaves on its own.
+            // woken, they leave on their own.
             if let Some(queue) = self.compile_queue.take() {
                 self.warm_up_stop
                     .store(true, std::sync::atomic::Ordering::Release);
                 queue.wake();
                 self.warm_up_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             }
-            let compile = Arc::clone(&compile_lazy_function);
+            let workers = compile_workers();
             let stop = Arc::clone(&self.warm_up_stop);
-            let queue = Arc::new(CompileQueue::new(Arc::clone(&stop)));
-            osr::set_compile_worker_busy(Some(Arc::clone(&queue.busy)));
+            let queue = Arc::new(CompileQueue::new(Arc::clone(&stop), workers));
+            osr::set_compile_workers_present(true);
             self.compile_queue = Some(Arc::clone(&queue));
             *queue_cell.lock().unwrap() = Some(Arc::clone(&queue));
-            // Quick baselines the worker before this one had not replaced.
+            // Quick baselines the workers before these had not replaced.
             for (bead_id, compiled) in self.first_compiles.0.lock().unwrap().iter() {
                 if let Some((_, true)) = compiled {
                     queue.request_replacement(*bead_id);
                 }
             }
-            self.warm_up = std::thread::Builder::new()
-                .name("zyntax-warm-up".into())
-                .stack_size(16 << 20)
-                .spawn(move || {
-                    let _heap = crate::host_heap::ThreadGuard::enter();
-                    ON_WARM_UP.with(|on| on.set(true));
-                    loop {
-                        if stop.load(std::sync::atomic::Ordering::Acquire) {
-                            return;
-                        }
-                        queue.busy.store(true, std::sync::atomic::Ordering::Release);
-                        match queue.take() {
-                            Some(Job::Promote(bead_id, site)) => {
-                                queue.run_promotions(bead_id, site);
+            self.warm_up.clear();
+            for _ in 0..workers {
+                let compile = Arc::clone(&compile_lazy_function);
+                let stop = Arc::clone(&stop);
+                let worker_queue = Arc::clone(&queue);
+                let scratch_shared = Arc::clone(&scratch_shared);
+                let spawned = std::thread::Builder::new()
+                    .name("zyntax-warm-up".into())
+                    .stack_size(16 << 20)
+                    .spawn(move || {
+                        let queue = worker_queue;
+                        let _heap = crate::host_heap::ThreadGuard::enter();
+                        ON_WARM_UP.with(|on| on.set(true));
+                        let mut in_job = false;
+                        loop {
+                            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
                             }
-                            Some(Job::Compile(bead_id, count, at)) => {
-                                if queue.still_wanted(bead_id, count, at) {
-                                    compile(bead_id, false);
-                                } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
-                                    eprintln!(
-                                        "[lazy] dropped compile of bead {bead_id}: no calls since"
-                                    );
+                            if !in_job {
+                                queue.enter_job();
+                                in_job = true;
+                            }
+                            match queue.take() {
+                                Some(Job::Promote(bead_id, site)) => {
+                                    queue.run_promotions(bead_id, site);
+                                }
+                                Some(Job::Compile(bead_id, count, at)) => {
+                                    if queue.still_wanted(bead_id, count, at) {
+                                        compile(bead_id, false);
+                                    } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                                        eprintln!(
+                                            "[lazy] dropped compile of bead {bead_id}: no calls since"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    // Nothing waits: the scratch modules the
+                                    // program's functions are optimised in are
+                                    // let go once no worker uses one, and made
+                                    // again if asked.
+                                    scratch_shared.release_if_unused();
+                                    queue.leave_job();
+                                    in_job = false;
+                                    queue.wait();
                                 }
                             }
-                            None => {
-                                // Nothing waits: the scratch modules the
-                                // program's functions are optimised in are
-                                // let go, and made again if asked.
-                                scratch_shared.release_if_unused();
-                                queue
-                                    .busy
-                                    .store(false, std::sync::atomic::Ordering::Release);
-                                queue.wait();
-                            }
                         }
-                    }
-                })
-                .ok();
+                    });
+                match spawned {
+                    Ok(handle) => self.warm_up.push(handle),
+                    // A worker never started is never idle.
+                    Err(_) => queue.retire_worker(),
+                }
+            }
         }
 
         // `ZYNTAX_DISABLE_QUICK_BASELINE=1` gives every first call the
@@ -4911,13 +4962,13 @@ impl TieredBackend {
         osr::set_promotion_requester(|_, _| false);
         osr::set_lazy_compiler(|_| ptr::null());
         osr::set_lazy_optimizer(|_| None);
-        osr::set_compile_worker_busy(None);
+        osr::set_compile_workers_present(false);
         self.warm_up_stop
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(queue) = &self.compile_queue {
             queue.wake();
         }
-        if let Some(handle) = self.warm_up.take() {
+        for handle in self.warm_up.drain(..) {
             let _ = handle.join();
         }
         for entry in self.functions.values() {
