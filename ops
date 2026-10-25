@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792917922,"nonce":"jhty0NYTs9YdXstASLYCHm5kRUg=","message":"Confirmed by Rust CI run 40173953556 on 5321f9019ed376737c1107bcce9f465166ff07ab: concurrent_publishers_do_not_expose_partial_snapshots and the other snapshot::cache tests pass on x86_64-pc-windows-msvc.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792917922,"nonce":"tCOprqFLaY56xVqsEsb9YDKXd30=","status":2}]}
