@@ -270,8 +270,10 @@ fn inclusive_bound_overflow_and_loop_local_liveouts_are_rejected() {
     assert_eq!(auto_vectorize::run(f).vectorized, 0);
 }
 
+/// The body every tier shares takes the baseline's counter vectors
+/// whichever tier is the last, and the interpreter runs it as it is.
 #[test]
-fn lazy_counter_vector_width_follows_the_final_native_tier() {
+fn lazy_counter_vectors_are_shared_by_every_tier() {
     let _guard = TIERED_TEST.lock().unwrap();
     use std::collections::HashSet;
     use zyntax_compiler::tiered_backend::{Tier2Backend, TieredBackend, TieredConfig};
@@ -279,7 +281,7 @@ fn lazy_counter_vector_width_follows_the_final_native_tier() {
     for (tier, vectorized) in [
         (Tier2Backend::Cranelift, true),
         #[cfg(feature = "llvm-backend")]
-        (Tier2Backend::LLVM, false),
+        (Tier2Backend::LLVM, true),
     ] {
         let (mut module, id) = fixture(HirType::I64, Some(99));
         module.functions.get_mut(&id).unwrap().attributes.deferred = true;
@@ -300,7 +302,7 @@ fn lazy_counter_vector_width_follows_the_final_native_tier() {
                 .values()
                 .any(|b| b.phis.iter().any(|p| matches!(p.ty, HirType::Vector(..)))),
             vectorized,
-            "fixed-width counter vectors belong to the final Cranelift pipeline"
+            "the shared body carries the baseline's counter vectors"
         );
         let mut module = HirModule::new(InternedString::new_global("selected_counter"));
         module.functions.insert(id, (*body).clone());

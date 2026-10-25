@@ -754,6 +754,74 @@ impl std::fmt::Display for PromotionOutcome {
     }
 }
 
+/// Baseline compiles the program is waiting on or asked for (a stub's
+/// first call, a request its interpreted calls or frames made; not a
+/// callee compiled ahead of its first call), and when the last one
+/// ended, in microseconds since [`baseline_epoch`]: what an optimizing
+/// compile waits on (see [`wait_for_baseline_quiet`]).
+static BASELINE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static BASELINE_LAST_US: AtomicU64 = AtomicU64::new(0);
+
+fn baseline_epoch() -> web_time::Instant {
+    static EPOCH: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(web_time::Instant::now)
+}
+
+/// A baseline compile in progress, counted until it drops.
+struct BaselineBusy;
+
+impl BaselineBusy {
+    fn enter() -> Self {
+        BASELINE_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        BaselineBusy
+    }
+}
+
+impl Drop for BaselineBusy {
+    fn drop(&mut self) {
+        let now = baseline_epoch().elapsed().as_micros() as u64;
+        BASELINE_LAST_US.fetch_max(now, Ordering::AcqRel);
+        BASELINE_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Hold an optimizing compile until the baseline tier has gone quiet:
+/// no baseline compile under way and none for the quiet window. While
+/// the program is still reaching new code the baseline compiles take
+/// the cores, and a short run ends on baseline code before an
+/// optimizing install would pay for itself; a running loop moves up
+/// through its resume points once the compile lands. Waits at most
+/// [`OPTIMIZE_WAIT_MAX`]. `ZYNTAX_OPTIMIZE_QUIET_MS=<n>` sets the
+/// window, 0 waiting for nothing; safe to run with.
+fn wait_for_baseline_quiet() {
+    static QUIET_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let quiet = *QUIET_US.get_or_init(|| {
+        std::env::var("ZYNTAX_OPTIMIZE_QUIET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(OPTIMIZE_QUIET_MS)
+            * 1000
+    });
+    if quiet == 0 {
+        return;
+    }
+    let started = web_time::Instant::now();
+    loop {
+        let now = baseline_epoch().elapsed().as_micros() as u64;
+        let idle = BASELINE_IN_FLIGHT.load(Ordering::Acquire) == 0
+            && now.saturating_sub(BASELINE_LAST_US.load(Ordering::Acquire)) >= quiet;
+        if idle || started.elapsed() >= OPTIMIZE_WAIT_MAX {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The baseline quiet time an optimizing compile waits for.
+const OPTIMIZE_QUIET_MS: u64 = 20;
+/// The longest an optimizing compile waits for the baseline to go quiet.
+const OPTIMIZE_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How many compile workers take requests. `ZYNTAX_COMPILE_WORKERS=<n>`
 /// runs n in place of one; safe to run with.
 fn compile_workers() -> usize {
@@ -972,6 +1040,7 @@ impl CompileQueue {
     /// Run the promotion of `bead_id` asked for at `site`, then those
     /// asked for meanwhile.
     fn run_promotions(&self, bead_id: u64, mut site: u64) {
+        let _busy = BaselineBusy::enter();
         loop {
             osr::run_promotion(bead_id, osr::Requester::Interpreted { site });
             match self.next_promotion(bead_id) {
@@ -3408,7 +3477,13 @@ impl TieredBackend {
         let keeps_bodies = matches!(tier2_backend, Tier2Backend::LLVM);
         #[cfg(not(feature = "llvm-backend"))]
         let keeps_bodies = false;
-        let run_opts = if keeps_bodies {
+        // The body every tier shares takes the baseline's counter vectors
+        // under an LLVM ladder too: the baseline runs it until LLVM lands,
+        // and a short run ends there. `ZYNTAX_LLVM_SCALAR_REDUCTIONS=1`
+        // keeps reductions scalar for LLVM's own vectorizer instead; safe
+        // to run with.
+        let scalar_reductions = std::env::var_os("ZYNTAX_LLVM_SCALAR_REDUCTIONS").is_some();
+        let run_opts = if keeps_bodies && scalar_reductions {
             crate::run_interp_safe_opts_cached
         } else {
             crate::run_interp_safe_opts_cached_for_cranelift
@@ -4052,6 +4127,10 @@ impl TieredBackend {
                                 }
                                 Some(Job::Compile(bead_id, count, at)) => {
                                     if queue.still_wanted(bead_id, count, at) {
+                                        // A request the program's own calls
+                                        // made is demand; a callee asked for
+                                        // ahead of its first call is not.
+                                        let _busy = count.map(|_| BaselineBusy::enter());
                                         compile(bead_id, false);
                                     } else if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                                         eprintln!(
@@ -4090,6 +4169,7 @@ impl TieredBackend {
         // stub again: the entry is answered from the table then, with
         // no thread.
         osr::set_lazy_compiler(move |bead_id| {
+            let _busy = BaselineBusy::enter();
             if let Some(entry) = published_beads
                 .get(&bead_id)
                 .and_then(|bound| bound.bead().compiled())
@@ -4582,7 +4662,16 @@ impl TieredBackend {
             // request costs the running loop only the submission. The
             // regions frames run come first: a frame is in one now, the
             // body serves the calls after.
+            // A frame in a hot loop moves up through its resume points as
+            // soon as the code lands, so its request is compiled at once;
+            // one counted at a function's entry waits for the baseline to
+            // go quiet.
+            let at_entry =
+                matches!(from, osr::Requester::Compiled { site } if site == osr::NO_SITE);
             let submitted = adapter.force_promote(bound, tier_idx, move |bead| {
+                if at_entry {
+                    wait_for_baseline_quiet();
+                }
                 let regions = outlined_regions
                     .lock()
                     .unwrap()
@@ -5642,6 +5731,9 @@ impl BindingParts {
             let optimized_bodies = Arc::clone(&optimized_bodies);
             let code = adapter.on_invoke(&bound, move |tier, bead| {
                 let c = &*ctx;
+                if tier >= 1 {
+                    wait_for_baseline_quiet();
+                }
                 // The baseline was compiled at load; the ladder above it
                 // compiles anew, from the function's tier body. A quick
                 // baseline has none until its replacement: the body is

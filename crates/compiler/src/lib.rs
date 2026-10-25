@@ -1995,9 +1995,9 @@ pub fn run_interp_safe_opts_cached(module: &mut HirModule, cache: &OptCache) -> 
     run_interp_safe_opts_with(module, true, Some(cache), false, None)
 }
 
-/// Select fixed-width counter vectors when Cranelift is the final native tier.
-/// Shared bodies destined for LLVM keep scalar reductions for its target-width
-/// vectorizer; interpreter and native resume points still use the same body.
+/// Select fixed-width counter vectors for the body every tier shares: the
+/// baseline runs it, and the interpreter and native resume points read the
+/// same layout. LLVM receives the vectors as they are.
 pub(crate) fn run_interp_safe_opts_cached_for_cranelift(
     module: &mut HirModule,
     cache: &OptCache,
