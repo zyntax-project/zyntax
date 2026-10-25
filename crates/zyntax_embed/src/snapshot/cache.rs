@@ -256,7 +256,12 @@ impl SnapshotCache {
         if stopped() {
             return Ok(None);
         }
-        file.persist(&self.path).map_err(|error| io(error.error))?;
+        // Closed, then renamed by std: on Windows that replaces a target
+        // that readers or another publisher still hold open, where the
+        // temporary file's own persist is refused.
+        let mut temp = file.into_temp_path();
+        std::fs::rename(&temp, &self.path).map_err(io)?;
+        temp.disable_cleanup(true);
         Ok(Some(self.path.clone()))
     }
 
