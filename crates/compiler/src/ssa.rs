@@ -243,6 +243,11 @@ fn simd_alias_hir_type(name: &str) -> Option<HirType> {
     (lanes > 0).then(|| HirType::Vector(Box::new(elem), lanes))
 }
 
+/// The largest body whose predecessor index a debug build checks
+/// against a scan of every terminator.
+#[cfg(debug_assertions)]
+const SCANNED_PREDS_MAX_BLOCKS: usize = 512;
+
 /// The blocks whose terminator branches to each block, and what each
 /// block's terminator was last read to target. Only the edges
 /// `current_preds_of` counts are kept: branches, conditional branches
@@ -8254,12 +8259,16 @@ impl SsaBuilder {
                 preds.push(id);
             }
         }
+        // The scan reads every block, so large bodies skip it: checked on
+        // each query, it makes a debug build quadratic in the body.
         #[cfg(debug_assertions)]
-        assert_eq!(
-            preds,
-            self.scanned_preds_of(block),
-            "a terminator written without `term_dirty` hides an edge into {block:?}"
-        );
+        if self.function.blocks.len() <= SCANNED_PREDS_MAX_BLOCKS {
+            assert_eq!(
+                preds,
+                self.scanned_preds_of(block),
+                "a terminator written without `term_dirty` hides an edge into {block:?}"
+            );
+        }
         preds
     }
 
