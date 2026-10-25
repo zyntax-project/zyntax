@@ -1846,6 +1846,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     // Operator codes: 0 +, 1 -, 2 *, 3 /, 4 //, 5 %, 6 **, 7 &, 8 |,
     // 9 ^, 10 <<, 11 >>.
     let code = local("code", i64());
+    // The operation a typed operand reaches only when it is None, for the
+    // TypeError: kept as a call on that path.
+    d.push(define_cold(
+        "zb_any_arith_cold",
+        &[&code, &a, &b],
+        any(),
+        vec![ret(call(
+            "zb_any_arith",
+            vec![code.e(), a.e(), b.e()],
+            any(),
+        ))],
+    ));
     d.push(define(
         "zb_any_arith",
         &[&code, &a, &b],

@@ -11618,7 +11618,13 @@ impl<'m> Lowerer<'m> {
                 "open" => return self.open_call(c, span),
                 "eval" => return self.eval_call(args, c, span),
                 "int" => {
-                    let v = self.expr(&args[0])?;
+                    let v = self.expr_num(&args[0])?;
+                    if let Ty::Num(_) = v.ty
+                        && let Some(node) = self.num_int(v.clone(), span)
+                    {
+                        return Ok(Val { node, ty: Ty::Int });
+                    }
+                    let v = self.boxed_num(v);
                     let node = match v.ty {
                         Ty::Int => v.node,
                         Ty::Bool | Ty::Float => cast(v.node, Ty::Int, span),
@@ -11643,7 +11649,17 @@ impl<'m> Lowerer<'m> {
                     return Ok(Val { node, ty: Ty::Int });
                 }
                 "float" => {
-                    let v = self.expr(&args[0])?;
+                    let v = self.expr_num(&args[0])?;
+                    if let Ty::Num(m) = v.ty
+                        && m & !(Ty::NUM_BOOL | Ty::NUM_INT | Ty::NUM_FLOAT) == 0
+                    {
+                        let node = self.coerce(v, Ty::Float);
+                        return Ok(Val {
+                            node,
+                            ty: Ty::Float,
+                        });
+                    }
+                    let v = self.boxed_num(v);
                     let node = match v.ty {
                         Ty::Float => v.node,
                         Ty::Bool | Ty::Int => cast(v.node, Ty::Float, span),
@@ -11885,6 +11901,52 @@ impl<'m> Lowerer<'m> {
                         let least = self.checked(least);
                         return Ok(Val {
                             node: self.coerce(least, ty),
+                            ty,
+                        });
+                    }
+                    // Several ints, or several floats, are compared in
+                    // turn: the first least (or greatest) is kept, as the
+                    // builtin keeps it.
+                    if args.len() >= 2
+                        && matches!(ty, Ty::Int | Ty::Float)
+                        && args.iter().all(|a| self.ty_of(a) == ty)
+                    {
+                        let op = if name == "min" {
+                            BinaryOp::Lt
+                        } else {
+                            BinaryOp::Gt
+                        };
+                        let mut best: Option<Node> = None;
+                        for a in args.iter() {
+                            let v = self.expr_as(a, ty)?;
+                            let mut held = Vec::new();
+                            let v = self.hold(Val { node: v, ty }, &mut held, span).node;
+                            self.hoisted.append(&mut held);
+                            best = Some(match best {
+                                None => v,
+                                Some(b) => {
+                                    let pick = node(
+                                        TypedExpression::If(TypedIfExpr {
+                                            condition: Box::new(binary(
+                                                op,
+                                                v.clone(),
+                                                b.clone(),
+                                                Ty::Bool,
+                                                span,
+                                            )),
+                                            then_branch: Box::new(v),
+                                            else_branch: Box::new(b),
+                                        }),
+                                        ty,
+                                        span,
+                                    );
+                                    self.hold(Val { node: pick, ty }, &mut held, span).node
+                                }
+                            });
+                            self.hoisted.append(&mut held);
+                        }
+                        return Ok(Val {
+                            node: best.expect("two or more arguments"),
                             ty,
                         });
                     }

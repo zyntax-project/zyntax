@@ -327,6 +327,25 @@ impl Lowerer<'_> {
         Self::with_pre(pre, result, target, span)
     }
 
+    /// `int(v)` of a Num of numbers only, on its parts: the int (a bool's
+    /// 0 or 1), or the float truncated as `int()` of a float is. `None`
+    /// when the Num may be None.
+    pub(crate) fn num_int(&mut self, v: Val, span: Span) -> Option<Node> {
+        if v.ty.mask()? & !NUMBERS != 0 {
+            return None;
+        }
+        let mut pre = Vec::new();
+        let p = self.num_held(v, &mut pre, span);
+        let int = select(
+            p.has_tag(TAG_FLOAT, span),
+            cast(p.float.clone(), Ty::Int, span),
+            p.int.clone(),
+            Ty::Int,
+            span,
+        );
+        Some(Self::with_pre(pre, int, Ty::Int, span))
+    }
+
     /// A Num a test has shown is not None, as the kinds left: a float,
     /// an int or a bool read off its part, else the same struct under
     /// the narrower mask. No check: the test excluded the NONE tag.
@@ -454,7 +473,7 @@ impl Lowerer<'_> {
             let outer = std::mem::take(&mut self.hoisted);
             let (bl, br) = (self.boxed_num(l.clone()), self.boxed_num(r.clone()));
             let raised = call(
-                "zb_any_arith",
+                "zb_any_arith_cold",
                 vec![
                     int_lit(crate::types::arith_code(op), span),
                     bl.node,

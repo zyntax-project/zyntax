@@ -88,6 +88,11 @@ use std::sync::Arc;
 /// inline blow-up at one call site stays bounded.
 const MAX_INLINE_INSTS: usize = 64;
 
+/// [`MAX_INLINE_INSTS`] for a leaf that returns an object it allocates:
+/// inlined, the object may never be made at all, since the caller then
+/// sees every use of it.
+const MAX_INLINE_INSTS_ALLOCATING_LEAF: usize = 128;
+
 /// Maximum total instructions across all blocks for a multi-block
 /// callee. Higher than `MAX_INLINE_INSTS` because the body has more
 /// structure to amortise the inline cost (a control-flow branch
@@ -1730,7 +1735,12 @@ fn classify(
             Some(b) => b,
             None => return unsupported,
         };
-        if entry.instructions.len() > MAX_INLINE_INSTS {
+        let limit = if returns_own_allocation(entry) {
+            MAX_INLINE_INSTS_ALLOCATING_LEAF
+        } else {
+            MAX_INLINE_INSTS
+        };
+        if entry.instructions.len() > limit {
             return (CalleeClass::TooLarge, hot);
         }
         if !entry.phis.is_empty() {
@@ -1747,6 +1757,31 @@ fn classify(
         return (CalleeClass::TooLarge, hot);
     }
     (CalleeClass::OkMultiBlock, hot)
+}
+
+/// Whether the leaf `block` returns, as it is or cast, the result of an
+/// allocation it makes.
+fn returns_own_allocation(block: &HirBlock) -> bool {
+    let HirTerminator::Return { values } = &block.terminator else {
+        return false;
+    };
+    let &[mut value] = values.as_slice() else {
+        return false;
+    };
+    for inst in block.instructions.iter().rev() {
+        match inst {
+            HirInstruction::Cast {
+                result, operand, ..
+            } if *result == value => value = *operand,
+            HirInstruction::Call {
+                result: Some(result),
+                callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                ..
+            } if *result == value => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Splice the callee's single-block body into the caller's
@@ -3073,6 +3108,62 @@ mod tests {
         let stats = run_module(&mut module);
         assert_eq!(stats.inlined, 0);
         assert_eq!(stats.skipped_too_large, 1);
+    }
+
+    /// A leaf past the plain limit is still inlined when what it returns
+    /// is an object it allocates: the caller may then never make it.
+    #[test]
+    fn inlines_a_large_leaf_returning_its_allocation() {
+        let mut callee = HirFunction::new(
+            InternedString::new_global("make"),
+            sig(vec![HirType::I64], HirType::I64),
+        );
+        let entry = HirId::new();
+        callee.entry_block = entry;
+        callee.blocks.clear();
+        callee.blocks.insert(entry, HirBlock::new(entry));
+        let x = add_value_for_param(&mut callee, 0, HirType::I64);
+        let mut prev = x;
+        for _ in 0..(MAX_INLINE_INSTS + 16) {
+            let next = add_inst(&mut callee, HirType::I64);
+            let one = add_const(&mut callee, HirType::I64, HirConstant::I64(1));
+            callee
+                .blocks
+                .get_mut(&entry)
+                .unwrap()
+                .instructions
+                .push(HirInstruction::Binary {
+                    op: BinaryOp::Add,
+                    result: next,
+                    ty: HirType::I64,
+                    left: prev,
+                    right: one,
+                });
+            prev = next;
+        }
+        let made = add_inst(&mut callee, HirType::I64);
+        let block = callee.blocks.get_mut(&entry).unwrap();
+        block.instructions.push(HirInstruction::Call {
+            result: Some(made),
+            callee: HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+            args: vec![prev],
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        });
+        block.terminator = HirTerminator::Return { values: vec![made] };
+
+        let callee_id = HirId::new();
+        callee.id = callee_id;
+        let caller = build_caller(callee_id);
+
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        module.functions.insert(callee_id, callee);
+        module.functions.insert(caller.id, caller);
+
+        let stats = run_module(&mut module);
+        assert_eq!(stats.skipped_too_large, 0);
+        assert_eq!(stats.inlined, 1);
     }
 
     #[test]
