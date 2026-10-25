@@ -105,7 +105,10 @@ fn transitive_and_type_only_edits_recheck_source_and_preserve_diagnostics() {
     let file = root.join("lib.ts");
     let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
     write(root, "lib.ts", "export function f():number{return 2;}");
-    std::fs::File::open(file)
+    // Windows sets a file's times only through a handle with write access.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(file)
         .unwrap()
         .set_times(std::fs::FileTimes::new().set_modified(modified))
         .unwrap();
