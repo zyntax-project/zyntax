@@ -1328,8 +1328,12 @@ impl TieredRuntime {
         // signatures, register signatures with the backend for
         // auto-boxing, then rebuild the JIT module so compiled code
         // can resolve the new symbols.
+        let pairs: Vec<(&str, *const u8)> = runtime_symbols
+            .iter()
+            .map(|sym| (sym.name, sym.ptr))
+            .collect();
+        self.backend.register_runtime_symbols(&pairs);
         for sym in &runtime_symbols {
-            self.backend.register_runtime_symbol(sym.name, sym.ptr);
             if let Some(sig) = sym.sig {
                 self.plugin_signatures.insert(sym.name.to_string(), sig);
             }

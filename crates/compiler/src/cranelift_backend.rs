@@ -460,6 +460,8 @@ pub struct CraneliftBackend {
     exported_symbols: HashMap<String, *const u8>,
     /// Runtime symbols registered for external linking
     runtime_symbols: Vec<(String, *const u8)>,
+    /// The names in `runtime_symbols`, for asking whether one is there.
+    runtime_symbol_names: std::collections::HashSet<String>,
     /// The same symbols as the JIT module looks them up; see
     /// [`SymbolTable`].
     symbol_table: SymbolTable,
@@ -819,6 +821,7 @@ impl CraneliftBackend {
             .map(|syms| syms.iter().map(|(n, p)| (n.to_string(), *p)).collect())
             .unwrap_or_default();
 
+        let runtime_symbol_names = runtime_symbols.iter().map(|(n, _)| n.clone()).collect();
         Ok(Self {
             declined_functions: std::collections::HashSet::default(),
             module,
@@ -843,6 +846,7 @@ impl CraneliftBackend {
             },
             exported_symbols: HashMap::default(),
             runtime_symbols,
+            runtime_symbol_names,
             symbol_table,
             symbol_signatures: HashMap::default(),
             external_link_names: HashMap::default(),
@@ -10860,13 +10864,21 @@ impl CraneliftBackend {
     ///
     /// These symbols will be included when the JIT module needs to be recreated.
     pub fn register_runtime_symbol(&mut self, name: &str, ptr: *const u8) {
-        // Check if symbol already exists
-        if !self.runtime_symbols.iter().any(|(n, _)| n == name) {
-            self.runtime_symbols.push((name.to_string(), ptr));
-            self.symbol_table
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(name.to_string(), ptr as usize);
+        self.register_runtime_symbols(std::iter::once((name, ptr)));
+    }
+
+    /// [`Self::register_runtime_symbol`] for many, under one lock of the
+    /// table. A name registered already keeps its first address.
+    pub fn register_runtime_symbols<'a>(
+        &mut self,
+        symbols: impl IntoIterator<Item = (&'a str, *const u8)>,
+    ) {
+        let mut table = self.symbol_table.write().unwrap_or_else(|e| e.into_inner());
+        for (name, ptr) in symbols {
+            if self.runtime_symbol_names.insert(name.to_string()) {
+                self.runtime_symbols.push((name.to_string(), ptr));
+                table.insert(name.to_string(), ptr as usize);
+            }
         }
     }
 
@@ -10899,7 +10911,7 @@ impl CraneliftBackend {
         externs.iter().any(|name| {
             // Check if the extern is in our exported symbols but not in runtime symbols
             let needs = self.exported_symbols.contains_key(name)
-                && !self.runtime_symbols.iter().any(|(n, _)| n == name);
+                && !self.runtime_symbol_names.contains(name);
             if needs && std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!("[clif] rebuild for extern {name}");
             }
@@ -10946,7 +10958,7 @@ impl CraneliftBackend {
 
         // Update runtime_symbols to include everything
         for (name, ptr) in &self.exported_symbols {
-            if !self.runtime_symbols.iter().any(|(n, _)| n == name) {
+            if self.runtime_symbol_names.insert(name.clone()) {
                 self.runtime_symbols.push((name.clone(), *ptr));
             }
         }

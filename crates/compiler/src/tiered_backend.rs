@@ -4911,19 +4911,32 @@ impl TieredBackend {
     /// once after batching all symbol registrations for a plugin (or
     /// directory of plugins) to push them into the live JIT module.
     pub fn register_runtime_symbol(&mut self, name: &str, ptr: *const u8) {
-        self.runtime_symbols.write().unwrap().push(RuntimeSymbol {
-            name: name.to_string(),
-            ptr: ptr as usize,
-        });
+        self.register_runtime_symbols(&[(name, ptr)]);
+    }
+
+    /// [`Self::register_runtime_symbol`] for many, each backend locked
+    /// once for all of them.
+    pub fn register_runtime_symbols(&mut self, symbols: &[(&str, *const u8)]) {
+        self.runtime_symbols
+            .write()
+            .unwrap()
+            .extend(symbols.iter().map(|(name, ptr)| RuntimeSymbol {
+                name: name.to_string(),
+                ptr: *ptr as usize,
+            }));
         self.cranelift
-            .with_lock(|be| be.register_runtime_symbol(name, ptr));
+            .with_lock(|be| be.register_runtime_symbols(symbols.iter().copied()));
         // The LLVM tier binds externals with `add_global_mapping`, and a
-        // declaration it has no mapping for resolves to null — which a
+        // declaration it has no mapping for resolves to null, which a
         // promoted function then calls. Every symbol the ground tier can
         // reach must be visible to the tiers above it.
         #[cfg(feature = "llvm-backend")]
         if let Some(llvm) = &self.llvm {
-            llvm.with_lock(|be| be.register_symbol(name, ptr));
+            llvm.with_lock(|be| {
+                for (name, ptr) in symbols {
+                    be.register_symbol(*name, *ptr);
+                }
+            });
         }
     }
 
