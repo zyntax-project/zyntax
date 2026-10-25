@@ -86,31 +86,32 @@ impl ZyntaxCraneliftBackend {
     /// function is compiled again here for its helpers alone; its call
     /// cell is left to whatever code is installed.
     pub fn resume_points(&self, def: &ZyntaxFunctionDef) -> Vec<(u64, *mut ())> {
-        let (translated, isa) = self
-            .with_lock(|backend| {
-                backend.set_compile_tier(1);
-                backend.set_compile_bead_id(def.bead_id);
-                backend
-                    .translate_function_in_shared_module(def.id, &def.function, &def.module)
-                    .ok()
-                    .flatten()
-                    .map(|t| (t, backend.isa()))
-            })
-            .map_or((None, None), |(t, isa)| (Some(t), Some(isa)));
-        let (Some(mut translated), Some(isa)) = (translated, isa) else {
+        // As in `compile`: the body and its helpers translated and
+        // installed under the lock, compiled between without it.
+        let Some((mut translated, mut helpers, isa)) = self.with_lock(|backend| {
+            backend.set_compile_tier(1);
+            backend.set_compile_bead_id(def.bead_id);
+            let translated = backend
+                .translate_function_in_shared_module(def.id, &def.function, &def.module)
+                .ok()
+                .flatten()?;
+            let helpers = backend.translate_resume_points(def.id, &def.function, &def.module);
+            Some((translated, helpers, backend.isa()))
+        }) else {
             return Vec::new();
         };
         if translated.compile(&*isa).is_err() {
             return Vec::new();
         }
+        helpers.retain_mut(|(helper, _)| helper.compile(&*isa).is_ok());
         self.with_lock(|backend| {
             backend.set_compile_tier(1);
             backend.set_compile_bead_id(def.bead_id);
-            if backend
-                .install_function_in_shared_module(translated, &def.function)
-                .is_err()
-            {
+            if backend.install_function_body(translated).is_err() {
                 return Vec::new();
+            }
+            for (helper, site) in helpers {
+                let _ = backend.install_resume_point(helper, site);
             }
             backend.set_defer_cell_publish(true);
             let finalized = backend.finalize_definitions();
@@ -304,8 +305,10 @@ impl JitBackend for ZyntaxCraneliftBackend {
         let bead_id = def.bead_id;
         // Translation and installation need the module and run under the
         // lock; Cranelift's own compile, the long part, does not, so
-        // another thread's compile is not held behind it.
-        let (translated, isa) = self.with_lock(|backend| {
+        // another thread's compile is not held behind it. That holds for
+        // a resume-point compile's helpers too: one per loop, they are
+        // most of the work for a function with many loops.
+        let (translated, mut helpers, isa) = self.with_lock(|backend| {
             backend.set_compile_tier(tier);
             backend.set_compile_bead_id(bead_id);
             let translated = backend
@@ -313,7 +316,13 @@ impl JitBackend for ZyntaxCraneliftBackend {
                 .map_err(|e| {
                     CompileError::new(format!("cranelift compile_function failed: {e}"))
                 })?;
-            Ok::<_, CompileError>((translated, backend.isa()))
+            let helpers = match &translated {
+                Some(_) if tier >= 1 => {
+                    backend.translate_resume_points(def.id, &def.function, &def.module)
+                }
+                _ => Vec::new(),
+            };
+            Ok::<_, CompileError>((translated, helpers, backend.isa()))
         })?;
         let translated = match translated {
             Some(mut translated) => {
@@ -324,15 +333,17 @@ impl JitBackend for ZyntaxCraneliftBackend {
             }
             None => None,
         };
+        helpers.retain_mut(|(helper, _)| helper.compile(&*isa).is_ok());
         self.with_lock(|backend| {
             backend.set_compile_tier(tier);
             backend.set_compile_bead_id(bead_id);
             if let Some(translated) = translated {
-                backend
-                    .install_function_in_shared_module(translated, &def.function)
-                    .map_err(|e| {
-                        CompileError::new(format!("cranelift compile_function failed: {e}"))
-                    })?;
+                backend.install_function_body(translated).map_err(|e| {
+                    CompileError::new(format!("cranelift compile_function failed: {e}"))
+                })?;
+            }
+            for (helper, site) in helpers {
+                let _ = backend.install_resume_point(helper, site);
             }
             // Resolve the new definition before reading any pointer from
             // it: `get_function_ptr` would otherwise hand back the

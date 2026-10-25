@@ -1992,6 +1992,45 @@ impl CraneliftBackend {
         Ok(())
     }
 
+    /// The resume points a tier-one install would emit for `function`,
+    /// one per loop header the layout admits, translated and not yet
+    /// compiled: Cranelift's compile of them needs no lock, and
+    /// [`Self::install_resume_point`] takes each result. A header whose
+    /// helper cannot be translated is left out, as the install skips it.
+    pub fn translate_resume_points(
+        &mut self,
+        id: HirId,
+        function: &HirFunction,
+        module: &Arc<HirModule>,
+    ) -> Vec<(Translated, u64)> {
+        let mut out = Vec::new();
+        for header in crate::osr::find_loop_headers(function) {
+            match self.translate_resume_point(id, function, module, header) {
+                Ok(Some(helper)) => out.push(helper),
+                Ok(None) => {}
+                Err(e) => {
+                    if std::env::var_os("ZYNTAX_OSR_TRACE").is_some() {
+                        eprintln!(
+                            "[osr] helper translation failed for bead={}: {e}",
+                            self.compile_bead_id
+                        );
+                    }
+                    self.codegen_context.clear();
+                    self.value_map.clear();
+                    self.block_map.clear();
+                }
+            }
+        }
+        out
+    }
+
+    /// Install a translated and compiled body alone, with none of the
+    /// OSR helpers [`Self::install_function_in_shared_module`] emits at
+    /// tier one; the caller installs those it translated itself.
+    pub fn install_function_body(&mut self, translated: Translated) -> CompilerResult<()> {
+        self.install_translated(translated)
+    }
+
     /// The resume point at `header` of `function`, translated and not
     /// yet compiled: the first half of [`Self::compile_resume_points_for`]
     /// for one header. Cranelift's compile of it, the long part, needs
