@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1792926937,"nonce":"JyZdu851+CwaS29lFKoRcKq8xrw=","message":"Confirmed by Rust CI run 40184462895 on 5dbc867332b953f2f36c3bbaefa9bacaa230813b2: every job passes, x86_64-pc-windows-msvc included.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1792926937,"nonce":"KV1tcQ1WaZdhsp4Wk3FqCQhTzL8=","status":2}]}
