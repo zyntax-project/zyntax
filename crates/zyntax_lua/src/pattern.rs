@@ -33,6 +33,71 @@ pub struct Matcher<'a> {
 
 type MatchResult = Result<Option<usize>, String>;
 
+/// The captures `pat` makes, in order, each whether it is a position
+/// capture `()`; `None` for a pattern this scan cannot read plainly (an
+/// unbalanced parenthesis, a dangling escape or set), which the matcher
+/// then reports.
+pub fn capture_kinds(pat: &[u8]) -> Option<Vec<bool>> {
+    let mut kinds = Vec::new();
+    let mut open = 0usize;
+    let mut i = 0;
+    while i < pat.len() {
+        match pat[i] {
+            ESC => {
+                let class = *pat.get(i + 1)?;
+                i += 2;
+                match class {
+                    b'b' => {
+                        pat.get(i + 1)?;
+                        i += 2;
+                    }
+                    b'f' if pat.get(i) == Some(&b'[') => i = set_end(pat, i)?,
+                    b'f' => return None,
+                    _ => {}
+                }
+            }
+            b'[' => i = set_end(pat, i)?,
+            b'(' if pat.get(i + 1) == Some(&b')') => {
+                kinds.push(true);
+                i += 2;
+            }
+            b'(' => {
+                kinds.push(false);
+                open += 1;
+                i += 1;
+            }
+            b')' => {
+                open = open.checked_sub(1)?;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (open == 0 && kinds.len() <= MAX_CAPTURES).then_some(kinds)
+}
+
+/// Past the set at `i` (`pat[i]` is `[`), as the reference's `classEnd`
+/// reads it: a leading `^`, then a first member taken whatever it is.
+fn set_end(pat: &[u8], mut i: usize) -> Option<usize> {
+    i += 1;
+    if pat.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if pat.get(i) == Some(&b']') {
+        i += 1;
+    }
+    loop {
+        match *pat.get(i)? {
+            ESC => {
+                pat.get(i + 1)?;
+                i += 2;
+            }
+            b']' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+}
+
 /// Whether any byte of the pattern has a meaning.
 pub fn has_specials(pat: &[u8]) -> bool {
     pat.iter().any(|b| SPECIALS.contains(b))
@@ -526,6 +591,23 @@ pub fn capture_text(i: usize) -> Result<CaptureValue, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_kinds_follow_the_pattern() {
+        assert_eq!(capture_kinds(b"[^ ]+"), Some(vec![]));
+        assert_eq!(
+            capture_kinds(b"(%a+)=()(%d+)"),
+            Some(vec![false, true, false])
+        );
+        assert_eq!(capture_kinds(b"[(]%((x)%)"), Some(vec![false]));
+        assert_eq!(capture_kinds(b"%b()(.)"), Some(vec![false]));
+        assert_eq!(capture_kinds(b"%f[%w](%w+)"), Some(vec![false]));
+        assert_eq!(capture_kinds(b"[]](a)"), Some(vec![false]));
+        assert_eq!(capture_kinds(b"(a"), None);
+        assert_eq!(capture_kinds(b"a)"), None);
+        assert_eq!(capture_kinds(b"a%"), None);
+        assert_eq!(capture_kinds(b"[a"), None);
+    }
 
     fn found(s: &str, p: &str) -> Option<(usize, usize)> {
         let r = find(s.as_bytes(), p.as_bytes(), 0);

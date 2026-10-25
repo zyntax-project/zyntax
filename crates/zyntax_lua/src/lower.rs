@@ -10387,6 +10387,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let t = self.expr(table)?;
             return self.pairs_loop(&names, t, f, span, out);
         }
+        if !self.debug_locals()
+            && let Some(captures) = self.typer().gmatch_walk(&exprs)
+        {
+            return self.gmatch_loop(&names, &exprs, &captures, f, span, out);
+        }
         // The general protocol: `f, s, control` and a closing value,
         // then `f(s, control)` until its first value is nil. A closing
         // value comes from a fourth expression that is not nil, or from
@@ -10630,6 +10635,107 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.push_loop_with_increment(body, inner, increment, span, out);
         let end = self.m.line_of(span_of(f.end_token()));
         out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end), span));
+        Ok(())
+    }
+
+    /// `for ... in string.gmatch(s, p)`, `s` a string and `p` a literal
+    /// pattern: each match found in place by `zl_gmatch_next` and its
+    /// captures read from the matcher straight after, a string or a
+    /// position each (`captures`), as the iterator would give them.
+    fn gmatch_loop(
+        &mut self,
+        names: &[VarId],
+        exprs: &[&Expression],
+        captures: &[bool],
+        f: &ast::GenericFor,
+        span: Span,
+        out: &mut Vec<St>,
+    ) -> Result<()> {
+        let [Expression::FunctionCall(c)] = exprs else {
+            unreachable!("a gmatch walk is one call")
+        };
+        let suffixes: Vec<&Suffix> = c.suffixes().collect();
+        let Some(Suffix::Call(ast::Call::AnonymousCall(args))) = suffixes.last() else {
+            unreachable!("a gmatch walk ends in its call")
+        };
+        let arg_exprs = self.args_exprs(args);
+        let subject = self.expr(arg_exprs[0])?;
+        let pattern = self.expr(arg_exprs[1])?;
+        let i64_t = prim(PrimitiveType::I64);
+        let str_t = self.ir(Ty::Str);
+        let [s, p, n, from, last, end] = std::array::from_fn(|_| self.temp());
+        let get = |name, ty: &Type| var(name, ty.clone(), span);
+        out.push(let_(s, str_t.clone(), subject.node, span));
+        out.push(let_(p, str_t.clone(), pattern.node, span));
+        out.push(let_(
+            n,
+            i64_t.clone(),
+            call("zb_str_len", vec![get(s, &str_t)], i64_t.clone(), span),
+            span,
+        ));
+        out.push(let_(from, i64_t.clone(), int_lit(0, span), span));
+        out.push(let_(last, i64_t.clone(), int_lit(-1, span), span));
+        let next = self.guard(Val {
+            node: call(
+                "zl_gmatch_next",
+                vec![
+                    get(s, &str_t),
+                    get(p, &str_t),
+                    get(from, &i64_t),
+                    get(n, &i64_t),
+                    get(last, &i64_t),
+                ],
+                i64_t.clone(),
+                span,
+            ),
+            ty: Ty::Int,
+        });
+        let mut body = vec![let_(end, i64_t.clone(), next.node, span)];
+        body.push(if_(
+            binary(
+                BinaryOp::Lt,
+                get(end, &i64_t),
+                int_lit(0, span),
+                prim(PrimitiveType::Bool),
+                span,
+            ),
+            vec![stmt(TypedStatement::Break(None), span)],
+            None,
+            span,
+        ));
+        body.push(assign(get(from, &i64_t), get(end, &i64_t), span));
+        body.push(assign(get(last, &i64_t), get(end, &i64_t), span));
+        for (j, v) in names.iter().enumerate() {
+            let value = match captures.get(j) {
+                Some(false) => Val {
+                    node: call(
+                        "zl_pat_cap_str",
+                        vec![get(s, &str_t), int_lit(j as i64, span)],
+                        str_t.clone(),
+                        span,
+                    ),
+                    ty: Ty::Str,
+                },
+                Some(true) => Val {
+                    node: call(
+                        "zl_pat_cap_pos",
+                        vec![int_lit(j as i64, span)],
+                        i64_t.clone(),
+                        span,
+                    ),
+                    ty: Ty::Int,
+                },
+                None => self.nil_val(span),
+            };
+            body.push(self.declare_var(*v, value, span));
+        }
+        let mut inner =
+            self.for_body(f.block(), vec![nil(span); 4], names, span_of(f.end_token()))?;
+        inner.extend(self.debug_loop_back(span_of(f.for_token()), false, span));
+        body.extend(inner);
+        out.push(while_(bool_lit(true, span), body, span));
+        let end_line = self.m.line_of(span_of(f.end_token()));
+        out.extend(self.debug_loop_exit(span_of(f.for_token()), Some(end_line), span));
         Ok(())
     }
 

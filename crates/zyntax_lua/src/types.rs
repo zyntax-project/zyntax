@@ -1078,6 +1078,38 @@ impl<'a> Typer<'a> {
         }
     }
 
+    /// The captures a generic `for` over `string.gmatch(s, p)` binds,
+    /// each whether it is a position, when `s` is a string and `p` a
+    /// literal pattern whose captures are known: such a loop walks the
+    /// matches in place. A pattern without captures binds the match.
+    pub fn gmatch_walk(&self, exprs: &[&Expression]) -> Option<Vec<bool>> {
+        let [Expression::FunctionCall(c)] = exprs else {
+            return None;
+        };
+        let suffixes: Vec<&Suffix> = c.suffixes().collect();
+        let b = self.builtin_callee(c.prefix(), &suffixes)?;
+        if b.lib != "string" || b.name != "gmatch" {
+            return None;
+        }
+        let Some(Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
+            arguments,
+            ..
+        }))) = suffixes.last()
+        else {
+            return None;
+        };
+        let args: Vec<&Expression> = arguments.iter().collect();
+        let [subject, Expression::String(pattern)] = args.as_slice() else {
+            return None;
+        };
+        if self.ty_of(subject) != Ty::Str {
+            return None;
+        }
+        let bytes = crate::lower::string_bytes(pattern).ok()?;
+        let kinds = crate::pattern::capture_kinds(&bytes)?;
+        Some(if kinds.is_empty() { vec![false] } else { kinds })
+    }
+
     /// What a call returns. `suffixes` are the callee's suffixes,
     /// ending in the call being typed.
     pub fn call_returns(&self, prefix: &Prefix, suffixes: &[&Suffix]) -> Returns {
@@ -2436,6 +2468,20 @@ impl<'a> Round<'a> {
                 }
                 self.loop_iterator = outer;
                 let names: Vec<VarId> = f.names().iter().map(|n| self.scopes.declared(n)).collect();
+                // A `gmatch` walked in place binds each capture: a string,
+                // or a position for `()`; nil past the last.
+                if let Some(captures) = self.typer().gmatch_walk(&exprs) {
+                    for (i, v) in names.iter().enumerate() {
+                        let ty = match captures.get(i) {
+                            Some(true) => Ty::Int,
+                            Some(false) => Ty::Str,
+                            None => Ty::Nil,
+                        };
+                        self.assign_var(*v, ty);
+                    }
+                    self.block(f.block());
+                    return;
+                }
                 // `ipairs` gives an integer key and each element; a
                 // typed `pairs` any key and each value its shape holds;
                 // anything else, dynamic values.
