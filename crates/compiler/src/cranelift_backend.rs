@@ -935,7 +935,7 @@ impl CraneliftBackend {
         &mut self,
         module: &HirModule,
     ) -> CompilerResult<std::collections::HashSet<HirId>> {
-        use crate::portable_code::CodeAnchor;
+        use crate::portable_code::CodeAnchorRef as CodeAnchor;
         use cranelift_module::{ModuleReloc, ModuleRelocTarget};
         let Some(placing) = self.placing.take() else {
             return Ok(Default::default());
@@ -975,7 +975,7 @@ impl CraneliftBackend {
                 None => {}
             }
         }
-        let placeable: Vec<&crate::portable_code::PortableFunction> =
+        let placeable: Vec<&crate::portable_code::PortableFunctionRef> =
             functions.iter().filter(|f| self.symbols_agree(f)).collect();
         let placing_ids: std::collections::HashSet<HirId> =
             placeable.iter().map(|f| here(f.id)).collect();
@@ -988,7 +988,7 @@ impl CraneliftBackend {
         };
         for f in &placeable {
             let declared = signature_of(self, here(f.id));
-            if declared.as_deref() != Some(f.signature.as_str()) {
+            if declared.as_deref() != Some(f.signature) {
                 return decline(format!(
                     "{} is declared {declared:?} here, {} in the code",
                     named(f.id),
@@ -1014,7 +1014,7 @@ impl CraneliftBackend {
             })
             .collect();
         for raw in &reached {
-            let crate::portable_code::PortableCallee {
+            let crate::portable_code::PortableCalleeRef {
                 id: callee,
                 name: callee_name,
                 signature,
@@ -1025,7 +1025,7 @@ impl CraneliftBackend {
             };
             let callee = &callee;
             let declared = signature_of(self, here(*callee));
-            if declared.as_deref() != Some(signature.as_str()) {
+            if declared.as_deref() != Some(signature) {
                 let caller = placeable
                     .iter()
                     .find(|f| {
@@ -1083,7 +1083,7 @@ impl CraneliftBackend {
             .iter()
             .flat_map(|f| &f.relocs)
             .filter_map(|reloc| match &reloc.anchor {
-                CodeAnchor::Import(name, _) => Some(name.as_str()),
+                CodeAnchor::Import(name, _) => Some(*name),
                 _ => None,
             })
             .collect();
@@ -1121,7 +1121,7 @@ impl CraneliftBackend {
                     }
                     CodeAnchor::Bead(raw) => bead(*raw).map(|b| b as usize),
                     CodeAnchor::Symbol(name) => symbols
-                        .get(name)
+                        .get(*name)
                         .copied()
                         .or_else(|| crate::symbol_address::resolve(name)),
                     _ => None,
@@ -1163,10 +1163,10 @@ impl CraneliftBackend {
                         }
                     }
                     CodeAnchor::Import(name, _) => {
-                        let Some(signature) = imports.get(name.as_str()).copied().flatten() else {
+                        let Some(signature) = imports.get(*name).copied().flatten() else {
                             return decline(format!("{name} has no signature in the code"));
                         };
-                        if name == crate::osr::OSR_REQUEST_PRESERVING_SYMBOL
+                        if *name == crate::osr::OSR_REQUEST_PRESERVING_SYMBOL
                             && preserving_request().is_none()
                         {
                             return decline(format!("{name} does not compile here"));
@@ -1213,7 +1213,7 @@ impl CraneliftBackend {
         for ((f, values), module_relocs) in placeable.iter().zip(bound).zip(relocs) {
             let id = here(f.id);
             let func_id = self.function_map[&id];
-            let mut code = f.code.clone();
+            let mut code = f.code.to_vec();
             for (offset, value) in values {
                 code[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
             }
@@ -8185,15 +8185,12 @@ impl CraneliftBackend {
 
     /// Whether the runtime symbols `function` was compiled against are
     /// registered here as they were there.
-    fn symbols_agree(&self, function: &crate::portable_code::PortableFunction) -> bool {
-        let differs = function
-            .symbols
-            .iter()
-            .find(|(name, found)| match found.as_str() {
-                "present" => !self.runtime_symbol_names.contains(name),
-                "absent" => self.runtime_symbol_names.contains(name),
-                signature => self.symbol_signature_text(name) != signature,
-            });
+    fn symbols_agree(&self, function: &crate::portable_code::PortableFunctionRef) -> bool {
+        let differs = function.symbols.iter().find(|(name, found)| match *found {
+            "present" => !self.runtime_symbol_names.contains(*name),
+            "absent" => self.runtime_symbol_names.contains(*name),
+            signature => self.symbol_signature_text(name) != signature,
+        });
         if let Some((name, found)) = differs
             && std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some()
         {

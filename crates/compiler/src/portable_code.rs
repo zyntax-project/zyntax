@@ -141,6 +141,69 @@ pub struct PortableFunction {
     pub symbols: Vec<(String, String)>,
 }
 
+/// [`CodeAnchor`] read in place: its names borrowed from the image. The
+/// variants are [`CodeAnchor`]'s, in its order, which the encoding names
+/// them by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+pub enum CodeAnchorRef<'a> {
+    Cell(u32),
+    EntryCounter(u32),
+    HelperSlot(u32, u64),
+    Bead(u32),
+    Symbol(&'a str),
+    Import(&'a str, Option<u32>),
+    Function(u32),
+    FunctionOffset(u32, u32),
+    Global(u32),
+    LibCall(&'a str),
+}
+
+impl CodeAnchorRef<'_> {
+    /// See [`CodeAnchor::is_value`].
+    pub fn is_value(&self) -> bool {
+        matches!(
+            self,
+            Self::Cell(_)
+                | Self::EntryCounter(_)
+                | Self::HelperSlot(..)
+                | Self::Bead(_)
+                | Self::Symbol(_)
+        )
+    }
+}
+
+/// [`PortableReloc`] read in place.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PortableRelocRef<'a> {
+    pub offset: u32,
+    pub kind: RelocKind,
+    #[serde(borrow)]
+    pub anchor: CodeAnchorRef<'a>,
+    pub addend: i64,
+}
+
+/// [`PortableFunction`] read in place: its code and names borrowed from
+/// the image, so placing it allocates only its relocation list.
+#[derive(Debug, Deserialize)]
+pub struct PortableFunctionRef<'a> {
+    pub id: u32,
+    pub signature: &'a str,
+    pub alignment: u64,
+    pub code: &'a [u8],
+    #[serde(borrow)]
+    pub relocs: Vec<PortableRelocRef<'a>>,
+    #[serde(borrow)]
+    pub symbols: Vec<(&'a str, &'a str)>,
+}
+
+/// [`PortableCallee`] read in place.
+#[derive(Debug, Deserialize)]
+pub struct PortableCalleeRef<'a> {
+    pub id: u32,
+    pub name: &'a str,
+    pub signature: &'a str,
+}
+
 /// What the code was compiled under, which the placing process must
 /// match to use it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,12 +385,12 @@ impl PortableImage {
     }
 
     /// The code of function `id`, when the image holds it.
-    pub fn function(&self, id: u32) -> Option<Result<PortableFunction, String>> {
+    pub fn function(&self, id: u32) -> Option<Result<PortableFunctionRef<'_>, String>> {
         self.decode(&self.functions, id)
     }
 
     /// The callee `id`, when the code calls it or takes its address.
-    pub fn callee(&self, id: u32) -> Option<Result<PortableCallee, String>> {
+    pub fn callee(&self, id: u32) -> Option<Result<PortableCalleeRef<'_>, String>> {
         self.decode(&self.callees, id)
     }
 
@@ -343,8 +406,8 @@ impl PortableImage {
         [word(0), word(1), word(2)]
     }
 
-    fn decode<T: serde::de::DeserializeOwned>(
-        &self,
+    fn decode<'a, T: serde::Deserialize<'a>>(
+        &'a self,
         table: &std::ops::Range<usize>,
         id: u32,
     ) -> Option<Result<T, String>> {
@@ -541,4 +604,105 @@ pub fn host_triple() -> String {
     cranelift_native::builder()
         .map(|b| b.triple().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function(id: u32) -> PortableFunction {
+        let anchors = [
+            CodeAnchor::Cell(1),
+            CodeAnchor::EntryCounter(2),
+            CodeAnchor::HelperSlot(3, 99),
+            CodeAnchor::Bead(4),
+            CodeAnchor::Symbol("sym".into()),
+            CodeAnchor::Import("imp".into(), Some(5)),
+            CodeAnchor::Import("bare".into(), None),
+            CodeAnchor::Function(6),
+            CodeAnchor::FunctionOffset(7, 8),
+            CodeAnchor::Global(9),
+            CodeAnchor::LibCall("FloorF64".into()),
+        ];
+        PortableFunction {
+            id,
+            signature: "(i64) -> i64 system_v".into(),
+            alignment: 16,
+            code: (0..40).collect(),
+            relocs: anchors
+                .into_iter()
+                .enumerate()
+                .map(|(i, anchor)| PortableReloc {
+                    offset: i as u32 * 4,
+                    kind: RelocKind::Abs8,
+                    anchor,
+                    addend: -(i as i64),
+                })
+                .collect(),
+            symbols: vec![("zl_x".into(), "present".into())],
+        }
+    }
+
+    #[test]
+    fn functions_read_in_place_as_they_were_written() {
+        let code = PortableCode {
+            target: PortableTarget {
+                triple: "t".into(),
+                platform: "p".into(),
+                compiler: "c".into(),
+                probes: true,
+            },
+            functions: vec![function(3), function(1)],
+            callees: vec![PortableCallee {
+                id: 6,
+                name: "callee".into(),
+                signature: "() system_v".into(),
+            }],
+            imports: vec![PortableImport {
+                name: "imp".into(),
+                signature: PortableSignature {
+                    params: vec![],
+                    returns: vec![],
+                    call_conv: "system_v".into(),
+                },
+            }],
+        };
+        let image = PortableImage::new(ImageBytes::Shared(code.encode().unwrap().into())).unwrap();
+        let written = function(1);
+        let read = image.function(1).unwrap().unwrap();
+        assert_eq!(read.id, written.id);
+        assert_eq!(read.signature, written.signature);
+        assert_eq!(read.alignment, written.alignment);
+        assert_eq!(read.code, &written.code[..]);
+        assert_eq!(read.symbols, vec![("zl_x", "present")]);
+        assert_eq!(read.relocs.len(), written.relocs.len());
+        for (r, w) in read.relocs.iter().zip(&written.relocs) {
+            assert_eq!((r.offset, r.kind, r.addend), (w.offset, w.kind, w.addend));
+            let same = match (&r.anchor, &w.anchor) {
+                (CodeAnchorRef::Cell(a), CodeAnchor::Cell(b))
+                | (CodeAnchorRef::EntryCounter(a), CodeAnchor::EntryCounter(b))
+                | (CodeAnchorRef::Bead(a), CodeAnchor::Bead(b))
+                | (CodeAnchorRef::Function(a), CodeAnchor::Function(b))
+                | (CodeAnchorRef::Global(a), CodeAnchor::Global(b)) => a == b,
+                (CodeAnchorRef::HelperSlot(a, s), CodeAnchor::HelperSlot(b, t)) => a == b && s == t,
+                (CodeAnchorRef::FunctionOffset(a, s), CodeAnchor::FunctionOffset(b, t)) => {
+                    a == b && s == t
+                }
+                (CodeAnchorRef::Symbol(a), CodeAnchor::Symbol(b))
+                | (CodeAnchorRef::LibCall(a), CodeAnchor::LibCall(b)) => *a == b,
+                (CodeAnchorRef::Import(a, s), CodeAnchor::Import(b, t)) => *a == b && s == t,
+                _ => false,
+            };
+            assert!(same, "{:?} read as {:?}", w.anchor, r.anchor);
+            assert_eq!(r.anchor.is_value(), w.anchor.is_value());
+        }
+        let callee = image.callee(6).unwrap().unwrap();
+        assert_eq!(
+            (callee.id, callee.name, callee.signature),
+            (6, "callee", "() system_v")
+        );
+        assert!(image.import("imp").unwrap().is_ok());
+        assert!(image.import("missing").is_none());
+        assert!(image.function(2).is_none());
+    }
 }
