@@ -817,6 +817,10 @@ fn wait_for_baseline_quiet() {
 
 /// The baseline quiet time an optimizing compile waits for.
 const OPTIMIZE_QUIET_MS: u64 = 20;
+
+/// The stack a first-call compile runs on: the calling thread's, when it
+/// has this much room left, else a thread started with it.
+const FIRST_CALL_STACK: usize = 16 << 20;
 /// The longest an optimizing compile waits for the baseline to go quiet.
 const OPTIMIZE_WAIT_MAX: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -3870,6 +3874,17 @@ impl TieredBackend {
                 }
                 return publish(0, false);
             };
+            // A function placed from its snapshot's machine code after the
+            // compile was asked for has its code: a callee asked for ahead
+            // of the module's placement, say.
+            if replacing.is_none()
+                && let Some(entry) = bound.bead().compiled()
+            {
+                if trace {
+                    eprintln!("[lazy] bead {bead_id} has code already");
+                }
+                return publish(entry as usize, false);
+            }
             let lazy_started = web_time::Instant::now();
             // Finished library bodies need only their finishing passes;
             // the same decoded body feeds scheduling and compilation.
@@ -4204,10 +4219,15 @@ impl TieredBackend {
                 return *entry as *const u8;
             }
             let quick = !quick_off && !ON_WARM_UP.with(|on| on.get());
+            // A call on a thread's own stack with the room a compile needs
+            // compiles there, without a thread started for it.
+            if crate::collector::stack_room().is_some_and(|room| room >= FIRST_CALL_STACK) {
+                return compile_lazy_function(bead_id, quick);
+            }
             std::thread::scope(|scope| {
                 std::thread::Builder::new()
                     .name("zyntax-first-call-compile".into())
-                    .stack_size(16 << 20)
+                    .stack_size(FIRST_CALL_STACK)
                     .spawn_scoped(scope, || {
                         let _heap = crate::host_heap::ThreadGuard::enter();
                         compile_lazy_function(bead_id, quick) as usize

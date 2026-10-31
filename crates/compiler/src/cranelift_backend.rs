@@ -2214,6 +2214,7 @@ impl CraneliftBackend {
         if let Some(&p) = self.interp_thunks.get(sig) {
             return Ok(p as *const u8);
         }
+        let started = web_time::Instant::now();
         let ptr_ty = self.module.target_config().pointer_type();
         let mut callee = self.module.make_signature();
         if sig.destination {
@@ -2294,6 +2295,14 @@ impl CraneliftBackend {
             .map_err(|e| CompilerError::Backend(format!("Failed to finalize definitions: {e}")))?;
         let p = self.module.get_finalized_function(thunk_id);
         self.interp_thunks.insert(sig.clone(), p as usize);
+        // `ZYNTAX_TRACE_LAZY=1` also times each call shape's thunk.
+        if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+            eprintln!(
+                "[lazy] interpreter thunk {} compiled in {:.2} ms",
+                self.interp_thunks.len(),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(p)
     }
 
@@ -11208,12 +11217,18 @@ impl CraneliftBackend {
         // finalization compiled goes into a call cell: republishing every
         // function would hand a cell a higher tier had taken over back
         // to this tier's code.
-        let fresh: std::collections::HashSet<HirId> = self.unpublished.drain(..).collect();
-        for (hir_id, compiled_func) in &self.compiled_functions {
+        // Code finalized before does not move: only what this
+        // finalization defined is recorded.
+        let trace_skip = std::env::var_os("ZYNTAX_TRACE_CRANELIFT_SKIP").is_some();
+        let fresh: Vec<HirId> = self.unpublished.drain(..).collect();
+        for hir_id in &fresh {
+            let Some(compiled_func) = self.compiled_functions.get(hir_id) else {
+                continue;
+            };
             let code_ptr = self
                 .module
                 .get_finalized_function(compiled_func.function_id);
-            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+            if trace_skip {
                 eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
             }
             self.address_owners.insert(code_ptr as usize, *hir_id);
@@ -11222,9 +11237,6 @@ impl CraneliftBackend {
                 .write()
                 .unwrap()
                 .insert(*hir_id, code_ptr);
-            if !fresh.contains(hir_id) {
-                continue;
-            }
             if self.defer_cell_publish {
                 self.deferred_cells.push((*hir_id, code_ptr as usize));
             } else {
