@@ -16,6 +16,7 @@ members = [
     "crates/zyntax_lua",
     "crates/zyntax_lua/capi",
     "crates/zyntax_builtins",
+    "crates/zyntax_plugin_tables",
     "crates/passes/normalization",
     "crates/passes/algebraic_effects",
     "crates/passes/krio_adapter",

@@ -1,0 +1,21 @@
+[package]
+name = "zyntax_plugin_tables"
+version = "0.1.0"
+# The plugins' sources compile in this crate, under its edition.
+edition = "2021"
+description = "Symbol tables of the plugins the language frontends link, for their build scripts"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+zrtl = { path = "../../sdk/zrtl" }
+getrandom = "0.2"
+
+[features]
+default = ["linked-into-host"]
+# Read by the plugins' sources: leaves out the unmangled exports every
+# plugin defines under the same names.
+linked-into-host = []
+
+[lints]
+workspace = true

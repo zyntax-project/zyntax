@@ -84,8 +84,16 @@ fn build() -> Result<(), BuildError> {
         true,
         Some(policy::PENDING),
     )?;
+    // The library as machine code too, so a run starts with it compiled:
+    // against the plugins whose signatures shape calls into them.
     SnapshotBuilder::new("python")
         .module_lowered(policy::LIBRARY_MODULE, program, &hir)?
+        .runtime_plugins([
+            zyntax_plugin_tables::zrtl_io::static_plugin(),
+            zyntax_plugin_tables::zrtl_string::static_plugin(),
+            zyntax_plugin_tables::zrtl_math::static_plugin(),
+        ])
+        .portable_code_for_build_target()?
         .build_in(&out)?;
 
     // Which library functions can raise, for the frontend's guards.

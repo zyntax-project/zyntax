@@ -246,6 +246,7 @@ fn fmt_constant(c: &HirConstant) -> String {
                 vt.methods.len()
             )
         }
+        HirConstant::SymbolAddress { name, offset } => format!("&{}+{}", resolve(name), offset),
     }
 }
 

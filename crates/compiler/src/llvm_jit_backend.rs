@@ -464,11 +464,27 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             }
             functions.push((func, addr));
         }
-        let globals: Vec<_> = backend
+        let mut globals: Vec<_> = backend
             .shared_global_bindings()
             .iter()
             .filter_map(|(name, addr)| backend.module().get_global(name).map(|g| (g, *addr)))
             .collect();
+        // A declared global no shared binding covers is a runtime data
+        // symbol whose address the code takes.
+        for global in backend.module().get_globals() {
+            if global.get_initializer().is_some() || globals.iter().any(|(g, _)| *g == global) {
+                continue;
+            }
+            let name = global.get_name().to_string_lossy().into_owned();
+            if let Some(addr) = self
+                .runtime_symbols
+                .get(&name)
+                .copied()
+                .or_else(|| crate::symbol_address::resolve(&name))
+            {
+                globals.push((global, addr));
+            }
+        }
 
         self.install_serial = self
             .install_serial

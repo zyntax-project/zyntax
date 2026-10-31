@@ -68,11 +68,18 @@ default = ["native"]
 # `async_support.rs` captures-lift bug is resolved — all 14 formerly-
 # ignored tests pass through krio).
 native = [
+    "portable-code",
     "zyntax_compiler/cranelift-backend",
     "zyntax_compiler/dynamic-plugins",
     "dynamic-plugins",
     "krio-async-backend",
 ]
+
+# `portable-code` compiles a snapshot's lowered modules to machine code
+# (`SnapshotBuilder::portable_code`) and gives a decoded module the code
+# its snapshot carries. A build script that writes a snapshot needs this
+# and nothing else of `native`.
+portable-code = ["zyntax_compiler/cranelift-backend"]
 
 # `parse-only` builds zyntax_embed without any native backend or
 # plugin loading — parser + TypedAST + transformation passes only.

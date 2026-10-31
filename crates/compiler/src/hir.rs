@@ -2189,6 +2189,13 @@ pub enum HirConstant {
     String(InternedString),
     /// Virtual method table for trait dispatch
     VTable(Box<HirVTable>),
+    /// The address of the runtime symbol `name` plus `offset` bytes, as a
+    /// pointer-width integer. Each backend binds it where it binds calls
+    /// to runtime symbols, so code holding it can run in another process.
+    SymbolAddress {
+        name: InternedString,
+        offset: i64,
+    },
 }
 
 impl Eq for HirConstant {}
@@ -2219,6 +2226,10 @@ impl std::hash::Hash for HirConstant {
             Struct(vals) => vals.hash(state),
             String(s) => s.hash(state),
             VTable(vtable) => vtable.id.hash(state), // Hash by ID
+            SymbolAddress { name, offset } => {
+                name.hash(state);
+                offset.hash(state);
+            }
         }
     }
 }

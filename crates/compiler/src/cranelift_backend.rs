@@ -423,6 +423,14 @@ pub struct CraneliftBackend {
     /// The target the module compiles for, held so a translated function
     /// can be compiled without the module in hand.
     isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
+    /// Set for a backend that writes its code out to run in another
+    /// process (see [`crate::portable_code`]) instead of installing it.
+    portable: Option<Box<PortableCapture>>,
+    /// Portable code the next module compile places; see
+    /// [`Self::set_portable_code`].
+    placing: Option<Placing>,
+    /// Functions placed from portable code since [`Self::take_placed`].
+    placed: Vec<HirId>,
     /// Current function builder
     builder_context: FunctionBuilderContext,
     /// Codegen context
@@ -786,6 +794,433 @@ impl CraneliftBackend {
         Self::new_internal(isa_for_triple(triple)?, None)
     }
 
+    /// A backend that compiles for `triple` and writes its code out to run
+    /// in another process instead of installing it; see
+    /// [`crate::portable_code`]. Every call goes through its callee's cell.
+    /// The functions it compiles came from a snapshot decoded with its ids
+    /// shifted by `id_base`.
+    pub fn portable_for_target(triple: &str, id_base: u32) -> CompilerResult<Self> {
+        let mut backend = Self::for_target(triple)?;
+        backend.portable = Some(Box::new(PortableCapture {
+            id_base,
+            ..Default::default()
+        }));
+        backend.reloadable_calls = true;
+        Ok(backend)
+    }
+
+    /// Have the next [`Self::compile_module`] define the functions portable
+    /// code covers from it instead of compiling them: those in `eligible`,
+    /// whose bodies are the snapshot's the code was compiled from, from the
+    /// variant compiled as this backend compiles. The snapshot was decoded
+    /// here with its ids shifted by `id_base`.
+    pub fn set_portable_code(
+        &mut self,
+        variants: Vec<crate::portable_code::PortableImage>,
+        id_base: u32,
+        eligible: std::collections::HashSet<HirId>,
+    ) {
+        let platform = self.platform();
+        let targets: Vec<Option<crate::portable_code::PortableTarget>> =
+            variants.iter().map(|code| code.target().ok()).collect();
+        let chosen = targets.iter().position(|target| {
+            target.as_ref().is_some_and(|target| {
+                target.platform == platform
+                    && target.compiler == crate::BUILD_ID
+                    && target.probes == self.emit_osr_probes
+            })
+        });
+        let Some(chosen) = chosen else {
+            if std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some() {
+                let offered: Vec<String> = targets
+                    .iter()
+                    .flatten()
+                    .map(|t| format!("{} probes {}", t.triple, t.probes))
+                    .collect();
+                eprintln!(
+                    "[portable] placing none: no variant for {platform} probes {} among {offered:?}",
+                    self.emit_osr_probes
+                );
+            }
+            return;
+        };
+        self.placing = Some(Placing {
+            code: variants.into_iter().nth(chosen).expect("a chosen variant"),
+            id_base,
+            eligible,
+        });
+    }
+
+    /// The architecture and operating system the backend compiles for,
+    /// as [`crate::portable_code::PortableTarget::platform`] records them.
+    pub fn platform(&self) -> String {
+        let triple = self.isa.triple();
+        format!("{}-{}", triple.architecture, triple.operating_system)
+    }
+
+    /// The functions placed from portable code since the last call.
+    pub fn take_placed(&mut self) -> Vec<HirId> {
+        std::mem::take(&mut self.placed)
+    }
+
+    /// Define the functions [`Self::set_portable_code`] allows from their
+    /// portable code. All or none: each function calls others through
+    /// their cells with the signatures it was compiled against, so a
+    /// declaration here that differs, or an anchor this process cannot
+    /// bind, places nothing. `ZYNTAX_TRACE_PORTABLE=1` says what was
+    /// placed or why nothing was; safe to run with.
+    fn place_portable_functions(
+        &mut self,
+        module: &HirModule,
+    ) -> CompilerResult<std::collections::HashSet<HirId>> {
+        use crate::portable_code::CodeAnchor;
+        use cranelift_module::{ModuleReloc, ModuleRelocTarget};
+        let Some(placing) = self.placing.take() else {
+            return Ok(Default::default());
+        };
+        let trace = std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some();
+        let here = |raw: u32| HirId::from_raw(raw.wrapping_add(placing.id_base));
+        let signature_of = |be: &Self, id: HirId| {
+            be.function_map.get(&id).map(|f| {
+                be.module
+                    .declarations()
+                    .get_function_decl(*f)
+                    .signature
+                    .to_string()
+            })
+        };
+        let decline = |why: String| {
+            if trace {
+                eprintln!("[portable] placing none: {why}");
+            }
+            Ok(Default::default())
+        };
+        // Only the functions placed here are decoded. A function defined
+        // already, as code or as its stub, keeps that definition.
+        let mut functions = Vec::new();
+        for raw in placing.code.function_ids() {
+            let id = here(raw);
+            if !placing.eligible.contains(&id)
+                || !module.functions.get(&id).is_some_and(|m| !m.is_external)
+                || self.compiled_functions.contains_key(&id)
+                || self.stubbed.contains(&id)
+            {
+                continue;
+            }
+            match placing.code.function(raw) {
+                Some(Ok(f)) => functions.push(f),
+                Some(Err(e)) => return decline(format!("function {raw} does not decode: {e}")),
+                None => {}
+            }
+        }
+        let placeable: Vec<&crate::portable_code::PortableFunction> =
+            functions.iter().filter(|f| self.symbols_agree(f)).collect();
+        let placing_ids: std::collections::HashSet<HirId> =
+            placeable.iter().map(|f| here(f.id)).collect();
+        let named = |raw: u32| {
+            module
+                .functions
+                .get(&here(raw))
+                .and_then(|f| f.name.resolve_global())
+                .unwrap_or_else(|| format!("#{raw}"))
+        };
+        for f in &placeable {
+            let declared = signature_of(self, here(f.id));
+            if declared.as_deref() != Some(f.signature.as_str()) {
+                return decline(format!(
+                    "{} is declared {declared:?} here, {} in the code",
+                    named(f.id),
+                    f.signature
+                ));
+            }
+        }
+        // A declaration the program defines here is a hook: the call
+        // reaches the program's function.
+        let defined_here = |raw: u32| {
+            module
+                .functions
+                .get(&here(raw))
+                .is_some_and(|f| !f.is_external)
+        };
+        let reached: std::collections::BTreeSet<u32> = placeable
+            .iter()
+            .flat_map(|f| &f.relocs)
+            .filter_map(|reloc| match reloc.anchor {
+                CodeAnchor::Cell(callee) | CodeAnchor::Function(callee) => Some(callee),
+                CodeAnchor::Import(_, Some(callee)) if defined_here(callee) => Some(callee),
+                _ => None,
+            })
+            .collect();
+        for raw in &reached {
+            let crate::portable_code::PortableCallee {
+                id: callee,
+                name: callee_name,
+                signature,
+            } = match placing.code.callee(*raw) {
+                Some(Ok(callee)) => callee,
+                Some(Err(e)) => return decline(format!("callee {raw} does not decode: {e}")),
+                None => continue,
+            };
+            let callee = &callee;
+            let declared = signature_of(self, here(*callee));
+            if declared.as_deref() != Some(signature.as_str()) {
+                let caller = placeable
+                    .iter()
+                    .find(|f| {
+                        f.relocs.iter().any(|r| {
+                            matches!(r.anchor, CodeAnchor::Cell(c) | CodeAnchor::Function(c) | CodeAnchor::Import(_, Some(c)) if c == *callee)
+                        })
+                    })
+                    .map_or_else(String::new, |f| named(f.id));
+                return decline(format!(
+                    "callee {callee_name} of {caller} is declared {declared:?} here, \
+                     {signature} in the code"
+                ));
+            }
+        }
+        // A lazy function this code reaches and that is not placed with it
+        // has its stub in its cell before the code runs, as it would for
+        // code compiled here; a hook is called at its stub.
+        let mut hooks: std::collections::HashSet<HirId> = Default::default();
+        for reloc in placeable.iter().flat_map(|f| &f.relocs) {
+            match &reloc.anchor {
+                CodeAnchor::Cell(raw) => {
+                    let id = here(*raw);
+                    if self.lazy_functions.contains(&id) && !placing_ids.contains(&id) {
+                        self.wanted_stubs.push(id);
+                    }
+                }
+                CodeAnchor::Import(_, Some(raw)) if defined_here(*raw) => {
+                    let id = here(*raw);
+                    if self.lazy_functions.contains(&id)
+                        && !placing_ids.contains(&id)
+                        && !self.stubbed.contains(&id)
+                    {
+                        self.compile_lazy_stub(id)?;
+                    }
+                    hooks.insert(id);
+                }
+                _ => {}
+            }
+        }
+        let hook_targets: HashMap<HirId, FuncId> = hooks
+            .into_iter()
+            .filter_map(|id| {
+                let stub = self
+                    .lazy_stubs
+                    .iter()
+                    .find(|(stubbed, _)| *stubbed == id)
+                    .map(|(_, stub)| *stub);
+                Some((id, stub.or_else(|| self.function_map.get(&id).copied())?))
+            })
+            .collect();
+        // The signature each runtime function is called with, read back
+        // for the imports placed code calls; `None` for one this compiler
+        // cannot read.
+        let imported = match placing.code.imports() {
+            Ok(imported) => imported,
+            Err(e) => return decline(format!("the imports do not decode: {e}")),
+        };
+        let called: HashSet<&str> = placeable
+            .iter()
+            .flat_map(|f| &f.relocs)
+            .filter_map(|reloc| match &reloc.anchor {
+                CodeAnchor::Import(name, _) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let import_signatures: Vec<(&str, Option<cranelift_codegen::ir::Signature>)> = imported
+            .iter()
+            .filter(|i| called.contains(i.name.as_str()))
+            .map(|i| (i.name.as_str(), i.signature.signature()))
+            .collect();
+        let imports: HashMap<&str, Option<&cranelift_codegen::ir::Signature>> = import_signatures
+            .iter()
+            .map(|(name, signature)| (*name, signature.as_ref()))
+            .collect();
+        // Every anchor's binding, before anything is defined.
+        let symbols = self.symbol_table.read().unwrap_or_else(|e| e.into_inner());
+        let mut bound: Vec<Vec<(usize, u64)>> = Vec::with_capacity(placeable.len());
+        let mut relocs: Vec<Vec<ModuleReloc>> = Vec::with_capacity(placeable.len());
+        for f in &placeable {
+            let mut values = Vec::new();
+            let mut module_relocs = Vec::new();
+            for reloc in &f.relocs {
+                let bead = |raw: u32| self.bead_ids.get(&here(raw)).copied();
+                let value: Option<usize> = match &reloc.anchor {
+                    CodeAnchor::Cell(raw) => {
+                        Some(crate::reload::call_cell_addr(self.reload_key, here(*raw)))
+                    }
+                    CodeAnchor::EntryCounter(raw) => {
+                        bead(*raw).map(|b| crate::osr::entry_counter_addr(b) as usize)
+                    }
+                    CodeAnchor::HelperSlot(raw, site) => {
+                        bead(*raw).map(|b| crate::osr::helper_slot_addr(b, *site) as usize)
+                    }
+                    CodeAnchor::Bead(raw) => bead(*raw).map(|b| b as usize),
+                    CodeAnchor::Symbol(name) => symbols
+                        .get(name)
+                        .copied()
+                        .or_else(|| crate::symbol_address::resolve(name)),
+                    _ => None,
+                };
+                if reloc.anchor.is_value() {
+                    let Some(value) = value else {
+                        return decline(format!("{:?} has no binding here", reloc.anchor));
+                    };
+                    values.push((
+                        reloc.offset as usize,
+                        (value as u64).wrapping_add(reloc.addend as u64),
+                    ));
+                    continue;
+                }
+                let name = match &reloc.anchor {
+                    CodeAnchor::Function(raw) | CodeAnchor::FunctionOffset(raw, _)
+                        if !placing_ids.contains(&here(*raw)) =>
+                    {
+                        return decline(format!("function {raw} is not placed with its callers"));
+                    }
+                    CodeAnchor::Function(raw) => {
+                        ModuleRelocTarget::user(0, self.function_map[&here(*raw)].as_u32())
+                    }
+                    CodeAnchor::FunctionOffset(raw, offset) => {
+                        ModuleRelocTarget::FunctionOffset(self.function_map[&here(*raw)], *offset)
+                    }
+                    CodeAnchor::Global(raw) => match self.global_map.get(&here(*raw)) {
+                        Some(data) => ModuleRelocTarget::user(1, data.as_u32()),
+                        None => return decline(format!("global {raw} is not declared here")),
+                    },
+                    CodeAnchor::LibCall(call) => match call.parse() {
+                        Ok(call) => ModuleRelocTarget::LibCall(call),
+                        Err(()) => return decline(format!("no libcall {call}")),
+                    },
+                    CodeAnchor::Import(name, Some(raw)) if defined_here(*raw) => {
+                        match hook_targets.get(&here(*raw)) {
+                            Some(func) => ModuleRelocTarget::user(0, func.as_u32()),
+                            None => return decline(format!("hook {name} has no code to call")),
+                        }
+                    }
+                    CodeAnchor::Import(name, _) => {
+                        let Some(signature) = imports.get(name.as_str()).copied().flatten() else {
+                            return decline(format!("{name} has no signature in the code"));
+                        };
+                        let func = match self.module.declarations().get_name(name) {
+                            Some(cranelift_module::FuncOrDataId::Func(func)) => {
+                                let declared =
+                                    &self.module.declarations().get_function_decl(func).signature;
+                                if *declared != *signature {
+                                    return decline(format!(
+                                        "{name} is declared {declared} here, {signature} in the code"
+                                    ));
+                                }
+                                func
+                            }
+                            Some(cranelift_module::FuncOrDataId::Data(_)) => {
+                                return decline(format!("{name} is data here"));
+                            }
+                            None => {
+                                match self
+                                    .module
+                                    .declare_function(name, Linkage::Import, signature)
+                                {
+                                    Ok(func) => func,
+                                    Err(e) => return decline(format!("{name}: {e}")),
+                                }
+                            }
+                        };
+                        ModuleRelocTarget::user(0, func.as_u32())
+                    }
+                    other => return decline(format!("{other:?} is no placed relocation")),
+                };
+                module_relocs.push(ModuleReloc {
+                    offset: reloc.offset,
+                    kind: reloc.kind.reloc(),
+                    name,
+                    addend: reloc.addend,
+                });
+            }
+            bound.push(values);
+            relocs.push(module_relocs);
+        }
+        drop(symbols);
+        for ((f, values), module_relocs) in placeable.iter().zip(bound).zip(relocs) {
+            let id = here(f.id);
+            let func_id = self.function_map[&id];
+            let mut code = f.code.clone();
+            for (offset, value) in values {
+                code[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            self.module
+                .define_function_bytes(func_id, f.alignment, &code, &module_relocs)
+                .map_err(|e| CompilerError::Backend(format!("placing portable code: {e}")))?;
+            let signature = self
+                .module
+                .declarations()
+                .get_function_decl(func_id)
+                .signature
+                .clone();
+            self.compiled_functions.insert(
+                id,
+                CompiledFunction {
+                    function_id: func_id,
+                    version: 1,
+                    code_ptr: std::ptr::null(),
+                    size: code.len(),
+                    signature,
+                },
+            );
+            self.unpublished.push(id);
+            self.lazy_functions.remove(&id);
+            self.placed.push(id);
+        }
+        if trace {
+            eprintln!("[portable] placed {} functions", placing_ids.len());
+        }
+        // `ZYNTAX_TRACE_PORTABLE=functions` also prints each placed
+        // function's size and a digest of its code and relocations.
+        if std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some_and(|v| v == "functions") {
+            for f in &placeable {
+                use std::hash::{Hash, Hasher};
+                let mut digest = std::collections::hash_map::DefaultHasher::new();
+                f.code.hash(&mut digest);
+                format!("{:?}", f.relocs).hash(&mut digest);
+                eprintln!(
+                    "[portable] {:?} {} {} bytes {} relocs {:016x}",
+                    here(f.id),
+                    module
+                        .functions
+                        .get(&here(f.id))
+                        .and_then(|m| m.name.resolve_global())
+                        .unwrap_or_default(),
+                    f.code.len(),
+                    f.relocs.len(),
+                    digest.finish()
+                );
+            }
+        }
+        Ok(placing_ids)
+    }
+
+    /// The code a backend from [`Self::portable_for_target`] has written,
+    /// for the target it names.
+    pub fn take_portable_code(
+        &mut self,
+        target: crate::portable_code::PortableTarget,
+    ) -> Option<crate::portable_code::PortableCode> {
+        let portable = self.portable.as_deref_mut()?;
+        Some(crate::portable_code::PortableCode {
+            target,
+            functions: std::mem::take(&mut portable.functions),
+            callees: std::mem::take(&mut portable.callees)
+                .into_values()
+                .collect(),
+            imports: std::mem::take(&mut portable.imports)
+                .into_iter()
+                .map(|(name, signature)| crate::portable_code::PortableImport { name, signature })
+                .collect(),
+        })
+    }
+
     fn new_internal(
         isa: Arc<dyn cranelift_codegen::isa::TargetIsa>,
         additional_symbols: Option<&[(&str, *const u8)]>,
@@ -827,6 +1262,9 @@ impl CraneliftBackend {
             module,
             jit_reservation,
             isa: isa_shared,
+            portable: None,
+            placing: None,
+            placed: Vec::new(),
             builder_context: FunctionBuilderContext::new(),
             codegen_context: codegen::Context::new(),
             capture_ir: false,
@@ -1106,7 +1544,11 @@ impl CraneliftBackend {
         }
 
         // Pass 2: Compile all function bodies
+        let placed = self.place_portable_functions(module)?;
         for (id, function) in &module.functions {
+            if placed.contains(id) {
+                continue;
+            }
             if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
                 eprintln!(
                     "[pass2] {:?} {} external={}",
@@ -1156,12 +1598,20 @@ impl CraneliftBackend {
                             eprintln!("[CRANELIFT-SKIP] '{name}': {e:?}");
                         }
                     }
-                    // Remove from function_map to prevent later lookup failures
-                    self.function_map.remove(id);
+                    // Remove from function_map to prevent later lookup failures.
+                    // Portable code keeps the declaration: callers reach the
+                    // function through its cell, compiled where it is placed.
+                    if self.portable.is_none() {
+                        self.function_map.remove(id);
+                    }
                 }
             }
         }
 
+        // Portable code is written out, never finalized here.
+        if self.portable.is_some() {
+            return Ok(());
+        }
         // A lazy function whose address a table or a vtable holds is
         // referenced by data the finalisation resolves against its own
         // symbol, so that symbol is defined as the stub now; the rest
@@ -2315,6 +2765,9 @@ impl CraneliftBackend {
         function: &HirFunction,
         hir_module: &HirModule,
     ) -> CompilerResult<Translated> {
+        if let Some(portable) = self.portable.as_deref_mut() {
+            portable.consulted.clear();
+        }
         // Address-taking sites use this to spot self-references, which
         // pin to this generation instead of the reload cell. A resume
         // point is a copy of the function entered mid-loop, not its
@@ -2949,7 +3402,11 @@ impl CraneliftBackend {
                 emit_osr_request_after_calls(
                     &mut builder,
                     &mut self.module,
-                    osr_bead_id,
+                    self.portable.as_deref_mut(),
+                    ProbeOwner {
+                        function: id,
+                        bead: osr_bead_id,
+                    },
                     pointer_type,
                 );
             }
@@ -3072,6 +3529,42 @@ impl CraneliftBackend {
                         HirConstant::Null(_) => {
                             let ptr = self.module.target_config().pointer_type();
                             builder.ins().iconst(ptr, 0)
+                        }
+                        HirConstant::SymbolAddress { name, offset } => {
+                            let name = name.resolve_global().unwrap_or_default();
+                            let ptr = self.module.target_config().pointer_type();
+                            // Portable code binds the symbol where it is
+                            // placed; code run here binds it now.
+                            let base = if self.portable.is_some() {
+                                0
+                            } else {
+                                self.symbol_table
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&name)
+                                    .copied()
+                                    .or_else(|| crate::symbol_address::resolve(&name))
+                                    .ok_or_else(|| {
+                                        CompilerError::CodeGen(format!(
+                                            "code takes the address of the runtime symbol \
+                                             {name}, which no table registers"
+                                        ))
+                                    })?
+                            };
+                            let portable = self.portable.is_some();
+                            let symbol = emit_anchor(
+                                &mut builder,
+                                &mut self.module,
+                                self.portable.as_deref_mut(),
+                                ptr,
+                                || Anchor::Symbol(name),
+                                || base.wrapping_add(*offset as usize),
+                            );
+                            if portable && *offset != 0 {
+                                builder.ins().iadd_imm(symbol, *offset)
+                            } else {
+                                symbol
+                            }
                         }
                         _ => continue, // Complex constants not yet supported
                     };
@@ -3327,7 +3820,11 @@ impl CraneliftBackend {
                         emit_osr_request_after_backedges(
                             &mut builder,
                             &mut self.module,
-                            osr_bead_id,
+                            self.portable.as_deref_mut(),
+                            ProbeOwner {
+                                function: id,
+                                bead: osr_bead_id,
+                            },
                             site_key,
                             *counter,
                         );
@@ -3351,7 +3848,11 @@ impl CraneliftBackend {
                     emit_osr_back_edge_probe(
                         &mut builder,
                         &mut self.module,
-                        osr_bead_id,
+                        self.portable.as_deref_mut(),
+                        ProbeOwner {
+                            function: id,
+                            bead: osr_bead_id,
+                        },
                         site_key,
                         &frame,
                         &live_in_clir,
@@ -4241,11 +4742,41 @@ impl CraneliftBackend {
                                                                 .iter()
                                                                 .find(|(n, _)| n == &display_symbol)
                                                             {
-                                                                builder.ins().iconst(
-                                                                    types::I64,
-                                                                    *func_ptr as i64,
-                                                                )
+                                                                {
+                                                                    if let Some(p) =
+                                                                        self.portable.as_deref_mut()
+                                                                    {
+                                                                        p.consulted.push((
+                                                                            display_symbol.clone(),
+                                                                            "present".into(),
+                                                                        ));
+                                                                    }
+                                                                    let func_ptr =
+                                                                        *func_ptr as usize;
+                                                                    emit_anchor(
+                                                                        &mut builder,
+                                                                        &mut self.module,
+                                                                        self.portable
+                                                                            .as_deref_mut(),
+                                                                        types::I64,
+                                                                        || {
+                                                                            Anchor::Symbol(
+                                                                                display_symbol
+                                                                                    .clone(),
+                                                                            )
+                                                                        },
+                                                                        || func_ptr,
+                                                                    )
+                                                                }
                                                             } else {
+                                                                if let Some(p) =
+                                                                    self.portable.as_deref_mut()
+                                                                {
+                                                                    p.consulted.push((
+                                                                        display_symbol.clone(),
+                                                                        "absent".into(),
+                                                                    ));
+                                                                }
                                                                 builder.ins().iconst(types::I64, 0)
                                                             }
                                                         } else {
@@ -4383,12 +4914,14 @@ impl CraneliftBackend {
                                                 if self.lazy_functions.contains(func_id) {
                                                     self.wanted_stubs.push(*func_id);
                                                 }
-                                                let cell = crate::reload::call_cell_addr(
+                                                let cell_v = emit_cell(
+                                                    &mut builder,
+                                                    &mut self.module,
+                                                    self.portable.as_deref_mut(),
+                                                    ptr_ty,
                                                     self.reload_key,
                                                     *func_id,
-                                                )
-                                                    as i64;
-                                                let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                                );
                                                 let entry = builder.ins().load(
                                                     ptr_ty,
                                                     MemFlags::trusted(),
@@ -4415,6 +4948,11 @@ impl CraneliftBackend {
                                                 }
                                             }
                                         } else {
+                                            if self.portable.is_some() {
+                                                return Err(CompilerError::Backend(format!(
+                                                    "a call to {func_id:?}, which nothing declares"
+                                                )));
+                                            }
                                             warn!(" Function {:?} not in function_map", func_id);
                                             if let Some(result_id) = result {
                                                 self.value_map.insert(
@@ -4438,12 +4976,14 @@ impl CraneliftBackend {
                                             if self.lazy_functions.contains(func_id) {
                                                 self.wanted_stubs.push(*func_id);
                                             }
-                                            let cell = crate::reload::call_cell_addr(
+                                            let cell_v = emit_cell(
+                                                &mut builder,
+                                                &mut self.module,
+                                                self.portable.as_deref_mut(),
+                                                ptr_ty,
                                                 self.reload_key,
                                                 *func_id,
-                                            )
-                                                as i64;
-                                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                            );
                                             builder.ins().load(
                                                 ptr_ty,
                                                 MemFlags::trusted(),
@@ -4749,12 +5289,42 @@ impl CraneliftBackend {
                                                                 })
                                                             {
                                                                 // Found Display implementation!
-                                                                builder.ins().iconst(
-                                                                    types::I64,
-                                                                    *func_ptr as i64,
-                                                                )
+                                                                {
+                                                                    if let Some(p) =
+                                                                        self.portable.as_deref_mut()
+                                                                    {
+                                                                        p.consulted.push((
+                                                                            display_symbol.clone(),
+                                                                            "present".into(),
+                                                                        ));
+                                                                    }
+                                                                    let func_ptr =
+                                                                        *func_ptr as usize;
+                                                                    emit_anchor(
+                                                                        &mut builder,
+                                                                        &mut self.module,
+                                                                        self.portable
+                                                                            .as_deref_mut(),
+                                                                        types::I64,
+                                                                        || {
+                                                                            Anchor::Symbol(
+                                                                                display_symbol
+                                                                                    .clone(),
+                                                                            )
+                                                                        },
+                                                                        || func_ptr,
+                                                                    )
+                                                                }
                                                             } else {
                                                                 // No Display implementation
+                                                                if let Some(p) =
+                                                                    self.portable.as_deref_mut()
+                                                                {
+                                                                    p.consulted.push((
+                                                                        display_symbol.clone(),
+                                                                        "absent".into(),
+                                                                    ));
+                                                                }
                                                                 builder.ins().iconst(types::I64, 0)
                                                             }
                                                         } else {
@@ -5650,10 +6220,14 @@ impl CraneliftBackend {
                                     if self.lazy_functions.contains(function) {
                                         self.wanted_stubs.push(*function);
                                     }
-                                    let cell =
-                                        crate::reload::call_cell_addr(self.reload_key, *function)
-                                            as i64;
-                                    let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                    let cell_v = emit_cell(
+                                        &mut builder,
+                                        &mut self.module,
+                                        self.portable.as_deref_mut(),
+                                        ptr_ty,
+                                        self.reload_key,
+                                        *function,
+                                    );
                                     builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
                                 } else {
                                     let local_func_ref = self
@@ -6303,10 +6877,14 @@ impl CraneliftBackend {
                                     // cell holds the stub, then the code.
                                     let static_addr = if self.lazy_functions.contains(&hir_id) {
                                         self.wanted_stubs.push(hir_id);
-                                        let cell =
-                                            crate::reload::call_cell_addr(self.reload_key, hir_id)
-                                                as i64;
-                                        let cell_v = builder.ins().iconst(ptr_ty, cell);
+                                        let cell_v = emit_cell(
+                                            &mut builder,
+                                            &mut self.module,
+                                            self.portable.as_deref_mut(),
+                                            ptr_ty,
+                                            self.reload_key,
+                                            hir_id,
+                                        );
                                         builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
                                     } else {
                                         let static_ref =
@@ -7522,6 +8100,124 @@ impl CraneliftBackend {
         })
     }
 
+    /// The plugin signature registered for `name`, as portable code
+    /// records what shaped a call to it.
+    fn symbol_signature_text(&self, name: &str) -> String {
+        format!("{:?}", self.symbol_signatures.get(name))
+    }
+
+    /// Whether the runtime symbols `function` was compiled against are
+    /// registered here as they were there.
+    fn symbols_agree(&self, function: &crate::portable_code::PortableFunction) -> bool {
+        let differs = function
+            .symbols
+            .iter()
+            .find(|(name, found)| match found.as_str() {
+                "present" => !self.runtime_symbol_names.contains(name),
+                "absent" => self.runtime_symbol_names.contains(name),
+                signature => self.symbol_signature_text(name) != signature,
+            });
+        if let Some((name, found)) = differs
+            && std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some()
+        {
+            eprintln!(
+                "[portable] not placing #{}: {name} was {found} where it was compiled, {} here",
+                function.id,
+                self.symbol_signature_text(name)
+            );
+        }
+        differs.is_none()
+    }
+
+    /// `id` as portable code names it: before the shift the snapshot's
+    /// ids took when it was decoded.
+    fn portable_id(&self, id: HirId) -> u32 {
+        let base = self.portable.as_deref().map_or(0, |p| p.id_base);
+        id.as_u32().wrapping_sub(base)
+    }
+
+    /// `reloc` against the anchor it names, for portable code.
+    fn portable_reloc(
+        &self,
+        reloc: &cranelift_module::ModuleReloc,
+    ) -> CompilerResult<crate::portable_code::PortableReloc> {
+        use crate::portable_code::CodeAnchor;
+        use cranelift_module::ModuleRelocTarget;
+        let refuse = |why: String| {
+            CompilerError::Backend(format!(
+                "portable code cannot hold a {:?} relocation at {}: {why}",
+                reloc.kind, reloc.offset
+            ))
+        };
+        let function_of = |func: FuncId| {
+            self.function_map
+                .iter()
+                .find(|(_, f)| **f == func)
+                .map(|(id, _)| self.portable_id(*id))
+        };
+        let anchor = match &reloc.name {
+            ModuleRelocTarget::User {
+                namespace: 0,
+                index,
+            } => {
+                // An import is a runtime symbol, whichever function
+                // declared it.
+                let func = FuncId::from_u32(*index);
+                let decl = self.module.declarations().get_function_decl(func);
+                match (&decl.name, decl.linkage, function_of(func)) {
+                    (Some(name), Linkage::Import, id) => CodeAnchor::Import(name.clone(), id),
+                    (_, _, Some(id)) => CodeAnchor::Function(id),
+                    _ => return Err(refuse(format!("{:?} is no snapshot function", decl.name))),
+                }
+            }
+            ModuleRelocTarget::User {
+                namespace: 1,
+                index,
+            } => {
+                let data = cranelift_module::DataId::from_u32(*index);
+                let portable = self
+                    .portable
+                    .as_deref()
+                    .expect("portable code is being written");
+                match portable.anchor_of.get(&data) {
+                    Some(Anchor::Cell(id)) => CodeAnchor::Cell(self.portable_id(*id)),
+                    Some(Anchor::EntryCounter(id)) => {
+                        CodeAnchor::EntryCounter(self.portable_id(*id))
+                    }
+                    Some(Anchor::HelperSlot(id, site)) => {
+                        CodeAnchor::HelperSlot(self.portable_id(*id), *site)
+                    }
+                    Some(Anchor::Bead(id)) => CodeAnchor::Bead(self.portable_id(*id)),
+                    Some(Anchor::Symbol(name)) => CodeAnchor::Symbol(name.clone()),
+                    None => match self.global_map.iter().find(|(_, d)| **d == data) {
+                        Some((id, _)) => CodeAnchor::Global(self.portable_id(*id)),
+                        None => return Err(refuse("data that is no snapshot global".into())),
+                    },
+                }
+            }
+            ModuleRelocTarget::LibCall(call) => CodeAnchor::LibCall(call.to_string()),
+            ModuleRelocTarget::FunctionOffset(func, offset) => match function_of(*func) {
+                Some(id) => CodeAnchor::FunctionOffset(id, *offset),
+                None => return Err(refuse("an offset into no snapshot function".into())),
+            },
+            other => return Err(refuse(format!("{other:?}"))),
+        };
+        let kind = crate::portable_code::RelocKind::of(reloc.kind)
+            .ok_or_else(|| refuse("the kind has no portable form".into()))?;
+        // A value is written where the code is placed, as a whole word.
+        if anchor.is_value() && kind != crate::portable_code::RelocKind::Abs8 {
+            return Err(refuse(format!(
+                "{anchor:?} is written only as a whole word"
+            )));
+        }
+        Ok(crate::portable_code::PortableReloc {
+            offset: reloc.offset,
+            kind,
+            anchor,
+            addend: reloc.addend,
+        })
+    }
+
     /// The last step of [`Self::compile_function_body`]: define the
     /// compiled code in the module and record what the runtime asks
     /// about it. Under the backend's lock, like the first.
@@ -7550,6 +8246,81 @@ impl CraneliftBackend {
             .iter()
             .map(|r| cranelift_module::ModuleReloc::from_mach_reloc(r, &ctx.func, func_id))
             .collect();
+        if self.portable.is_some() {
+            let imports: Vec<(String, crate::portable_code::PortableSignature)> = relocs
+                .iter()
+                .filter_map(|reloc| match reloc.name {
+                    cranelift_module::ModuleRelocTarget::User {
+                        namespace: 0,
+                        index,
+                    } => {
+                        let decl = self
+                            .module
+                            .declarations()
+                            .get_function_decl(FuncId::from_u32(index));
+                        (decl.linkage == Linkage::Import).then(|| {
+                            (
+                                decl.name.clone().unwrap_or_default(),
+                                crate::portable_code::PortableSignature::of(&decl.signature),
+                            )
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            let relocs = relocs
+                .iter()
+                .map(|reloc| self.portable_reloc(reloc))
+                .collect::<CompilerResult<Vec<_>>>()?;
+            let callees: Vec<crate::portable_code::PortableCallee> = relocs
+                .iter()
+                .filter_map(|reloc| match reloc.anchor {
+                    crate::portable_code::CodeAnchor::Cell(callee)
+                    | crate::portable_code::CodeAnchor::Function(callee)
+                    | crate::portable_code::CodeAnchor::Import(_, Some(callee)) => {
+                        let runtime = HirId::from_raw(
+                            callee.wrapping_add(self.portable.as_deref().map_or(0, |p| p.id_base)),
+                        );
+                        let func = self.function_map.get(&runtime)?;
+                        let decl = self.module.declarations().get_function_decl(*func);
+                        Some(crate::portable_code::PortableCallee {
+                            id: callee,
+                            name: decl.name.clone().unwrap_or_default(),
+                            signature: decl.signature.to_string(),
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut symbols: Vec<(String, String)> = self
+                .portable
+                .as_deref_mut()
+                .map(|p| std::mem::take(&mut p.consulted))
+                .unwrap_or_default();
+            for reloc in &relocs {
+                if let crate::portable_code::CodeAnchor::Import(name, _) = &reloc.anchor {
+                    symbols.push((name.clone(), self.symbol_signature_text(name)));
+                }
+            }
+            symbols.sort();
+            symbols.dedup();
+            let function = crate::portable_code::PortableFunction {
+                id: self.portable_id(id),
+                signature: sig.to_string(),
+                alignment: u64::from(compiled.buffer.alignment),
+                code: compiled.code_buffer().to_vec(),
+                relocs,
+                symbols,
+            };
+            if let Some(portable) = self.portable.as_deref_mut() {
+                portable.functions.push(function);
+                for callee in callees {
+                    portable.callees.insert(callee.id, callee);
+                }
+                portable.imports.extend(imports);
+            }
+            return Ok(());
+        }
         self.module
             .define_function_bytes(
                 func_id,
@@ -8990,9 +9761,14 @@ impl CraneliftBackend {
                             if self.lazy_functions.contains(func_id) {
                                 self.wanted_stubs.push(*func_id);
                             }
-                            let cell =
-                                crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
-                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                            let cell_v = emit_cell(
+                                builder,
+                                &mut self.module,
+                                self.portable.as_deref_mut(),
+                                ptr_ty,
+                                self.reload_key,
+                                *func_id,
+                            );
                             let entry = builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0);
                             builder.ins().call_indirect(sig_ref, entry, &arg_vals)
                         } else {
@@ -9021,9 +9797,14 @@ impl CraneliftBackend {
                             if self.lazy_functions.contains(func_id) {
                                 self.wanted_stubs.push(*func_id);
                             }
-                            let cell =
-                                crate::reload::call_cell_addr(self.reload_key, *func_id) as i64;
-                            let cell_v = builder.ins().iconst(ptr_ty, cell);
+                            let cell_v = emit_cell(
+                                builder,
+                                &mut self.module,
+                                self.portable.as_deref_mut(),
+                                ptr_ty,
+                                self.reload_key,
+                                *func_id,
+                            );
                             builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
                         } else {
                             let cranelift_func = self.function_map[func_id];
@@ -10152,8 +10933,14 @@ impl CraneliftBackend {
                     // then the code.
                     let func_ptr = if self.lazy_functions.contains(function) {
                         self.wanted_stubs.push(*function);
-                        let cell = crate::reload::call_cell_addr(self.reload_key, *function) as i64;
-                        let cell_v = builder.ins().iconst(ptr_ty, cell);
+                        let cell_v = emit_cell(
+                            builder,
+                            &mut self.module,
+                            self.portable.as_deref_mut(),
+                            ptr_ty,
+                            self.reload_key,
+                            *function,
+                        );
                         builder.ins().load(ptr_ty, MemFlags::trusted(), cell_v, 0)
                     } else {
                         // Declare the function reference in the current function
@@ -11010,13 +11797,118 @@ fn get_successors(terminator: &HirTerminator) -> Vec<HirId> {
     }
 }
 
+/// A run-time address or value generated code needs, named so portable
+/// code can be bound to it where it is placed; see
+/// [`crate::portable_code::CodeAnchor`], which this becomes when written.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Anchor {
+    Cell(HirId),
+    EntryCounter(HirId),
+    HelperSlot(HirId, u64),
+    Bead(HirId),
+    Symbol(String),
+}
+
+/// Portable code a module compile is to place, and which of its functions.
+struct Placing {
+    code: crate::portable_code::PortableImage,
+    id_base: u32,
+    eligible: std::collections::HashSet<HirId>,
+}
+
+/// What a backend writing portable code keeps: the data imports standing
+/// for anchors, and the functions written so far.
+#[derive(Default)]
+struct PortableCapture {
+    /// The shift the snapshot's ids took when it was decoded, taken off
+    /// again when code names them.
+    id_base: u32,
+    anchors: HashMap<Anchor, cranelift_module::DataId>,
+    anchor_of: HashMap<cranelift_module::DataId, Anchor>,
+    functions: Vec<crate::portable_code::PortableFunction>,
+    callees: std::collections::BTreeMap<u32, crate::portable_code::PortableCallee>,
+    imports: std::collections::BTreeMap<String, crate::portable_code::PortableSignature>,
+    /// The runtime symbols the function being translated looked up, and
+    /// what it found.
+    consulted: Vec<(String, String)>,
+}
+
+impl PortableCapture {
+    /// The data import standing for `anchor`, declared on first use.
+    fn data_for(&mut self, module: &mut JITModule, anchor: Anchor) -> cranelift_module::DataId {
+        if let Some(&data) = self.anchors.get(&anchor) {
+            return data;
+        }
+        let name = format!("__zyntax_anchor_{}", self.anchors.len());
+        let data = module
+            .declare_data(&name, Linkage::Import, false, false)
+            .expect("an unused name declares");
+        self.anchors.insert(anchor.clone(), data);
+        self.anchor_of.insert(data, anchor);
+        data
+    }
+}
+
+/// The function a probe belongs to: its bead for code this process runs,
+/// the function itself for portable code.
+#[derive(Clone, Copy)]
+struct ProbeOwner {
+    function: HirId,
+    bead: u64,
+}
+
+/// The address or value `anchor` stands for, as a `ty`. Code this process
+/// runs holds it as a constant, resolved now; portable code holds a
+/// relocation against a data import standing for the anchor.
+fn emit_anchor(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    portable: Option<&mut PortableCapture>,
+    ty: types::Type,
+    anchor: impl FnOnce() -> Anchor,
+    resolve: impl FnOnce() -> usize,
+) -> Value {
+    let Some(portable) = portable else {
+        return builder.ins().iconst(ty, resolve() as i64);
+    };
+    let data = portable.data_for(module, anchor());
+    let global = module.declare_data_in_func(data, builder.func);
+    let pointer = module.target_config().pointer_type();
+    let address = builder.ins().symbol_value(pointer, global);
+    match ty.bits().cmp(&pointer.bits()) {
+        std::cmp::Ordering::Equal => address,
+        std::cmp::Ordering::Less => builder.ins().ireduce(ty, address),
+        std::cmp::Ordering::Greater => builder.ins().uextend(ty, address),
+    }
+}
+
+/// The address of `callee`'s call cell, as [`emit_anchor`] emits it.
+fn emit_cell(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut JITModule,
+    portable: Option<&mut PortableCapture>,
+    ty: types::Type,
+    reload_key: u64,
+    callee: HirId,
+) -> Value {
+    emit_anchor(
+        builder,
+        module,
+        portable,
+        ty,
+        || Anchor::Cell(callee),
+        || crate::reload::call_cell_addr(reload_key, callee),
+    )
+}
+
 /// Count visits in SSA so a short-lived loop does not start an LLVM compile.
 /// Only the threshold visit calls into the runtime, naming this site; all
 /// other visits stay in generated code.
 fn emit_osr_request_after_backedges(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    bead_id: u64,
+    mut portable: Option<&mut PortableCapture>,
+    owner: ProbeOwner,
     site_key: u64,
     counter: cranelift_frontend::Variable,
 ) {
@@ -11040,7 +11932,14 @@ fn emit_osr_request_after_backedges(
     if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
     {
         let f = module.declare_func_in_func(fid, builder.func);
-        let bead = builder.ins().iconst(types::I64, bead_id as i64);
+        let bead = emit_anchor(
+            builder,
+            module,
+            portable.as_deref_mut(),
+            types::I64,
+            || Anchor::Bead(owner.function),
+            || owner.bead as usize,
+        );
         let site = builder.ins().iconst(types::I64, site_key as i64);
         builder.ins().call(f, &[bead, site]);
     }
@@ -11056,11 +11955,18 @@ fn emit_osr_request_after_backedges(
 fn emit_osr_request_after_calls(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    bead_id: u64,
+    mut portable: Option<&mut PortableCapture>,
+    owner: ProbeOwner,
     pointer_type: types::Type,
 ) {
-    let addr = crate::osr::entry_counter_addr(bead_id);
-    let addr = builder.ins().iconst(pointer_type, addr as i64);
+    let addr = emit_anchor(
+        builder,
+        module,
+        portable.as_deref_mut(),
+        pointer_type,
+        || Anchor::EntryCounter(owner.function),
+        || crate::osr::entry_counter_addr(owner.bead) as usize,
+    );
     let flags = MemFlags::trusted();
     let count = builder.ins().load(types::I64, flags, addr, 0);
     let next = builder.ins().iadd_imm(count, 1);
@@ -11082,7 +11988,14 @@ fn emit_osr_request_after_calls(
     if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
     {
         let f = module.declare_func_in_func(fid, builder.func);
-        let bead = builder.ins().iconst(types::I64, bead_id as i64);
+        let bead = emit_anchor(
+            builder,
+            module,
+            portable.as_deref_mut(),
+            types::I64,
+            || Anchor::Bead(owner.function),
+            || owner.bead as usize,
+        );
         // At its entry the frame is at no header.
         let site = builder.ins().iconst(types::I64, crate::osr::NO_SITE as i64);
         builder.ins().call(f, &[bead, site]);
@@ -11100,7 +12013,8 @@ fn emit_osr_request_after_calls(
 fn emit_osr_back_edge_probe(
     builder: &mut FunctionBuilder<'_>,
     module: &mut JITModule,
-    bead_id: u64,
+    portable: Option<&mut PortableCapture>,
+    owner: ProbeOwner,
     site_key: u64,
     frame: &crate::osr::OsrFrame,
     live_ins: &[cranelift_codegen::ir::Value],
@@ -11134,8 +12048,14 @@ fn emit_osr_back_edge_probe(
     // registers as clobbered across the whole body. The dispatch below
     // returns instead of continuing, so nothing in the loop is constrained
     // by it.
-    let slot = crate::osr::helper_slot_addr(bead_id, site_key);
-    let slot_v = builder.ins().iconst(types::I64, slot as i64);
+    let slot_v = emit_anchor(
+        builder,
+        module,
+        portable,
+        types::I64,
+        || Anchor::HelperSlot(owner.function, site_key),
+        || crate::osr::helper_slot_addr(owner.bead, site_key) as usize,
+    );
     let helper_ptr = builder.ins().load(types::I64, MemFlags::new(), slot_v, 0);
 
     let dispatch_block = builder.create_block();

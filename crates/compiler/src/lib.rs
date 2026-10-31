@@ -94,6 +94,7 @@ pub mod partial_escape; // Materialize immutable temporaries at consuming escape
 pub mod pattern_matching;
 pub mod phi_prune;
 pub mod pool_alloc; // Size-class pools behind the allocation intrinsics
+pub mod portable_code; // Machine code compiled to run in another process
 #[cfg(feature = "cranelift-backend")]
 mod power2_div;
 pub mod pure_call_pre;
@@ -105,6 +106,7 @@ pub mod scalar_replace_alloc; // Eliminate non-escaping Call(Intrinsic::Malloc) 
 pub mod sign_fold; // Compares against zero decided by the sign of what is compared
 pub mod ssa;
 pub mod stdlib; // Standard library implementation using HIR Builder
+pub mod symbol_address; // Where the runtime symbols code names by address are
 pub mod target_vector; // How wide a vector the target accepts, and lanes per element
 pub mod tco; // Tail-call optimisation marker
 pub mod trait_lowering; // Trait/interface lowering to HIR

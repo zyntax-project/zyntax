@@ -91,6 +91,23 @@ pub fn bool_box(b: bool) -> usize {
     &table()[usize::from(b)] as *const StaticBox as usize
 }
 
+/// The runtime symbol at the start of the table, which compiled code
+/// names rather than holding the address.
+pub const SHARED_BOXES_SYMBOL: &str = "__zyntax_shared_boxes";
+
+/// The address [`SHARED_BOXES_SYMBOL`] names.
+pub fn shared_boxes() -> usize {
+    table().as_ptr() as usize
+}
+
+/// Bytes from [`SHARED_BOXES_SYMBOL`] to the box of `b`.
+pub const fn bool_box_offset(b: bool) -> i64 {
+    (b as usize * STRIDE) as i64
+}
+
+/// Bytes from [`SHARED_BOXES_SYMBOL`] to [`small_int_base`].
+pub const SMALL_INT_OFFSET: i64 = (2 * STRIDE) as i64;
+
 /// Whether `p` is one of the shared boxes, which no release may touch.
 /// Before the table exists nothing can hold one of its addresses, and
 /// the base reads as zero.
@@ -123,6 +140,11 @@ mod tests {
         assert!(is_interned(three));
         assert!(is_interned(bool_box(false)));
         assert!(!is_interned(three + SMALL_INT_COUNT * STRIDE));
+        assert_eq!(shared_boxes() + SMALL_INT_OFFSET as usize, small_int_base());
+        assert_eq!(
+            shared_boxes() + bool_box_offset(true) as usize,
+            bool_box(true)
+        );
     }
 
     #[test]

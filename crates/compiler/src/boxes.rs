@@ -311,8 +311,8 @@ fn shared_bool(func: &mut HirFunction, result: HirId, arg: HirId, out: &mut Vec<
         left: arg,
         right: zero,
     });
-    let yes = address(func, crate::interned::bool_box(true), &box_ty, out);
-    let no = address(func, crate::interned::bool_box(false), &box_ty, out);
+    let yes = shared_box(func, crate::interned::bool_box_offset(true), &box_ty, out);
+    let no = shared_box(func, crate::interned::bool_box_offset(false), &box_ty, out);
     out.push(HirInstruction::Select {
         result,
         ty: box_ty,
@@ -334,13 +334,14 @@ fn zero_of(ty: &HirType) -> HirConstant {
 }
 
 /// A constant address as a value of `ty`.
-fn address(
+/// A pointer of type `ty` to the shared box `offset` bytes into the table.
+fn shared_box(
     func: &mut HirFunction,
-    addr: usize,
+    offset: i64,
     ty: &HirType,
     out: &mut Vec<HirInstruction>,
 ) -> HirId {
-    let raw = constant(func, HirType::I64, HirConstant::I64(addr as i64));
+    let raw = constant(func, HirType::I64, shared_boxes_at(offset));
     let ptr = value(func, ty.clone());
     out.push(HirInstruction::Cast {
         result: ptr,
@@ -448,7 +449,7 @@ fn shared_or_made_int(
     let base = constant(
         func,
         HirType::I64,
-        HirConstant::I64(crate::interned::small_int_base() as i64),
+        shared_boxes_at(crate::interned::SMALL_INT_OFFSET),
     );
     let raw = value(func, HirType::I64);
     small_insts.push(HirInstruction::Binary {
@@ -639,6 +640,14 @@ fn hir_ty_width(ty: &HirType) -> i64 {
         HirType::I16 | HirType::U16 => 2,
         HirType::I32 | HirType::U32 | HirType::F32 => 4,
         _ => 8,
+    }
+}
+
+/// The address `offset` bytes into the shared box table, by its symbol.
+fn shared_boxes_at(offset: i64) -> HirConstant {
+    HirConstant::SymbolAddress {
+        name: zyntax_typed_ast::InternedString::new_global(crate::interned::SHARED_BOXES_SYMBOL),
+        offset,
     }
 }
 

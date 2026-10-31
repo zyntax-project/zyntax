@@ -6206,6 +6206,26 @@ impl<'ctx> LLVMBackend<'ctx> {
             // Boolean
             Bool(v) => self.context.bool_type().const_int(*v as u64, false).into(),
 
+            // A runtime data symbol's address: an external global the
+            // installer binds to the symbol.
+            SymbolAddress { name, offset } => {
+                let name = name.resolve_global().unwrap_or_default();
+                let int_ty = self.translate_type(&HirType::USize)?.into_int_type();
+                let global = self.module.get_global(&name).unwrap_or_else(|| {
+                    let global = self.module.add_global(self.context.i8_type(), None, &name);
+                    global.set_linkage(inkwell::module::Linkage::External);
+                    global
+                });
+                let mut address = global.as_pointer_value();
+                if *offset != 0 {
+                    let bytes = self.context.i64_type().const_int(*offset as u64, true);
+                    // SAFETY: a byte offset from the symbol, which the
+                    // symbol's owner lays out.
+                    address = unsafe { address.const_gep(self.context.i8_type(), &[bytes]) };
+                }
+                address.const_to_int(int_ty).into()
+            }
+
             // Null pointer
             Null(ty) => {
                 let llvm_ty = self.translate_type(ty)?;

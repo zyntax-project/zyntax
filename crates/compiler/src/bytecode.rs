@@ -107,6 +107,10 @@ pub struct LazyModule {
     base: u32,
     /// Made on first use; see [`Self::link_index`].
     index: std::sync::OnceLock<std::sync::Arc<LinkIndex>>,
+    /// The module's functions as machine code for this target, one
+    /// variant per way of compiling them, when the image came with it;
+    /// see [`crate::portable_code`].
+    portable: OnceLock<Vec<crate::portable_code::PortableImage>>,
 }
 
 /// What a program linking a lowered module finds its functions and
@@ -250,7 +254,24 @@ impl LazyModule {
             in_memory: true,
             base: 0,
             index: std::sync::OnceLock::new(),
+            portable: OnceLock::new(),
         }
+    }
+
+    /// What every id in the image was shifted by when it was decoded.
+    pub fn id_base(&self) -> u32 {
+        self.base
+    }
+
+    /// Give the module its functions' machine code, compiled from this
+    /// image for this target. A module takes it once.
+    pub fn set_portable_code(&self, variants: Vec<crate::portable_code::PortableImage>) {
+        let _ = self.portable.set(variants);
+    }
+
+    /// The machine code [`Self::set_portable_code`] gave the module.
+    pub fn portable_code(&self) -> &[crate::portable_code::PortableImage] {
+        self.portable.get().map_or(&[], Vec::as_slice)
     }
 
     /// The module's functions and globals by name, made once.
@@ -641,6 +662,7 @@ fn lazy_module(bytes: Cow<'static, [u8]>, checked: bool, relocate: bool) -> Resu
         in_memory: false,
         base,
         index: std::sync::OnceLock::new(),
+        portable: OnceLock::new(),
     })
 }
 

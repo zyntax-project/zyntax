@@ -1727,16 +1727,48 @@ impl TieredBackend {
         // while the module compiles, and its own compile, which needs the
         // module's declarations, waits for them.
         let started = web_time::Instant::now();
-        self.cranelift.with_lock(|be| {
+        // A snapshot module that came with machine code for this target
+        // has its functions placed from it, compiled from the start.
+        let portable = body_sources.values().find_map(|source| {
+            let variants = source.portable_code();
+            if variants.is_empty() {
+                return None;
+            }
+            let eligible: HashSet<HirId> = body_sources
+                .iter()
+                .filter(|(_, s)| Arc::ptr_eq(s, source))
+                .map(|(id, _)| *id)
+                .collect();
+            Some((variants.to_vec(), source.id_base(), eligible))
+        });
+        let placed = self.cranelift.with_lock(|be| {
             if !joining {
-                self.precompile_static_hot(&lazy);
+                let compiled_later: HashSet<HirId> = match &portable {
+                    Some((_, _, eligible)) => lazy.difference(eligible).copied().collect(),
+                    None => lazy.clone(),
+                };
+                self.precompile_static_hot(&compiled_later);
+            }
+            if let Some((code, base, eligible)) = portable {
+                be.set_portable_code(code, base, eligible);
             }
             be.set_only_compile_reachable(reachable);
             be.add_lazy_functions(lazy.iter().copied());
             let compiled = be.compile_module(&module_context);
             be.set_only_compile_reachable(None);
-            compiled
+            compiled.map(|()| {
+                be.take_placed()
+                    .into_iter()
+                    .filter_map(|id| be.get_function_ptr(id).map(|entry| (id, entry)))
+                    .collect::<Vec<_>>()
+            })
         })?;
+        for (id, entry) in placed {
+            if let Some(function) = self.functions.get(&id) {
+                function.bound.bead().eager_install(entry as *mut ());
+                osr::set_published_entry(function.bead_id, entry as usize);
+            }
+        }
         if trace {
             eprintln!(
                 "[OPT] codegen: cranelift    {:8.2} ms",

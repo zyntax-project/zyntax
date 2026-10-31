@@ -1326,8 +1326,21 @@ pub fn compile_function_with(
                 cf.entry_storage.push((reg_of[val_id], bytes));
                 continue;
             }
+            let value = match c {
+                HirConstant::SymbolAddress { name, offset } => {
+                    let name = name.resolve_global().unwrap_or_default();
+                    let address = crate::symbol_address::resolve_with_offset(&name, *offset)
+                        .ok_or_else(|| {
+                            InterpError::UnsupportedInstruction(format!(
+                                "the address of the runtime symbol {name}, which no table registers"
+                            ))
+                        })?;
+                    ZyntaxValue::Int(address as i64)
+                }
+                c => const_to_zyntax(c),
+            };
             let idx = cf.const_pool.len() as u32;
-            cf.const_pool.push(const_to_zyntax(c));
+            cf.const_pool.push(value);
             const_idx_for.insert(*val_id, idx);
         } else if matches!(val_def.kind, HirValueKind::Undef)
             && held(&val_def.ty) == Held::ByReference

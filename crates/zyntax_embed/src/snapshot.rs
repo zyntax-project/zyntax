@@ -31,7 +31,7 @@ pub use cache::{SnapshotCache, SnapshotDependency, SnapshotSource};
 pub use preparation::SnapshotPreparation;
 
 const MAGIC: &[u8; 5] = b"ZSNAP";
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 /// magic, schema, and the length of the directory that follows.
 const HEADER_LEN: usize = MAGIC.len() + 2 * std::mem::size_of::<u32>();
 
@@ -217,6 +217,12 @@ struct LoweredEntry {
     build_id: String,
     /// The pointer width it was lowered for, in bytes.
     pointer_size: u8,
+    /// The module's functions as machine code for the target the
+    /// snapshot was built for, one variant per way of compiling them:
+    /// each a postcard-encoded
+    /// [`zyntax_compiler::portable_code::PortableCode`].
+    #[serde(default)]
+    code: Vec<Extent>,
 }
 
 impl LoweredEntry {
@@ -289,7 +295,153 @@ pub struct Snapshot {
     signature_indexes: Vec<std::sync::OnceLock<Result<(SignatureIndex, usize), String>>>,
 }
 
+/// Whether nothing in the environment changes how the runtime compiles,
+/// so machine code compiled ahead of time is what it would compile: no
+/// `ZYNTAX_*` variable is set but traces, dumps and worker settings.
+#[cfg(feature = "portable-code")]
+fn portable_code_allowed() -> bool {
+    std::env::vars_os().all(|(key, _)| {
+        let key = key.to_string_lossy();
+        !key.starts_with("ZYNTAX_")
+            || key.starts_with("ZYNTAX_TRACE_")
+            || key.starts_with("ZYNTAX_DUMP_")
+            || matches!(
+                key.as_ref(),
+                "ZYNTAX_COMPILE_WORKERS"
+                    | "ZYNTAX_DISABLE_WARM_UP"
+                    | "ZYNTAX_OPTIMIZE_QUIET_MS"
+                    | "ZYNTAX_PORTABLE_COMPILE_AT_LOAD"
+            )
+    })
+}
+
+/// A statically linked plugin's symbols as the compiler takes them: name,
+/// address and, when the plugin gives one, signature.
+pub fn static_plugin_symbols(
+    plugin: &zrtl::StaticPlugin,
+) -> Vec<zyntax_compiler::zrtl::RuntimeSymbolInfo> {
+    use std::ffi::CStr;
+    use zyntax_compiler::zrtl::{
+        MAX_PARAMS, RuntimeSymbolInfo, TypeTag, ZrtlSigFlags, ZrtlSymbolSig,
+    };
+    let mut symbols = Vec::new();
+    for sym in plugin.symbols {
+        // SAFETY: each `name` in a plugin's table is a null-terminated
+        // `'static` literal; a name that is not UTF-8 is skipped.
+        let name: &'static str = unsafe {
+            match CStr::from_ptr(sym.name).to_str() {
+                Ok(s) => &*(s as *const str),
+                Err(_) => continue,
+            }
+        };
+        // SAFETY: `sym.sig` is null or points at a static signature in the
+        // plugin, laid out as the compiler's by `#[repr(C)]` design; its
+        // fields are copied through their `pub` wrappers.
+        let sig = if sym.sig.is_null() {
+            None
+        } else {
+            let s = unsafe { &*sym.sig };
+            let mut params = [TypeTag(0); MAX_PARAMS];
+            for (i, p) in s.params.iter().enumerate().take(MAX_PARAMS) {
+                params[i] = TypeTag(p.0);
+            }
+            Some(ZrtlSymbolSig {
+                param_count: s.param_count,
+                flags: ZrtlSigFlags(s.flags.0),
+                return_type: TypeTag(s.return_type.0),
+                params,
+            })
+        };
+        symbols.push(RuntimeSymbolInfo {
+            name,
+            ptr: sym.ptr,
+            sig,
+        });
+    }
+    symbols
+}
+
+/// `ZYNTAX_PORTABLE_COMPILE_AT_LOAD=1` compiles a lowered module's
+/// functions to portable code for this machine as the module is decoded,
+/// in place of any the snapshot carries, and the runtime places them from
+/// it: the path code a snapshot carries takes, compiled here. `=probes`
+/// compiles loops with OSR probes, for a ladder with LLVM. Slow to start;
+/// safe to run with. Whether it compiled.
+#[cfg(feature = "portable-code")]
+fn compile_portable_at_load(module: &zyntax_compiler::bytecode::LazyModule, name: &str) -> bool {
+    let Some(mode) = std::env::var_os("ZYNTAX_PORTABLE_COMPILE_AT_LOAD") else {
+        return false;
+    };
+    let triple = zyntax_compiler::portable_code::host_triple();
+    match zyntax_compiler::portable_code::compile_snapshot_module(
+        module,
+        &triple,
+        mode == "probes",
+        &[],
+    ) {
+        Ok(code) => match code.encode().and_then(|bytes| {
+            zyntax_compiler::portable_code::PortableImage::new(
+                zyntax_compiler::portable_code::ImageBytes::Shared(bytes.into()),
+            )
+        }) {
+            Ok(image) => module.set_portable_code(vec![image]),
+            Err(e) => eprintln!("[portable] {name}: no portable code: {e}"),
+        },
+        Err(e) => eprintln!("[portable] {name}: no portable code: {e}"),
+    }
+    true
+}
+
 impl Snapshot {
+    /// Give `module` the machine code the snapshot carries for it, when
+    /// the environment leaves the runtime compiling as the build did.
+    /// `ZYNTAX_DISABLE_PORTABLE_CODE=1` leaves it aside; safe to run with.
+    #[cfg(feature = "portable-code")]
+    fn attach_portable_code(
+        &self,
+        module: &zyntax_compiler::bytecode::LazyModule,
+        variants: &[Extent],
+        name: &str,
+    ) {
+        let declined = if std::env::var_os("ZYNTAX_DISABLE_PORTABLE_CODE").is_some() {
+            Some("ZYNTAX_DISABLE_PORTABLE_CODE is set")
+        } else if !portable_code_allowed() {
+            Some("the environment changes how code compiles")
+        } else {
+            None
+        };
+        if let Some(why) = declined {
+            if std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some() {
+                eprintln!("[portable] {name}: no machine code: {why}");
+            }
+            return;
+        }
+        // Read in place from an embedded snapshot, from a copy otherwise;
+        // nothing is decoded until a function is placed.
+        use zyntax_compiler::portable_code::{ImageBytes, PortableImage};
+        let images: Result<Vec<PortableImage>, String> = variants
+            .iter()
+            .map(|code| {
+                let bytes = match &self.bytes {
+                    std::borrow::Cow::Borrowed(all) => {
+                        let blobs: &'static [u8] = &all[self.blobs_at..];
+                        ImageBytes::Static(code.slice(blobs, name).map_err(|e| e.to_string())?)
+                    }
+                    std::borrow::Cow::Owned(_) => ImageBytes::Shared(
+                        code.slice(self.blobs(), name)
+                            .map_err(|e| e.to_string())?
+                            .into(),
+                    ),
+                };
+                PortableImage::new(bytes)
+            })
+            .collect();
+        match images {
+            Ok(images) => module.set_portable_code(images),
+            Err(e) => eprintln!("[portable] {name}: the machine code does not read: {e}"),
+        }
+    }
+
     /// Read the snapshot this build embedded (see [`include_snapshot!`]),
     /// checking it is one and that this build understands it.
     ///
@@ -506,6 +658,10 @@ impl Snapshot {
                                 t0.elapsed().as_secs_f64() * 1000.0,
                                 bytes,
                             );
+                        }
+                        #[cfg(feature = "portable-code")]
+                        if !compile_portable_at_load(&hir, &entry.name) {
+                            self.attach_portable_code(&hir, &lowered.code, &entry.name);
                         }
                         Some(Arc::new(hir))
                     })
@@ -772,6 +928,8 @@ pub struct SnapshotBuilder {
     grammar: Option<Vec<u8>>,
     modules: Vec<PendingModule>,
     cache: Option<CachedInputs>,
+    /// What the runtime registers, for compiling machine code as it would.
+    runtime_symbols: Vec<zyntax_compiler::zrtl::RuntimeSymbolInfo>,
 }
 
 /// A module waiting to be written into a snapshot.
@@ -784,6 +942,8 @@ struct PendingModule {
     source: Option<String>,
     /// The module's HIR, encoded, with what may read it.
     lowered: Option<(Vec<u8>, String, u8)>,
+    /// The module's functions as machine code, encoded, per variant.
+    code: Vec<Vec<u8>>,
     /// The module's function declarations, from [`signature_table`].
     signatures: Option<Vec<u8>>,
 }
@@ -956,6 +1116,7 @@ impl SnapshotBuilder {
             grammar: None,
             modules: Vec::new(),
             cache: None,
+            runtime_symbols: Vec::new(),
         }
     }
 
@@ -993,6 +1154,7 @@ impl SnapshotBuilder {
             interface: None,
             source: None,
             lowered: None,
+            code: Vec::new(),
             signatures: None,
         });
         Ok(self)
@@ -1024,6 +1186,7 @@ impl SnapshotBuilder {
             interface: None,
             source,
             lowered: None,
+            code: Vec::new(),
             signatures: None,
         });
         Ok(self)
@@ -1099,9 +1262,89 @@ impl SnapshotBuilder {
             name,
             source: None,
             lowered: Some((encoded, zyntax_compiler::BUILD_ID.to_string(), pointer_size)),
+            code: Vec::new(),
             signatures: Some(signatures),
         });
         Ok(self)
+    }
+
+    /// Compile each lowered module's functions to machine code for
+    /// `triple`, carried beside its HIR so a runtime on that target
+    /// starts with them compiled; see [`zyntax_compiler::portable_code`].
+    /// `probes` is whether loops carry OSR probes, as the runtime that
+    /// places the code emits them.
+    #[cfg(feature = "portable-code")]
+    pub fn portable_code(mut self, triple: &str, probes: bool) -> Result<Self, SnapshotError> {
+        if !portable_code_allowed() {
+            return Err(SnapshotError::Encode(
+                "a ZYNTAX_* variable changes how code compiles; machine code compiled \
+                 under it would not be what a runtime compiles"
+                    .into(),
+            ));
+        }
+        for module in &mut self.modules {
+            let Some((hir, _, _)) = &module.lowered else {
+                continue;
+            };
+            let lazy = zyntax_compiler::bytecode::deserialize_module_lazy(hir.clone())
+                .map_err(|e| SnapshotError::Encode(e.to_string()))?;
+            let code = zyntax_compiler::portable_code::compile_snapshot_module(
+                &lazy,
+                triple,
+                probes,
+                &self.runtime_symbols,
+            )
+            .map_err(|e| SnapshotError::Encode(format!("{}: {e}", module.name)))?;
+            module
+                .code
+                .push(code.encode().map_err(SnapshotError::Encode)?);
+        }
+        Ok(self)
+    }
+
+    /// The static plugins the runtime registers before it compiles: their
+    /// signatures shape how compiled code calls them, so machine code the
+    /// snapshot carries is compiled against them.
+    pub fn runtime_plugins(
+        mut self,
+        plugins: impl IntoIterator<Item = zrtl::StaticPlugin>,
+    ) -> Self {
+        for plugin in plugins {
+            self.runtime_symbols.extend(static_plugin_symbols(&plugin));
+        }
+        self
+    }
+
+    /// [`Self::portable_code`] for the target a build script builds for,
+    /// with OSR probes and without, for a ladder that goes past the
+    /// Cranelift baseline and one that ends there; when Cranelift compiles
+    /// for the target and no `ZYNTAX_*` variable changes how code
+    /// compiles. Otherwise the snapshot carries HIR alone, and the runtime
+    /// compiles the library as it needs it.
+    #[cfg(feature = "portable-code")]
+    pub fn portable_code_for_build_target(self) -> Result<Self, SnapshotError> {
+        let Ok(triple) = std::env::var("TARGET") else {
+            return Ok(self);
+        };
+        if triple.starts_with("wasm32") {
+            return Ok(self);
+        }
+        if !zyntax_compiler::portable_code::compiles_for(&triple) {
+            println!(
+                "cargo:warning=the snapshot carries no machine code: this build's Cranelift \
+                 cannot compile for {triple}"
+            );
+            return Ok(self);
+        }
+        if !portable_code_allowed() {
+            println!(
+                "cargo:warning=the snapshot carries no machine code: a ZYNTAX_* variable \
+                 changes how code compiles"
+            );
+            return Ok(self);
+        }
+        self.portable_code(&triple, false)?
+            .portable_code(&triple, true)
     }
 
     /// Encode the snapshot.
@@ -1136,6 +1379,11 @@ impl SnapshotBuilder {
                     hir: put(bytes, &mut blobs),
                     build_id: build_id.clone(),
                     pointer_size: *pointer_size,
+                    code: module
+                        .code
+                        .iter()
+                        .map(|code| put(code, &mut blobs))
+                        .collect(),
                 });
             let signatures = module
                 .signatures

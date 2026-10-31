@@ -141,7 +141,7 @@ pub use compiled_artifact::{CompiledArtifactError, CompiledImport};
 pub use snapshot::{
     SNAPSHOT_EXTENSION, Snapshot, SnapshotBuilder, SnapshotCache, SnapshotDependency,
     SnapshotError, SnapshotSource, lower_for_snapshot, lower_for_snapshot_releasing,
-    optimize_snapshot_hir, snapshot_file_name,
+    optimize_snapshot_hir, snapshot_file_name, static_plugin_symbols,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
