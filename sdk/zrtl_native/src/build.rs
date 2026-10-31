@@ -24,22 +24,36 @@ pub fn emit_startup_layout(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Link the package's executables so that dyld runs none of their static
-/// initialisers, on macOS: the runtime runs them before its first use of
-/// what they set up (`zyntax_compiler`'s LLVM tier), and a process that
-/// never gets there skips them. Every static initialiser of such an
-/// executable must be one that runtime runs. The link goes through a
-/// small linker built here with the build's `rustc`, which runs `ld` and
-/// retypes the output's initialiser offsets as regular data. Setting
+/// Link the package's executables so that the loader runs none of LLVM's
+/// static initialisers: the runtime runs them before its first use of
+/// LLVM (`zyntax_compiler`'s LLVM tier), and a process that never gets
+/// there skips them. On Linux a linker script moves the initialiser
+/// pointers of LLVM's archives out of `.init_array` into a section of
+/// their own. On macOS, where every static initialiser of such an
+/// executable must be LLVM's, the link goes through a small linker built
+/// here with the build's `rustc`, which runs `ld` and retypes the
+/// output's initialiser offsets as regular data. Setting
 /// `ZYNTAX_KEEP_LINKER_LAYOUT` links as usual.
 pub fn emit_deferred_initializers(dir: &Path) -> io::Result<()> {
     println!("cargo:rerun-if-env-changed=ZYNTAX_KEEP_LINKER_LAYOUT");
     let os = std::env::var("CARGO_CFG_TARGET_OS")
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    if std::env::var_os("ZYNTAX_KEEP_LINKER_LAYOUT").is_some()
-        || os != "macos"
-        || !cfg!(target_os = "macos")
-    {
+    if std::env::var_os("ZYNTAX_KEEP_LINKER_LAYOUT").is_some() {
+        return Ok(());
+    }
+    if os == "linux" {
+        // The runtime reads the section back from a 64-bit little-endian
+        // image; any other runs LLVM's initialisers at launch as before.
+        let little = std::env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little");
+        let wide = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
+        if little && wide {
+            for arg in deferred_initializer_link_args(&os, dir)? {
+                println!("cargo:rustc-link-arg-bins={arg}");
+            }
+        }
+        return Ok(());
+    }
+    if os != "macos" || !cfg!(target_os = "macos") {
         return Ok(());
     }
     let source = dir.join("zyntax_ld.rs");
@@ -56,6 +70,33 @@ pub fn emit_deferred_initializers(dir: &Path) -> io::Result<()> {
     }
     println!("cargo:rustc-link-arg-bins=--ld-path={}", linker.display());
     Ok(())
+}
+
+/// The section a Linux link moves LLVM's initialiser pointers to, which
+/// the runtime reads back.
+pub const DEFERRED_INITIALIZERS_SECTION: &str = ".zyntax_llvm_init";
+
+/// The linker arguments that move LLVM's initialiser pointers out of
+/// `.init_array`, for an ELF target; empty for others. LLVM's objects
+/// arrive bundled in llvm-sys's rlib, or in LLVM's own archives when
+/// linked unbundled. Placed ahead of `.init_array` in the script, the
+/// section claims those pointers first.
+pub fn deferred_initializer_link_args(target_os: &str, dir: &Path) -> io::Result<Vec<String>> {
+    if target_os != "linux" {
+        return Ok(Vec::new());
+    }
+    let path = dir.join("deferred_initializers.ld");
+    let sections = ".init_array .init_array.* .ctors .ctors.*";
+    std::fs::write(
+        &path,
+        format!(
+            "SECTIONS {{\n  {DEFERRED_INITIALIZERS_SECTION} : {{\n    KEEP(*libllvm_sys-*.rlib:*({sections}))\n    KEEP(*libLLVM*.a:*({sections}))\n  }}\n}}\nINSERT BEFORE .init_array;\n"
+        ),
+    )?;
+    Ok(vec![
+        "-Xlinker".into(),
+        format!("--script={}", path.display()),
+    ])
 }
 
 /// Group ELF startup text without changing constructor-array order or the
