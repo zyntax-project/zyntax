@@ -2719,11 +2719,11 @@ impl<'a> Round<'a> {
                 self.loop_block(f.block());
             }
             Stmt::If(i) => {
-                self.value(i.condition());
+                self.condition(i.condition());
                 self.block(i.block());
                 if let Some(elseifs) = i.else_if() {
                     for e in elseifs {
-                        self.value(e.condition());
+                        self.condition(e.condition());
                         self.block(e.block());
                     }
                 }
@@ -2769,17 +2769,38 @@ impl<'a> Round<'a> {
             Stmt::Repeat(r) => {
                 self.loops += 1;
                 self.block(r.block());
-                self.value(r.until());
+                self.condition(r.until());
                 self.loops -= 1;
             }
             Stmt::While(w) => {
                 self.loops += 1;
-                self.value(w.condition());
+                self.condition(w.condition());
                 self.block(w.block());
                 self.loops -= 1;
             }
             Stmt::Goto(_) | Stmt::Label(_) if self.func == CHUNK => self.chunk_jumps = true,
             _ => {}
+        }
+    }
+
+    /// An expression whose value is only tested for truth, which Lua
+    /// takes raw: what `not`, `and` and `or` combine goes nowhere.
+    fn condition(&mut self, e: &Expression) {
+        match e {
+            Expression::Parentheses { expression, .. }
+            | Expression::UnaryOperator {
+                unop: UnOp::Not(_),
+                expression,
+            } => self.condition(expression),
+            Expression::BinaryOperator {
+                lhs,
+                binop: BinOp::And(_) | BinOp::Or(_),
+                rhs,
+            } => {
+                self.condition(lhs);
+                self.condition(rhs);
+            }
+            _ => self.expr(e),
         }
     }
 
@@ -3434,6 +3455,7 @@ impl<'a> Round<'a> {
                     {
                         self.expr(expression)
                     }
+                    None if matches!(unop, UnOp::Not(_)) => self.condition(expression),
                     None => self.value(expression),
                 }
             }
