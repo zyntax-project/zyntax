@@ -11926,11 +11926,20 @@ fn emit_osr_request_after_backedges(
 
     builder.switch_to_block(request_block);
     builder.seal_block(request_block);
+    builder.set_cold_block(request_block);
+    // The call returns into the loop: one that clobbered registers would
+    // have every value live across the loop kept on the stack.
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
     sig.params.push(AbiParam::new(types::I64));
-    if let Ok(fid) = module.declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &sig)
-    {
+    let symbol = match crate::osr::OSR_REQUEST_PRESERVING_SYMBOL {
+        Some(preserving) => {
+            sig.call_conv = cranelift_codegen::isa::CallConv::PreserveAll;
+            preserving
+        }
+        None => crate::osr::OSR_REQUEST_SYMBOL,
+    };
+    if let Ok(fid) = module.declare_function(symbol, Linkage::Import, &sig) {
         let f = module.declare_func_in_func(fid, builder.func);
         let bead = emit_anchor(
             builder,
