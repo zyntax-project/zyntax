@@ -677,19 +677,38 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
 pub fn preserving_request() -> Option<*const u8> {
     static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     ADDRESS
-        .get_or_init(|| compile_preserving_request().ok())
+        .get_or_init(|| {
+            compile_preserving_request(crate::osr::osr_request_promotion as *const u8).ok()
+        })
         .map(|address| address as *const u8)
 }
 
-fn compile_preserving_request() -> CompilerResult<usize> {
+/// [`preserving_request`] calling `request`, for a backend given a
+/// promotion request of its own: one per request, kept for the process.
+fn preserving_request_for(request: usize) -> Option<*const u8> {
+    if request == crate::osr::osr_request_promotion as *const u8 as usize {
+        return preserving_request();
+    }
+    static ADDRESSES: std::sync::Mutex<Vec<(usize, Option<usize>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut addresses = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+    let address = match addresses.iter().find(|(given, _)| *given == request) {
+        Some((_, address)) => *address,
+        None => {
+            let address = compile_preserving_request(request as *const u8).ok();
+            addresses.push((request, address));
+            address
+        }
+    };
+    address.map(|address| address as *const u8)
+}
+
+fn compile_preserving_request(request: *const u8) -> CompilerResult<usize> {
     let fail = |e: &dyn std::fmt::Display| {
         CompilerError::Backend(format!("the preserving promotion request: {e}"))
     };
     let mut builder = JITBuilder::with_isa(host_isa(), cranelift_module::default_libcall_names());
-    builder.symbol(
-        crate::osr::OSR_REQUEST_SYMBOL,
-        crate::osr::osr_request_promotion as *const u8,
-    );
+    builder.symbol(crate::osr::OSR_REQUEST_SYMBOL, request);
     let mut module = JITModule::new(builder);
     let mut request = module.make_signature();
     request.params.push(AbiParam::new(types::I64));
@@ -816,11 +835,19 @@ fn jit_builder(
     // Ahead of the process's own symbols: what an embedder supplied
     // after this module was set up.
     builder.symbol_lookup_fn(Box::new(crate::late_symbols::lookup));
-    // Made when code first names it.
-    builder.symbol_lookup_fn(Box::new(|name| {
-        (name == crate::osr::OSR_REQUEST_PRESERVING_SYMBOL)
-            .then(preserving_request)
-            .flatten()
+    // Made when code first names it, calling the promotion request this
+    // backend was given if it was given one.
+    let requests = Arc::clone(table);
+    builder.symbol_lookup_fn(Box::new(move |name| {
+        if name != crate::osr::OSR_REQUEST_PRESERVING_SYMBOL {
+            return None;
+        }
+        let given = requests
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(crate::osr::OSR_REQUEST_SYMBOL)
+            .copied();
+        given.map_or_else(preserving_request, preserving_request_for)
     }));
     // Ahead of those, what this backend was given; tried first.
     let table = Arc::clone(table);
@@ -1313,6 +1340,13 @@ impl CraneliftBackend {
         if let Some(symbols) = additional_symbols {
             for (name, ptr) in symbols {
                 builder.symbol(*name, *ptr);
+                // The preserving request looks it up there.
+                if *name == crate::osr::OSR_REQUEST_SYMBOL {
+                    symbol_table
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(name.to_string(), *ptr as usize);
+                }
             }
         }
 
