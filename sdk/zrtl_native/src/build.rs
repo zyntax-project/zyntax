@@ -201,6 +201,19 @@ mod tests {
     }
 
     #[test]
+    fn linux_moves_llvm_initializers_into_their_own_section() {
+        let dir = scratch("deferred_linux");
+        let args = deferred_initializer_link_args("linux", &dir).unwrap();
+        assert_eq!(args.len(), 2);
+        let script = std::fs::read_to_string(dir.join("deferred_initializers.ld")).unwrap();
+        assert!(script.contains(DEFERRED_INITIALIZERS_SECTION));
+        assert!(script.contains("INSERT BEFORE .init_array"));
+        for os in ["macos", "windows", "freebsd"] {
+            assert!(deferred_initializer_link_args(os, &dir).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn macos_links_with_chained_fixups() {
         let dir = scratch("startup_macos");
         assert_eq!(
