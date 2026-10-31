@@ -403,6 +403,11 @@ impl Snapshot {
         variants: &[Extent],
         name: &str,
     ) {
+        // Without code there is nothing to check the environment for, and
+        // reading it allocates.
+        if variants.is_empty() {
+            return;
+        }
         let declined = if std::env::var_os("ZYNTAX_DISABLE_PORTABLE_CODE").is_some() {
             Some("ZYNTAX_DISABLE_PORTABLE_CODE is set")
         } else if !portable_code_allowed() {
