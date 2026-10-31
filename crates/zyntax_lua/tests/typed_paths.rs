@@ -1,6 +1,7 @@
 //! Method and field calls on shaped receivers take their typed paths:
 //! a program under `typed_paths/` run by the interpreter tier calls no
-//! library function that looks a callee up or calls through a value.
+//! library function that looks a callee up or calls through a value,
+//! and calls each function it names.
 
 use std::path::Path;
 use std::process::Command;
@@ -42,7 +43,7 @@ fn traced(name: &str) -> (String, Vec<String>) {
     (String::from_utf8_lossy(&output.stdout).into_owned(), calls)
 }
 
-fn assert_typed(name: &str, expected: &str, finder: &str, allowed: &[&str]) {
+fn assert_typed(name: &str, expected: &str, called: &[&str], allowed: &[&str]) {
     let (stdout, calls) = traced(name);
     assert_eq!(stdout.trim(), expected, "{name}");
     let denied: Vec<&String> = calls
@@ -50,23 +51,39 @@ fn assert_typed(name: &str, expected: &str, finder: &str, allowed: &[&str]) {
         .filter(|c| DENIED.iter().any(|d| c.contains(d) && !allowed.contains(d)))
         .collect();
     assert!(denied.is_empty(), "{name} called {denied:?}");
-    assert!(
-        calls.iter().any(|c| c.contains(finder)),
-        "{name} never called a {finder} finder: {calls:?}"
+    for callee in called {
+        assert!(
+            calls.iter().any(|c| c.contains(callee)),
+            "{name} never called {callee}: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn inherited_methods_are_called_directly() {
+    assert_typed(
+        "method_call.lua",
+        "true",
+        &[
+            "$Toggle$value$",
+            "$Toggle$activate$",
+            "$NthToggle$activate$",
+        ],
+        SETMETATABLE_ON_SLOTS,
     );
 }
 
 #[test]
-fn inherited_methods_are_called_by_which_end_the_lookup_takes() {
-    assert_typed("method_call.lua", "true", "$which$", SETMETATABLE_ON_SLOTS);
-}
-
-#[test]
 fn own_and_inherited_methods_are_called_directly() {
-    assert_typed("probe_own.lua", "21", "$which$", &[]);
+    assert_typed("probe_own.lua", "21", &["$anon$", "$Base$twice$"], &[]);
 }
 
 #[test]
 fn a_class_table_field_is_called_directly() {
-    assert_typed("field_call.lua", "12", "$which$", &[]);
+    assert_typed("field_call.lua", "12", &["$Point$sum$"], &[]);
+}
+
+#[test]
+fn a_class_a_function_makes_is_called_by_which_end_the_lookup_takes() {
+    assert_typed("class_factory.lua", "6", &["$which$", "$C$get$"], &[]);
 }
