@@ -3103,6 +3103,14 @@ pub struct SymbolEntry {
 unsafe impl Send for SymbolEntry {}
 unsafe impl Sync for SymbolEntry {}
 
+/// Symbols every interpreter bound the same way shares, made by the
+/// first lookup: a run that interprets no call to a symbol never builds
+/// the table.
+pub type SharedSymbols = std::sync::LazyLock<
+    HashMap<String, SymbolEntry>,
+    Box<dyn FnOnce() -> HashMap<String, SymbolEntry> + Send>,
+>;
+
 #[derive(Debug)]
 pub enum InterpError {
     UndefinedSsaValue(HirId),
@@ -3149,6 +3157,9 @@ struct SourceBody {
 
 pub struct HirInterpreter {
     symbols: HashMap<String, SymbolEntry>,
+    /// Looked up before `symbols`, which then holds only what this
+    /// interpreter registered or resolved itself.
+    shared_symbols: Option<std::sync::Arc<SharedSymbols>>,
     pub profile: IdMap<ProfileSample>,
     memory: Memory,
     /// Per-HIR-function compiled bytecode cache. First call to a fn
@@ -3332,6 +3343,7 @@ impl HirInterpreter {
     pub fn new() -> Self {
         Self {
             symbols: HashMap::new(),
+            shared_symbols: None,
             profile: IdMap::default(),
             memory: Memory::new(),
             cache: IdMap::default(),
@@ -3445,10 +3457,31 @@ impl HirInterpreter {
     /// thread-local store that `_zyntax_call_extern_*` exports
     /// dispatch through.
     pub fn symbol_table_snapshot(&self) -> Vec<(String, *const u8, u8)> {
-        self.symbols
+        let shared = self.shared_symbols.as_deref().map(|s| &**s);
+        let own = self
+            .symbols
             .iter()
+            .filter(|(name, _)| !shared.is_some_and(|s| s.contains_key(*name)));
+        shared
+            .into_iter()
+            .flatten()
+            .chain(own)
             .map(|(name, entry)| (name.clone(), entry.ptr, entry.param_count))
             .collect()
+    }
+
+    /// Look symbols up in `shared` ahead of those registered here.
+    pub fn share_symbols(&mut self, shared: std::sync::Arc<SharedSymbols>) {
+        self.shared_symbols = Some(shared);
+    }
+
+    /// The symbol `name`, shared or registered here.
+    fn symbol(&self, name: &str) -> Option<SymbolEntry> {
+        self.shared_symbols
+            .as_deref()
+            .and_then(|shared| shared.get(name))
+            .or_else(|| self.symbols.get(name))
+            .copied()
     }
 
     /// Register a per-function tick callback. Invoked on every entry to
@@ -3636,8 +3669,7 @@ impl HirInterpreter {
                 let name = name.strip_prefix('$').unwrap_or(&name).to_string();
                 (!name.is_empty())
                     .then(|| {
-                        self.symbols
-                            .get(&format!("${name}$to_string"))
+                        self.symbol(&format!("${name}$to_string"))
                             .map(|e| e.ptr as i64)
                     })
                     .flatten()
@@ -3967,7 +3999,7 @@ impl HirInterpreter {
                     .clone()
                     .or_else(|| func.name.resolve_global())
                     .ok_or_else(|| InterpError::UnknownFunction(format!("{:?}", func_id)))?;
-                let entry = match self.symbols.get(&name).copied() {
+                let entry = match self.symbol(&name) {
                     Some(e) => e,
                     None => {
                         // A symbol nothing registered is the process's own,
@@ -4383,7 +4415,7 @@ impl HirInterpreter {
         let resolved_symbols: Vec<Option<SymbolEntry>> = cf
             .symbol_pool
             .iter()
-            .map(|name| self.symbols.get(name).copied())
+            .map(|name| self.symbol(name))
             .collect();
 
         let mut pc: usize = 0;
@@ -5331,9 +5363,7 @@ impl HirInterpreter {
                     let mut boxes: Vec<*mut u8> = Vec::new();
                     if let Some(f) = callee.filter(|f| f.is_external) {
                         let link = f.link_name.clone().or_else(|| f.name.resolve_global());
-                        if let Some(sig) =
-                            link.and_then(|n| self.symbols.get(&n)).and_then(|e| e.sig)
-                        {
+                        if let Some(sig) = link.and_then(|n| self.symbol(&n)).and_then(|e| e.sig) {
                             let arg_types: Vec<HirType> = arg_regs
                                 .iter()
                                 .map(|r| cf.reg_types[*r as usize].clone())
@@ -5397,7 +5427,7 @@ impl HirInterpreter {
                             Some(e) => e,
                             None => {
                                 let name = &cf.symbol_pool[sym_idx];
-                                match self.symbols.get(name).copied() {
+                                match self.symbol(name) {
                                     Some(e) => e,
                                     None => {
                                         let ptr = crate::late_symbols::lookup(name)

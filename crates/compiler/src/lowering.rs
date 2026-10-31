@@ -2969,10 +2969,11 @@ impl LoweringContext {
 
     /// Lower a declaration
     fn lower_declaration(&mut self, decl: &TypedNode<TypedDeclaration>) -> CompilerResult<()> {
-        let timing = std::env::var_os("ZYNTAX_TRACE_LOWER_DECLS").is_some();
-        let started = web_time::Instant::now();
+        static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let timing = *TIMING.get_or_init(|| std::env::var_os("ZYNTAX_TRACE_LOWER_DECLS").is_some());
+        let started = timing.then(web_time::Instant::now);
         let result = self.lower_declaration_inner(decl);
-        if timing {
+        if let Some(started) = started {
             let (kind, name) = match &decl.node {
                 TypedDeclaration::Function(f) => {
                     ("function", f.name.resolve_global().unwrap_or_default())

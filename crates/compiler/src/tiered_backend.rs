@@ -3133,17 +3133,9 @@ impl TieredBackend {
         self.functions.get(&func_id).map(|e| Arc::clone(&e.module))
     }
 
-    /// Runtime symbols and native global slots used by interpreted code.
-    pub fn interpreter_bindings(&self) -> (Vec<(String, *const u8)>, Vec<(HirId, *mut u8)>) {
-        let symbols = self
-            .runtime_symbols
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| (s.name.clone(), s.ptr as *const u8))
-            .collect();
-        let globals = self
-            .loaded_modules()
+    /// The native global slots interpreted code reads and writes.
+    pub fn interpreter_globals(&self) -> Vec<(HirId, *mut u8)> {
+        self.loaded_modules()
             .into_iter()
             .flat_map(|m| m.globals.keys().copied())
             .filter_map(|id| {
@@ -3151,8 +3143,7 @@ impl TieredBackend {
                     .with_lock(|be| be.global_data_addr(id))
                     .map(|(ptr, _)| (id, ptr as *mut u8))
             })
-            .collect();
-        (symbols, globals)
+            .collect()
     }
 
     /// The native slot and size of each loaded module's error-flag global
@@ -3289,23 +3280,32 @@ impl TieredBackend {
     /// runtime's interpreter and into those native calls enter.
     pub fn interpreter_binding(
         &self,
-        typed: &HashMap<String, crate::zrtl::ZrtlSymbolSig>,
+        typed: Arc<HashMap<String, crate::zrtl::ZrtlSymbolSig>>,
         ticks: impl IntoIterator<Item = HirId>,
     ) -> InterpreterBinding {
-        let (symbols, globals) = self.interpreter_bindings();
+        use crate::hir_interp::SymbolEntry;
+        let registered = Arc::clone(&self.runtime_symbols);
+        let symbols: Box<dyn FnOnce() -> HashMap<String, SymbolEntry> + Send> =
+            Box::new(move || {
+                let registered = registered.read().unwrap_or_else(|e| e.into_inner());
+                registered
+                    .iter()
+                    .map(|s| {
+                        let sig = typed.get(&s.name).copied();
+                        let entry = SymbolEntry {
+                            ptr: s.ptr as *const u8,
+                            param_count: sig.map_or(0, |sig| sig.param_count),
+                            sig,
+                        };
+                        (s.name.clone(), entry)
+                    })
+                    .collect()
+            });
         InterpreterBinding {
             parts: Arc::new(self.binding_parts()),
-            symbols: Arc::new(
-                symbols
-                    .into_iter()
-                    .map(|(name, ptr)| {
-                        let sig = typed.get(&name).copied();
-                        (name, ptr as usize, sig)
-                    })
-                    .collect(),
-            ),
+            symbols: Arc::new(std::sync::LazyLock::new(symbols)),
             globals: Arc::new(
-                globals
+                self.interpreter_globals()
                     .into_iter()
                     .map(|(id, ptr)| (id, ptr as usize))
                     .collect(),
@@ -5976,7 +5976,7 @@ impl BindingParts {
 #[derive(Clone)]
 pub struct InterpreterBinding {
     parts: Arc<BindingParts>,
-    symbols: Arc<Vec<(String, usize, Option<crate::zrtl::ZrtlSymbolSig>)>>,
+    symbols: Arc<crate::hir_interp::SharedSymbols>,
     globals: Arc<Vec<(HirId, usize)>>,
     ticks: Arc<Vec<HirId>>,
 }
@@ -5984,12 +5984,7 @@ pub struct InterpreterBinding {
 impl InterpreterBinding {
     /// Give `interp` every symbol, global slot and callback.
     pub fn bind(&self, interp: &mut crate::hir_interp::HirInterpreter) {
-        for (name, ptr, sig) in self.symbols.iter() {
-            match sig {
-                Some(sig) => interp.register_symbol_typed(name.clone(), *ptr as *const u8, *sig),
-                None => interp.register_symbol(name.clone(), *ptr as *const u8, 0),
-            }
-        }
+        interp.share_symbols(Arc::clone(&self.symbols));
         for (id, ptr) in self.globals.iter() {
             interp.bind_global_slot(*id, *ptr as *mut u8);
         }

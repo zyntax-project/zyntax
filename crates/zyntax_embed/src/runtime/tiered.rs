@@ -135,7 +135,7 @@ pub struct TieredRuntime {
     extension_map: HashMap<String, String>,
     /// Plugin signatures (symbol name -> ZRTL signature)
     /// Collected from loaded plugins for proper extern function type checking
-    plugin_signatures: HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>,
+    plugin_signatures: Arc<HashMap<String, zyntax_compiler::zrtl::ZrtlSymbolSig>>,
     /// Plugins whose symbols have been registered.
     ///
     /// Registration hands out raw pointers into the plugin's library, so the
@@ -525,7 +525,7 @@ impl TieredRuntime {
             config,
             grammars: HashMap::new(),
             extension_map: HashMap::new(),
-            plugin_signatures: HashMap::new(),
+            plugin_signatures: Arc::default(),
             loaded_plugins: Vec::new(),
             run_interp_opts: true,
             automatic_release: false,
@@ -861,9 +861,10 @@ impl TieredRuntime {
         // code, which holds the interpreter. Such a chunk is entered by
         // native pointer and runs natively, so it needs no binding, and
         // its constants are initialised natively too.
-        let binding = self
-            .backend
-            .interpreter_binding(&self.plugin_signatures, self.function_ids.values().copied());
+        let binding = self.backend.interpreter_binding(
+            Arc::clone(&self.plugin_signatures),
+            self.function_ids.values().copied(),
+        );
         // Calls native code makes before a function has code run in
         // interpreters bound the same way, the chunk's functions included.
         binding.serve_native_calls();
@@ -1220,7 +1221,7 @@ impl TieredRuntime {
 
             // Store signature if available
             if let Some(sig) = symbol_info.sig {
-                self.plugin_signatures
+                Arc::make_mut(&mut self.plugin_signatures)
                     .insert(symbol_info.name.to_string(), sig);
             }
         }
@@ -1283,7 +1284,7 @@ impl TieredRuntime {
         self.backend.register_runtime_symbols(&pairs);
         for sym in &runtime_symbols {
             if let Some(sig) = sym.sig {
-                self.plugin_signatures.insert(sym.name.to_string(), sig);
+                Arc::make_mut(&mut self.plugin_signatures).insert(sym.name.to_string(), sig);
             }
         }
         self.backend.register_symbol_signatures(&runtime_symbols);
@@ -1473,7 +1474,7 @@ impl TieredRuntime {
 
             // Store signature if available
             if let Some(sig) = symbol_info.sig {
-                self.plugin_signatures
+                Arc::make_mut(&mut self.plugin_signatures)
                     .insert(symbol_info.name.to_string(), sig);
             }
         }
@@ -1678,7 +1679,7 @@ impl TieredRuntime {
         sig: zyntax_compiler::zrtl::ZrtlSymbolSig,
     ) {
         self.backend.register_runtime_symbol(name, ptr);
-        self.plugin_signatures.insert(name.to_string(), sig);
+        Arc::make_mut(&mut self.plugin_signatures).insert(name.to_string(), sig);
         let info = zyntax_compiler::zrtl::RuntimeSymbolInfo {
             name,
             ptr,
@@ -1992,9 +1993,10 @@ impl TieredRuntime {
     /// a reload or a rollback replaces. Skipped while the interpreter
     /// is running, as at load.
     fn rebind_interpreter_ticks(&self) {
-        let binding = self
-            .backend
-            .interpreter_binding(&self.plugin_signatures, self.function_ids.values().copied());
+        let binding = self.backend.interpreter_binding(
+            Arc::clone(&self.plugin_signatures),
+            self.function_ids.values().copied(),
+        );
         binding.serve_native_calls();
         let Ok(mut interp) = self.interpreter.try_lock() else {
             return;

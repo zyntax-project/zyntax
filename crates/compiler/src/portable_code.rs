@@ -172,8 +172,9 @@ pub struct PortableCode {
 
 impl PortableCode {
     /// The code as an image carries it, read by [`PortableImage`]: the
-    /// target and imports, an index of the functions and one of the
-    /// callees by id, then each function and callee encoded on its own.
+    /// target, an index of the functions and one of the callees by id,
+    /// one of the imports in name order, then each function, callee and
+    /// import encoded on its own.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let encoded = |e: postcard::Error| e.to_string();
         let mut blobs = Vec::new();
@@ -200,14 +201,24 @@ impl PortableCode {
             .map(|c| Ok((c.id, postcard::to_allocvec(c).map_err(encoded)?)))
             .collect::<Result<Vec<_>, String>>()?;
         callees.sort_by_key(|(id, _)| *id);
+        let mut imports: Vec<&PortableImport> = self.imports.iter().collect();
+        imports.sort_by(|a, b| a.name.cmp(&b.name));
+        let imports = imports
+            .into_iter()
+            .enumerate()
+            .map(|(at, i)| Ok((at as u32, postcard::to_allocvec(i).map_err(encoded)?)))
+            .collect::<Result<Vec<_>, String>>()?;
         let functions = table(functions, &mut blobs);
         let callees = table(callees, &mut blobs);
-        let header = postcard::to_allocvec(&(&self.target, &self.imports)).map_err(encoded)?;
-        let mut out = Vec::with_capacity(4 + header.len() + functions.len() + callees.len());
+        let imports = table(imports, &mut blobs);
+        let header = postcard::to_allocvec(&self.target).map_err(encoded)?;
+        let mut out =
+            Vec::with_capacity(4 + header.len() + functions.len() + callees.len() + imports.len());
         out.extend_from_slice(&(header.len() as u32).to_le_bytes());
         out.extend_from_slice(&header);
         out.extend_from_slice(&functions);
         out.extend_from_slice(&callees);
+        out.extend_from_slice(&imports);
         out.extend_from_slice(&blobs);
         Ok(out)
     }
@@ -242,6 +253,7 @@ pub struct PortableImage {
     header: std::ops::Range<usize>,
     functions: std::ops::Range<usize>,
     callees: std::ops::Range<usize>,
+    imports: std::ops::Range<usize>,
     blobs: usize,
 }
 
@@ -257,32 +269,51 @@ impl PortableImage {
         let header = 4..4 + word(0)?;
         let functions = header.end + 4..header.end + 4 + word(header.end)? * INDEX_ENTRY;
         let callees = functions.end + 4..functions.end + 4 + word(functions.end)? * INDEX_ENTRY;
-        if callees.end > bytes.len() {
+        let imports = callees.end + 4..callees.end + 4 + word(callees.end)? * INDEX_ENTRY;
+        if imports.end > bytes.len() {
             return Err("portable code is truncated".into());
         }
         Ok(Self {
-            blobs: callees.end,
+            blobs: imports.end,
             bytes,
             header,
             functions,
             callees,
+            imports,
         })
     }
 
     /// What the code was compiled under.
     pub fn target(&self) -> Result<PortableTarget, String> {
-        postcard::take_from_bytes(&self.bytes[self.header.clone()])
-            .map(|(target, _)| target)
-            .map_err(|e| e.to_string())
+        postcard::from_bytes(&self.bytes[self.header.clone()]).map_err(|e| e.to_string())
     }
 
-    /// The runtime functions the code calls.
-    pub fn imports(&self) -> Result<Vec<PortableImport>, String> {
-        postcard::from_bytes::<(PortableTarget, Vec<PortableImport>)>(
-            &self.bytes[self.header.clone()],
-        )
-        .map(|(_, imports)| imports)
-        .map_err(|e| e.to_string())
+    /// The runtime function `name` the code calls, when it calls it. Only
+    /// the names a search passes are read, and only the entry found is
+    /// decoded.
+    pub fn import(&self, name: &str) -> Option<Result<PortableImport, String>> {
+        let (mut lo, mut hi) = (0, self.imports.len() / INDEX_ENTRY);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let [_, start, len] = self.entry(&self.imports, mid);
+            let start = self.blobs + start as usize;
+            let Some(bytes) = self.bytes.get(start..start + len as usize) else {
+                return Some(Err("portable code is truncated".into()));
+            };
+            // An import is encoded name first.
+            let at = match postcard::take_from_bytes::<&str>(bytes) {
+                Ok((at, _)) => at,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            match at.cmp(name) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    return Some(postcard::from_bytes(bytes).map_err(|e| e.to_string()));
+                }
+            }
+        }
+        None
     }
 
     /// The ids of the functions the image holds code for, in order.

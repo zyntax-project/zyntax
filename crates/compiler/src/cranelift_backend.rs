@@ -1017,10 +1017,6 @@ impl CraneliftBackend {
         // The signature each runtime function is called with, read back
         // for the imports placed code calls; `None` for one this compiler
         // cannot read.
-        let imported = match placing.code.imports() {
-            Ok(imported) => imported,
-            Err(e) => return decline(format!("the imports do not decode: {e}")),
-        };
         let called: HashSet<&str> = placeable
             .iter()
             .flat_map(|f| &f.relocs)
@@ -1029,11 +1025,15 @@ impl CraneliftBackend {
                 _ => None,
             })
             .collect();
-        let import_signatures: Vec<(&str, Option<cranelift_codegen::ir::Signature>)> = imported
-            .iter()
-            .filter(|i| called.contains(i.name.as_str()))
-            .map(|i| (i.name.as_str(), i.signature.signature()))
-            .collect();
+        let mut import_signatures: Vec<(&str, Option<cranelift_codegen::ir::Signature>)> =
+            Vec::with_capacity(called.len());
+        for name in called {
+            match placing.code.import(name) {
+                Some(Ok(import)) => import_signatures.push((name, import.signature.signature())),
+                Some(Err(e)) => return decline(format!("import {name} does not decode: {e}")),
+                None => {}
+            }
+        }
         let imports: HashMap<&str, Option<&cranelift_codegen::ir::Signature>> = import_signatures
             .iter()
             .map(|(name, signature)| (*name, signature.as_ref()))
@@ -1506,6 +1506,7 @@ impl CraneliftBackend {
 
     /// Compile a HIR module to native code
     pub fn compile_module(&mut self, module: &HirModule) -> CompilerResult<()> {
+        let trace_skip = std::env::var_os("ZYNTAX_TRACE_CRANELIFT_SKIP").is_some();
         // Dump HIR if ZYNTAX_DUMP_HIR is set
         if std::env::var("ZYNTAX_DUMP_HIR").is_ok() {
             let dump = crate::hir_dump::dump_module(module);
@@ -1549,7 +1550,7 @@ impl CraneliftBackend {
             if placed.contains(id) {
                 continue;
             }
-            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+            if trace_skip {
                 eprintln!(
                     "[pass2] {:?} {} external={}",
                     id,
@@ -1574,7 +1575,7 @@ impl CraneliftBackend {
                 }
                 // Skip functions that fail to compile (e.g., signature mismatches with ZRTL)
                 let body_result = self.compile_function_body(*id, function, module);
-                if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                if trace_skip {
                     eprintln!("[pass2] {:?} result_err={}", id, body_result.is_err());
                 }
                 if let Err(e) = body_result {
@@ -1588,13 +1589,13 @@ impl CraneliftBackend {
                         CRANELIFT_DECLINED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                         self.declined_functions.insert(*id);
                         log::debug!("[CRANELIFT] Declining function '{}': {}", name, e);
-                        if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                        if trace_skip {
                             eprintln!("[CRANELIFT-DECLINE] '{name}': {e}");
                         }
                     } else {
                         CRANELIFT_SKIPPED_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
                         log::debug!("[CRANELIFT] Skipping function '{}': {:?}", function.name, e);
-                        if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+                        if trace_skip {
                             eprintln!("[CRANELIFT-SKIP] '{name}': {e:?}");
                         }
                     }
@@ -1642,7 +1643,7 @@ impl CraneliftBackend {
             let code_ptr = self
                 .module
                 .get_finalized_function(compiled_func.function_id);
-            if std::env::var("ZYNTAX_TRACE_CRANELIFT_SKIP").is_ok() {
+            if trace_skip {
                 eprintln!("[ptrs] {hir_id:?} -> {code_ptr:?}");
             }
             self.address_owners.insert(code_ptr as usize, *hir_id);
