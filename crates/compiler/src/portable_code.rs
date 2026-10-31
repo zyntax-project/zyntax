@@ -354,7 +354,7 @@ impl PortableImage {
     /// The runtime function `name` the code calls, when it calls it. Only
     /// the names a search passes are read, and only the entry found is
     /// decoded.
-    pub fn import(&self, name: &str) -> Option<Result<PortableImport, String>> {
+    pub fn import(&self, name: &str) -> Option<Result<PortableImportRef<'_>, String>> {
         let (mut lo, mut hi) = (0, self.imports.len() / INDEX_ENTRY);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -483,49 +483,110 @@ impl PortableSignature {
     /// The Cranelift signature, or `None` for a part this compiler does
     /// not know.
     pub fn signature(&self) -> Option<cranelift_codegen::ir::Signature> {
-        use cranelift_codegen::ir::{AbiParam, ArgumentExtension, types};
-        let scalars = [
-            types::I8,
-            types::I16,
-            types::I32,
-            types::I64,
-            types::I128,
-            types::F16,
-            types::F32,
-            types::F64,
-            types::F128,
-        ];
-        let value_type = |name: &str| {
-            let (lane, lanes) = match name.split_once('x') {
-                Some((lane, lanes)) => (lane, lanes.parse::<u32>().ok()?),
-                None => (name, 1),
-            };
-            let lane = scalars.into_iter().find(|t| t.to_string() == lane)?;
-            if lanes == 1 {
-                Some(lane)
-            } else {
-                lane.by(lanes)
-            }
-        };
-        let param = |p: &PortableParam| {
-            let extension = match p.extension.as_str() {
-                "" => ArgumentExtension::None,
-                "uext" => ArgumentExtension::Uext,
-                "sext" => ArgumentExtension::Sext,
-                _ => return None,
-            };
-            Some(AbiParam {
-                value_type: value_type(&p.value_type)?,
-                purpose: p.purpose.parse().ok()?,
-                extension,
-            })
-        };
-        Some(cranelift_codegen::ir::Signature {
-            params: self.params.iter().map(param).collect::<Option<_>>()?,
-            returns: self.returns.iter().map(param).collect::<Option<_>>()?,
-            call_conv: self.call_conv.parse().ok()?,
-        })
+        fn part(p: &PortableParam) -> (&str, &str, &str) {
+            (&p.value_type, &p.extension, &p.purpose)
+        }
+        read_signature(
+            self.params.iter().map(part),
+            self.returns.iter().map(part),
+            &self.call_conv,
+        )
     }
+}
+
+/// [`PortableSignature`] read in place.
+#[derive(Debug, Deserialize)]
+pub struct PortableSignatureRef<'a> {
+    #[serde(borrow)]
+    pub params: Vec<PortableParamRef<'a>>,
+    #[serde(borrow)]
+    pub returns: Vec<PortableParamRef<'a>>,
+    pub call_conv: &'a str,
+}
+
+/// [`PortableParam`] read in place.
+#[derive(Debug, Deserialize)]
+pub struct PortableParamRef<'a> {
+    pub value_type: &'a str,
+    pub extension: &'a str,
+    pub purpose: &'a str,
+}
+
+/// [`PortableImport`] read in place.
+#[derive(Debug, Deserialize)]
+pub struct PortableImportRef<'a> {
+    pub name: &'a str,
+    #[serde(borrow)]
+    pub signature: PortableSignatureRef<'a>,
+}
+
+#[cfg(feature = "cranelift-backend")]
+impl PortableSignatureRef<'_> {
+    /// See [`PortableSignature::signature`].
+    pub fn signature(&self) -> Option<cranelift_codegen::ir::Signature> {
+        fn part<'a>(p: &PortableParamRef<'a>) -> (&'a str, &'a str, &'a str) {
+            (p.value_type, p.extension, p.purpose)
+        }
+        read_signature(
+            self.params.iter().map(part),
+            self.returns.iter().map(part),
+            self.call_conv,
+        )
+    }
+}
+
+/// A Cranelift signature from its parts as Cranelift prints them: each
+/// parameter's value type, extension and purpose, and the calling
+/// convention; `None` for a part this compiler does not know.
+#[cfg(feature = "cranelift-backend")]
+fn read_signature<'a>(
+    params: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    returns: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    call_conv: &str,
+) -> Option<cranelift_codegen::ir::Signature> {
+    use cranelift_codegen::ir::{AbiParam, ArgumentExtension, types};
+    let value_type = |name: &str| {
+        let (lane, lanes) = match name.split_once('x') {
+            Some((lane, lanes)) => (lane, lanes.parse::<u32>().ok()?),
+            None => (name, 1),
+        };
+        // The names Cranelift prints its scalar types by.
+        let lane = match lane {
+            "i8" => types::I8,
+            "i16" => types::I16,
+            "i32" => types::I32,
+            "i64" => types::I64,
+            "i128" => types::I128,
+            "f16" => types::F16,
+            "f32" => types::F32,
+            "f64" => types::F64,
+            "f128" => types::F128,
+            _ => return None,
+        };
+        if lanes == 1 {
+            Some(lane)
+        } else {
+            lane.by(lanes)
+        }
+    };
+    let param = |(value, extension, purpose): (&str, &str, &str)| {
+        let extension = match extension {
+            "" => ArgumentExtension::None,
+            "uext" => ArgumentExtension::Uext,
+            "sext" => ArgumentExtension::Sext,
+            _ => return None,
+        };
+        Some(AbiParam {
+            value_type: value_type(value)?,
+            purpose: purpose.parse().ok()?,
+            extension,
+        })
+    };
+    Some(cranelift_codegen::ir::Signature {
+        params: params.map(param).collect::<Option<_>>()?,
+        returns: returns.map(param).collect::<Option<_>>()?,
+        call_conv: call_conv.parse().ok()?,
+    })
 }
 
 /// A function portable code calls or takes the address of.
@@ -704,5 +765,36 @@ mod tests {
         assert!(image.import("imp").unwrap().is_ok());
         assert!(image.import("missing").is_none());
         assert!(image.function(2).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "cranelift-backend"))]
+mod signature_tests {
+    use super::*;
+    use cranelift_codegen::ir::{AbiParam, ArgumentExtension, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+
+    #[test]
+    fn signatures_read_back_as_written() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        for ty in [
+            types::I8,
+            types::I16,
+            types::I32,
+            types::I64,
+            types::I128,
+            types::F16,
+            types::F32,
+            types::F64,
+            types::F128,
+            types::I32X4,
+            types::F64X2,
+        ] {
+            sig.params.push(AbiParam::new(ty));
+        }
+        sig.params.push(AbiParam::new(types::I8).uext());
+        sig.params[0].extension = ArgumentExtension::Sext;
+        sig.returns.push(AbiParam::new(types::F64));
+        assert_eq!(PortableSignature::of(&sig).signature(), Some(sig));
     }
 }

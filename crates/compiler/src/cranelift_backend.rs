@@ -969,13 +969,17 @@ impl CraneliftBackend {
         };
         let trace = std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some();
         let here = |raw: u32| HirId::from_raw(raw.wrapping_add(placing.id_base));
-        let signature_of = |be: &Self, id: HirId| {
+        // Each declared signature's text, made once however many
+        // functions share it.
+        let mut signature_texts: std::collections::HashMap<Signature, String> =
+            std::collections::HashMap::new();
+        let mut signature_of = |be: &Self, id: HirId| {
             be.function_map.get(&id).map(|f| {
-                be.module
-                    .declarations()
-                    .get_function_decl(*f)
-                    .signature
-                    .to_string()
+                let signature = &be.module.declarations().get_function_decl(*f).signature;
+                signature_texts
+                    .entry(signature.clone())
+                    .or_insert_with(|| signature.to_string())
+                    .clone()
             })
         };
         let decline = |why: String| {
@@ -1002,8 +1006,11 @@ impl CraneliftBackend {
                 None => {}
             }
         }
-        let placeable: Vec<&crate::portable_code::PortableFunctionRef> =
-            functions.iter().filter(|f| self.symbols_agree(f)).collect();
+        let mut symbol_texts = std::collections::HashMap::new();
+        let placeable: Vec<&crate::portable_code::PortableFunctionRef> = functions
+            .iter()
+            .filter(|f| self.symbols_agree(f, &mut symbol_texts))
+            .collect();
         let placing_ids: std::collections::HashSet<HirId> =
             placeable.iter().map(|f| here(f.id)).collect();
         let named = |raw: u32| {
@@ -1131,15 +1138,17 @@ impl CraneliftBackend {
         let symbols = self.symbol_table.read().unwrap_or_else(|e| e.into_inner());
         let mut bound: Vec<Vec<(usize, u64)>> = Vec::with_capacity(placeable.len());
         let mut relocs: Vec<Vec<ModuleReloc>> = Vec::with_capacity(placeable.len());
+        // A callee's cell, looked up once however many calls name it.
+        let mut cells: HashMap<u32, usize> = HashMap::default();
         for f in &placeable {
             let mut values = Vec::new();
             let mut module_relocs = Vec::new();
             for reloc in &f.relocs {
                 let bead = |raw: u32| self.bead_ids.get(&here(raw)).copied();
                 let value: Option<usize> = match &reloc.anchor {
-                    CodeAnchor::Cell(raw) => {
-                        Some(crate::reload::call_cell_addr(self.reload_key, here(*raw)))
-                    }
+                    CodeAnchor::Cell(raw) => Some(*cells.entry(*raw).or_insert_with(|| {
+                        crate::reload::call_cell_addr(self.reload_key, here(*raw))
+                    })),
                     CodeAnchor::EntryCounter(raw) => {
                         bead(*raw).map(|b| crate::osr::entry_counter_addr(b) as usize)
                     }
@@ -8219,11 +8228,20 @@ impl CraneliftBackend {
 
     /// Whether the runtime symbols `function` was compiled against are
     /// registered here as they were there.
-    fn symbols_agree(&self, function: &crate::portable_code::PortableFunctionRef) -> bool {
+    fn symbols_agree<'a>(
+        &self,
+        function: &crate::portable_code::PortableFunctionRef<'a>,
+        texts: &mut std::collections::HashMap<&'a str, String>,
+    ) -> bool {
         let differs = function.symbols.iter().find(|(name, found)| match *found {
             "present" => !self.runtime_symbol_names.contains(*name),
             "absent" => self.runtime_symbol_names.contains(*name),
-            signature => self.symbol_signature_text(name) != signature,
+            signature => {
+                *texts
+                    .entry(name)
+                    .or_insert_with(|| self.symbol_signature_text(name))
+                    != signature
+            }
         });
         if let Some((name, found)) = differs
             && std::env::var_os("ZYNTAX_TRACE_PORTABLE").is_some()
