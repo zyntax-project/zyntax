@@ -4772,28 +4772,50 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 },
                 &mut pre,
             );
-            let is_class = binary(
-                BinaryOp::And,
-                binary(
+            // A handler stored where every path here has run needs no
+            // presence test; a table whose one metatable is this class
+            // from birth on needs only to be a table.
+            let known = self.known_present(class, event);
+            let only_class = match operand.ty {
+                Ty::Shape(k) => {
+                    let inferred = self.m.inferred;
+                    inferred.meta_never_nil(k)
+                        && inferred.shape(k).classes.iter().eq(std::iter::once(&class))
+                }
+                _ => false,
+            };
+            let ok = if known && only_class {
+                not_null(&operand.node)
+            } else {
+                let shape_is = binary(
                     BinaryOp::Eq,
                     field(meta.node.clone(), "shape", i64_t.clone(), span),
                     int_lit(layout.gid, span),
                     bool_t.clone(),
                     span,
-                ),
-                self.slot_present(&meta.node, &slot, span),
-                bool_t.clone(),
-                span,
-            );
-            let ok = self.hold(
-                Val {
-                    node: if_value(
-                        not_null(&meta.node),
-                        is_class,
-                        bool_lit(false, span),
+                );
+                let is_class = if known {
+                    shape_is
+                } else {
+                    binary(
+                        BinaryOp::And,
+                        shape_is,
+                        self.slot_present(&meta.node, &slot, span),
                         bool_t.clone(),
                         span,
-                    ),
+                    )
+                };
+                if_value(
+                    not_null(&meta.node),
+                    is_class,
+                    bool_lit(false, span),
+                    bool_t.clone(),
+                    span,
+                )
+            };
+            let ok = self.hold(
+                Val {
+                    node: ok,
                     ty: Ty::Bool,
                 },
                 &mut pre,

@@ -1,0 +1,3 @@
+6	-1	2
+false	mixed_handlers.lua:11: attempt to perform arithmetic on a table value (upvalue 'd')
+8

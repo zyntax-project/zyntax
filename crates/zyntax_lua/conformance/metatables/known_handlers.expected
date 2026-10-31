@@ -1,0 +1,5 @@
+false	known_handlers.lua:7: attempt to perform arithmetic on a table value (upvalue 'a')
+3
+30
+false	known_handlers.lua:13: attempt to perform arithmetic on a table value (upvalue 'acc')
+28
