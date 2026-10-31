@@ -257,10 +257,6 @@ pub fn osr_runtime_symbols() -> Vec<(&'static str, *const u8)> {
         (LAZY_COMPILE_SYMBOL, lazy_compile as *const u8),
         (LAZY_INTERPRET_SYMBOL, lazy_interpret as *const u8),
     ];
-    #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(windows)))]
-    if let Some(name) = OSR_REQUEST_PRESERVING_SYMBOL {
-        symbols.push((name, osr_request_preserving as *const u8));
-    }
     symbols
 }
 
@@ -2985,19 +2981,12 @@ pub fn try_lazy_compile(bead_id: u64) -> *const u8 {
 /// Symbol a compiled function calls once its loop has stayed hot.
 pub const OSR_REQUEST_SYMBOL: &str = "__zyntax_osr_request";
 
-/// The same request made from inside a loop, through
-/// [`osr_request_preserving`]: called with Cranelift's `preserve_all`
-/// convention, it clobbers no register, so the loop's values stay in
-/// registers rather than living on the stack for the one threshold
-/// visit's sake. None on targets without the trampoline.
-pub const OSR_REQUEST_PRESERVING_SYMBOL: Option<&str> = if cfg!(all(
-    any(target_arch = "aarch64", target_arch = "x86_64"),
-    not(windows)
-)) {
-    Some("__zyntax_osr_request_preserving")
-} else {
-    None
-};
+/// The same request made from inside a loop, through the function
+/// `cranelift_backend::preserving_request` compiles: called with
+/// Cranelift's `preserve_all` convention, it clobbers no register, so the
+/// loop's values stay in registers rather than living on the stack for
+/// the one threshold visit's sake.
+pub const OSR_REQUEST_PRESERVING_SYMBOL: &str = "__zyntax_osr_request_preserving";
 
 /// The site a request carries when the frame is at no header: one made
 /// at a function's entry, once it has been called often enough. Not a
@@ -3301,155 +3290,6 @@ pub fn wanted_resume_points(
 #[unsafe(no_mangle)]
 pub extern "C" fn osr_request_promotion(bead_id: u64, site: u64) {
     request(bead_id, Requester::Compiled { site });
-}
-
-/// [`osr_request_promotion`] for a caller that expects every register
-/// back as it left it: the registers the C call may clobber, the full
-/// vector registers among them, are saved around it.
-///
-/// # Safety
-/// Called from generated code with the `preserve_all` convention, the
-/// bead in the first argument register and the site in the second.
-#[cfg(all(target_arch = "aarch64", not(windows)))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn osr_request_preserving(bead_id: u64, site: u64) {
-    // x0 to x18 (x18 is a scratch register on Linux), then q0 to q31.
-    core::arch::naked_asm!(
-        "stp x29, x30, [sp, #-16]!",
-        "mov x29, sp",
-        "sub sp, sp, #672",
-        "stp x0, x1, [sp, #0]",
-        "stp x2, x3, [sp, #16]",
-        "stp x4, x5, [sp, #32]",
-        "stp x6, x7, [sp, #48]",
-        "stp x8, x9, [sp, #64]",
-        "stp x10, x11, [sp, #80]",
-        "stp x12, x13, [sp, #96]",
-        "stp x14, x15, [sp, #112]",
-        "stp x16, x17, [sp, #128]",
-        "str x18, [sp, #144]",
-        "stp q0, q1, [sp, #160]",
-        "stp q2, q3, [sp, #192]",
-        "stp q4, q5, [sp, #224]",
-        "stp q6, q7, [sp, #256]",
-        "stp q8, q9, [sp, #288]",
-        "stp q10, q11, [sp, #320]",
-        "stp q12, q13, [sp, #352]",
-        "stp q14, q15, [sp, #384]",
-        "stp q16, q17, [sp, #416]",
-        "stp q18, q19, [sp, #448]",
-        "stp q20, q21, [sp, #480]",
-        "stp q22, q23, [sp, #512]",
-        "stp q24, q25, [sp, #544]",
-        "stp q26, q27, [sp, #576]",
-        "stp q28, q29, [sp, #608]",
-        "stp q30, q31, [sp, #640]",
-        "bl {request}",
-        "ldp q30, q31, [sp, #640]",
-        "ldp q28, q29, [sp, #608]",
-        "ldp q26, q27, [sp, #576]",
-        "ldp q24, q25, [sp, #544]",
-        "ldp q22, q23, [sp, #512]",
-        "ldp q20, q21, [sp, #480]",
-        "ldp q18, q19, [sp, #448]",
-        "ldp q16, q17, [sp, #416]",
-        "ldp q14, q15, [sp, #384]",
-        "ldp q12, q13, [sp, #352]",
-        "ldp q10, q11, [sp, #320]",
-        "ldp q8, q9, [sp, #288]",
-        "ldp q6, q7, [sp, #256]",
-        "ldp q4, q5, [sp, #224]",
-        "ldp q2, q3, [sp, #192]",
-        "ldp q0, q1, [sp, #160]",
-        "ldr x18, [sp, #144]",
-        "ldp x16, x17, [sp, #128]",
-        "ldp x14, x15, [sp, #112]",
-        "ldp x12, x13, [sp, #96]",
-        "ldp x10, x11, [sp, #80]",
-        "ldp x8, x9, [sp, #64]",
-        "ldp x6, x7, [sp, #48]",
-        "ldp x4, x5, [sp, #32]",
-        "ldp x2, x3, [sp, #16]",
-        "ldp x0, x1, [sp, #0]",
-        "add sp, sp, #672",
-        "ldp x29, x30, [sp], #16",
-        "ret",
-        request = sym osr_request_promotion,
-    )
-}
-
-/// [`osr_request_promotion`] for a caller that expects every register
-/// back as it left it: the System V caller-saved registers, the vector
-/// registers among them, are saved around it.
-///
-/// # Safety
-/// Called from generated code with the `preserve_all` convention, the
-/// bead in `rdi` and the site in `rsi`.
-#[cfg(all(target_arch = "x86_64", not(windows)))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn osr_request_preserving(bead_id: u64, site: u64) {
-    // After the return address and rbp, rsp is 16-byte aligned; nine
-    // words and sixteen vectors, padded to a multiple of 16, keep it so.
-    core::arch::naked_asm!(
-        "push rbp",
-        "mov rbp, rsp",
-        "sub rsp, 336",
-        "mov [rsp + 0], rax",
-        "mov [rsp + 8], rcx",
-        "mov [rsp + 16], rdx",
-        "mov [rsp + 24], rsi",
-        "mov [rsp + 32], rdi",
-        "mov [rsp + 40], r8",
-        "mov [rsp + 48], r9",
-        "mov [rsp + 56], r10",
-        "mov [rsp + 64], r11",
-        "movdqu [rsp + 80], xmm0",
-        "movdqu [rsp + 96], xmm1",
-        "movdqu [rsp + 112], xmm2",
-        "movdqu [rsp + 128], xmm3",
-        "movdqu [rsp + 144], xmm4",
-        "movdqu [rsp + 160], xmm5",
-        "movdqu [rsp + 176], xmm6",
-        "movdqu [rsp + 192], xmm7",
-        "movdqu [rsp + 208], xmm8",
-        "movdqu [rsp + 224], xmm9",
-        "movdqu [rsp + 240], xmm10",
-        "movdqu [rsp + 256], xmm11",
-        "movdqu [rsp + 272], xmm12",
-        "movdqu [rsp + 288], xmm13",
-        "movdqu [rsp + 304], xmm14",
-        "movdqu [rsp + 320], xmm15",
-        "call {request}",
-        "movdqu xmm15, [rsp + 320]",
-        "movdqu xmm14, [rsp + 304]",
-        "movdqu xmm13, [rsp + 288]",
-        "movdqu xmm12, [rsp + 272]",
-        "movdqu xmm11, [rsp + 256]",
-        "movdqu xmm10, [rsp + 240]",
-        "movdqu xmm9, [rsp + 224]",
-        "movdqu xmm8, [rsp + 208]",
-        "movdqu xmm7, [rsp + 192]",
-        "movdqu xmm6, [rsp + 176]",
-        "movdqu xmm5, [rsp + 160]",
-        "movdqu xmm4, [rsp + 144]",
-        "movdqu xmm3, [rsp + 128]",
-        "movdqu xmm2, [rsp + 112]",
-        "movdqu xmm1, [rsp + 96]",
-        "movdqu xmm0, [rsp + 80]",
-        "mov r11, [rsp + 64]",
-        "mov r10, [rsp + 56]",
-        "mov r9, [rsp + 48]",
-        "mov r8, [rsp + 40]",
-        "mov rdi, [rsp + 32]",
-        "mov rsi, [rsp + 24]",
-        "mov rdx, [rsp + 16]",
-        "mov rcx, [rsp + 8]",
-        "mov rax, [rsp + 0]",
-        "add rsp, 336",
-        "pop rbp",
-        "ret",
-        request = sym osr_request_promotion,
-    )
 }
 
 /// The interpreter's request for the loop it is running: the same

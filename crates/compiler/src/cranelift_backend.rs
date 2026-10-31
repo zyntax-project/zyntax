@@ -668,6 +668,62 @@ fn host_isa() -> Arc<dyn cranelift_codegen::isa::TargetIsa> {
     configured_isa(cranelift_native::builder().unwrap(), cfg!(windows))
 }
 
+/// A function making the promotion request a loop's back-edge counter
+/// asks for ([`crate::osr::osr_request_promotion`]) that returns with
+/// every register as its caller left it: Cranelift compiles it once, for
+/// this process's target, with its `preserve_all` convention, so a call
+/// from a loop costs the loop no registers. `None` where it does not
+/// compile; the loop then calls the request itself.
+pub fn preserving_request() -> Option<*const u8> {
+    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    ADDRESS
+        .get_or_init(|| compile_preserving_request().ok())
+        .map(|address| address as *const u8)
+}
+
+fn compile_preserving_request() -> CompilerResult<usize> {
+    let fail = |e: &dyn std::fmt::Display| {
+        CompilerError::Backend(format!("the preserving promotion request: {e}"))
+    };
+    let mut builder = JITBuilder::with_isa(host_isa(), cranelift_module::default_libcall_names());
+    builder.symbol(
+        crate::osr::OSR_REQUEST_SYMBOL,
+        crate::osr::osr_request_promotion as *const u8,
+    );
+    let mut module = JITModule::new(builder);
+    let mut request = module.make_signature();
+    request.params.push(AbiParam::new(types::I64));
+    request.params.push(AbiParam::new(types::I64));
+    let callee = module
+        .declare_function(crate::osr::OSR_REQUEST_SYMBOL, Linkage::Import, &request)
+        .map_err(|e| fail(&e))?;
+    let mut preserving = request.clone();
+    preserving.call_conv = cranelift_codegen::isa::CallConv::PreserveAll;
+    let id = module
+        .declare_anonymous_function(&preserving)
+        .map_err(|e| fail(&e))?;
+    let frontend_config = module.target_config();
+    let mut ctx = module.make_context();
+    ctx.func.signature = preserving;
+    let mut functions = FunctionBuilderContext::new();
+    let mut body = FunctionBuilder::new(&mut ctx.func, &mut functions);
+    let entry = body.create_block();
+    body.append_block_params_for_function_params(entry);
+    body.switch_to_block(entry);
+    body.seal_block(entry);
+    let args = body.block_params(entry).to_vec();
+    let callee = module.declare_func_in_func(callee, body.func);
+    body.ins().call(callee, &args);
+    body.ins().return_(&[]);
+    body.finalize(frontend_config);
+    module.define_function(id, &mut ctx).map_err(|e| fail(&e))?;
+    module.finalize_definitions().map_err(|e| fail(&e))?;
+    let address = module.get_finalized_function(id) as usize;
+    // The code is called for the rest of the process.
+    std::mem::forget(module);
+    Ok(address)
+}
+
 /// The ISA for the target `triple` names, configured as [`host_isa`]
 /// configures the host's. Code compiled for another target is for
 /// inspection and must never be run.
@@ -760,6 +816,12 @@ fn jit_builder(
     // Ahead of the process's own symbols: what an embedder supplied
     // after this module was set up.
     builder.symbol_lookup_fn(Box::new(crate::late_symbols::lookup));
+    // Made when code first names it.
+    builder.symbol_lookup_fn(Box::new(|name| {
+        (name == crate::osr::OSR_REQUEST_PRESERVING_SYMBOL)
+            .then(preserving_request)
+            .flatten()
+    }));
     // Ahead of those, what this backend was given; tried first.
     let table = Arc::clone(table);
     builder.symbol_lookup_fn(Box::new(move |name| {
@@ -1104,6 +1166,11 @@ impl CraneliftBackend {
                         let Some(signature) = imports.get(name.as_str()).copied().flatten() else {
                             return decline(format!("{name} has no signature in the code"));
                         };
+                        if name == crate::osr::OSR_REQUEST_PRESERVING_SYMBOL
+                            && preserving_request().is_none()
+                        {
+                            return decline(format!("{name} does not compile here"));
+                        }
                         let func = match self.module.declarations().get_name(name) {
                             Some(cranelift_module::FuncOrDataId::Func(func)) => {
                                 let declared =
@@ -11933,12 +12000,13 @@ fn emit_osr_request_after_backedges(
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
     sig.params.push(AbiParam::new(types::I64));
-    let symbol = match crate::osr::OSR_REQUEST_PRESERVING_SYMBOL {
-        Some(preserving) => {
-            sig.call_conv = cranelift_codegen::isa::CallConv::PreserveAll;
-            preserving
-        }
-        None => crate::osr::OSR_REQUEST_SYMBOL,
+    // Portable code names the preserving request for the process that
+    // places it, which makes its own.
+    let symbol = if portable.is_some() || preserving_request().is_some() {
+        sig.call_conv = cranelift_codegen::isa::CallConv::PreserveAll;
+        crate::osr::OSR_REQUEST_PRESERVING_SYMBOL
+    } else {
+        crate::osr::OSR_REQUEST_SYMBOL
     };
     if let Ok(fid) = module.declare_function(symbol, Linkage::Import, &sig) {
         let f = module.declare_func_in_func(fid, builder.func);
