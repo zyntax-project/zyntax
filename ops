@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":6,"timestamp":1793411361,"nonce":"hz7B0e4if7hKviQY+TaRB+fehPk=","target":"8f5d3888c847fa584062decfd452ad0f4b10b723203422c2cde7d79f85e291df","message":"Windows CI passes with 23191f1d9e8ed2c20cdab4d0d375c83ea4238f45 (run 41152900468, native tests x86_64-pc-windows-msvc). Closing.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1793411361,"nonce":"77j/oay6NIfasts+8HHntyq7XvI=","status":2}]}
