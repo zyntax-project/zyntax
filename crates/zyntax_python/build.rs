@@ -23,8 +23,9 @@ mod policy;
 /// an executable by default and drops unused dylibs on its own.
 fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
     let os = env::var("CARGO_CFG_TARGET_OS")?;
+    zrtl_native::build::emit_startup_layout(out)?;
     if cfg!(feature = "llvm-backend") {
-        zrtl_native::build::emit_startup_layout(out)?;
+        zrtl_native::build::emit_deferred_initializers(out)?;
     }
     if os != "macos" {
         return Ok(());

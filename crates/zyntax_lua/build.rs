@@ -29,8 +29,9 @@ mod policy;
 /// there cannot bind to the executable.
 fn emit_link_flags(out: &std::path::Path) -> Result<(), BuildError> {
     let os = env::var("CARGO_CFG_TARGET_OS")?;
+    zrtl_native::build::emit_startup_layout(out)?;
     if cfg!(feature = "llvm-backend") {
-        zrtl_native::build::emit_startup_layout(out)?;
+        zrtl_native::build::emit_deferred_initializers(out)?;
     }
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let list = env::var("DEP_ZL_CAPI_EXPORTS")?;

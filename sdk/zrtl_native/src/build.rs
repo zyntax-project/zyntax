@@ -1,4 +1,5 @@
-//! For build scripts: native executable exports and startup text placement.
+//! For build scripts: native executable exports, startup text placement
+//! and deferred static initialisers.
 //!
 //! An executable exports nothing a library opened later can bind to
 //! unless it is told to. These write the list in the form each linker
@@ -23,9 +24,48 @@ pub fn emit_startup_layout(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Link the package's executables so that dyld runs none of their static
+/// initialisers, on macOS: the runtime runs them before its first use of
+/// what they set up (`zyntax_compiler`'s LLVM tier), and a process that
+/// never gets there skips them. Every static initialiser of such an
+/// executable must be one that runtime runs. The link goes through a
+/// small linker built here with the build's `rustc`, which runs `ld` and
+/// retypes the output's initialiser offsets as regular data. Setting
+/// `ZYNTAX_KEEP_LINKER_LAYOUT` links as usual.
+pub fn emit_deferred_initializers(dir: &Path) -> io::Result<()> {
+    println!("cargo:rerun-if-env-changed=ZYNTAX_KEEP_LINKER_LAYOUT");
+    let os = std::env::var("CARGO_CFG_TARGET_OS")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if std::env::var_os("ZYNTAX_KEEP_LINKER_LAYOUT").is_some()
+        || os != "macos"
+        || !cfg!(target_os = "macos")
+    {
+        return Ok(());
+    }
+    let source = dir.join("zyntax_ld.rs");
+    std::fs::write(&source, include_str!("defer_initializers_ld.rs"))?;
+    let linker = dir.join("zyntax-ld");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let built = std::process::Command::new(rustc)
+        .args(["--edition", "2024", "-O", "--crate-name", "zyntax_ld", "-o"])
+        .arg(&linker)
+        .arg(&source)
+        .status()?;
+    if !built.success() {
+        return Err(io::Error::other("building the deferring linker failed"));
+    }
+    println!("cargo:rustc-link-arg-bins=--ld-path={}", linker.display());
+    Ok(())
+}
+
 /// Group ELF startup text without changing constructor-array order or the
-/// loader ABI. Other targets retain their native linker's layout.
+/// loader ABI. On macOS, link with chained fixups, which dyld applies to
+/// a data page when it is first touched rather than to every page at
+/// launch. Other targets retain their native linker's layout.
 pub fn startup_link_args(target_os: &str, dir: &Path) -> io::Result<Vec<String>> {
+    if target_os == "macos" {
+        return Ok(vec!["-Wl,-fixup_chains".into()]);
+    }
     if target_os != "linux" {
         return Ok(Vec::new());
     }
@@ -111,11 +151,21 @@ mod tests {
     }
 
     #[test]
-    fn startup_layout_leaves_non_linux_targets_untouched() {
+    fn startup_layout_leaves_other_targets_untouched() {
         let dir = scratch("startup_other_targets");
-        for os in ["macos", "windows", "unknown", "freebsd", "android"] {
+        for os in ["windows", "unknown", "freebsd", "android"] {
             assert!(startup_link_args(os, &dir).unwrap().is_empty());
         }
+        assert!(!dir.join("native_startup.ld").exists());
+    }
+
+    #[test]
+    fn macos_links_with_chained_fixups() {
+        let dir = scratch("startup_macos");
+        assert_eq!(
+            startup_link_args("macos", &dir).unwrap(),
+            vec!["-Wl,-fixup_chains".to_string()]
+        );
         assert!(!dir.join("native_startup.ld").exists());
     }
 

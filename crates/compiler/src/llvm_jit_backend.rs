@@ -81,8 +81,9 @@ static AOT_TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Compiles HIR to native code through MCJIT, or through the optional
 /// object-file/linker installer. Published code lives with the backend.
 pub struct LLVMJitBackend<'ctx> {
-    /// LLVM context reference.
-    context: &'ctx Context,
+    /// The context the caller made, unless it is made at the first compile
+    /// (`deferred_context`).
+    context: Option<&'ctx Context>,
 
     /// The module a promotion recompiles out of.
     ///
@@ -184,9 +185,61 @@ pub struct LLVMJitBackend<'ctx> {
     osr_helper_sites: Option<std::collections::HashSet<u64>>,
     /// Emit only the requested resume points; leave normal entry cells alone.
     osr_helpers_only: bool,
+
+    /// Declared last, so it is dropped after every module and engine made
+    /// in it.
+    deferred_context: Option<DeferredContext>,
+}
+
+/// A context made when it is first asked for, after the image's static
+/// initialisers have run ([`crate::llvm_targets::run_static_initializers`]):
+/// a runtime that never compiles at this tier never touches LLVM.
+#[derive(Default)]
+struct DeferredContext(std::sync::OnceLock<OwnedContext>);
+
+struct OwnedContext(Box<Context>);
+
+// SAFETY: the context is only reached through its backend, which callers
+// serialise (`ZyntaxLlvmBackend` holds it under a mutex).
+unsafe impl Send for OwnedContext {}
+unsafe impl Sync for OwnedContext {}
+
+impl DeferredContext {
+    fn get(&self) -> &Context {
+        &self
+            .0
+            .get_or_init(|| {
+                crate::llvm_targets::run_static_initializers();
+                OwnedContext(Box::new(Context::create()))
+            })
+            .0
+    }
+}
+
+impl LLVMJitBackend<'static> {
+    /// A backend that makes its own context at its first compile.
+    pub fn deferred() -> CompilerResult<Self> {
+        let mut backend = Self::with_context(None, OptimizationLevel::Aggressive);
+        backend.deferred_context = Some(DeferredContext::default());
+        Ok(backend)
+    }
 }
 
 impl<'ctx> LLVMJitBackend<'ctx> {
+    /// The context modules are made in.
+    fn context(&self) -> &'ctx Context {
+        if let Some(context) = self.context {
+            return context;
+        }
+        let deferred = self
+            .deferred_context
+            .as_ref()
+            .expect("a backend is given a context or makes its own");
+        // SAFETY: only `deferred` makes a backend without a given context,
+        // and it makes an `LLVMJitBackend<'static>`; the context lives in
+        // the backend's last field, dropped after everything made in it.
+        unsafe { &*(deferred.get() as *const Context) }
+    }
     /// Create a new LLVM JIT backend with aggressive optimisation.
     pub fn new(context: &'ctx Context) -> CompilerResult<Self> {
         Self::with_opt_level(context, OptimizationLevel::Aggressive)
@@ -197,6 +250,10 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         context: &'ctx Context,
         opt_level: OptimizationLevel,
     ) -> CompilerResult<Self> {
+        Ok(Self::with_context(Some(context), opt_level))
+    }
+
+    fn with_context(context: Option<&'ctx Context>, opt_level: OptimizationLevel) -> Self {
         let mut backend = Self {
             context,
             module_context: None,
@@ -224,6 +281,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             pending_osr_helpers: Vec::new(),
             osr_helper_sites: None,
             osr_helpers_only: false,
+            deferred_context: None,
         };
 
         // The allocation intrinsics call into the runtime's pools. Both
@@ -234,7 +292,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
         // addresses is what makes them findable.
         backend.register_symbols(&crate::pool_alloc::alloc_runtime_symbols());
 
-        Ok(backend)
+        backend
     }
 
     /// Set a content-hash cache key for subsequent `compile_module`
@@ -318,6 +376,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     fn parse_llvm_args() {
         static PARSED: std::sync::Once = std::sync::Once::new();
         PARSED.call_once(|| {
+            crate::llvm_targets::run_static_initializers();
             let Some(args) = std::env::var_os("ZYNTAX_LLVM_ARGS") else {
                 return;
             };
@@ -782,7 +841,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
     ) -> CompilerResult<(LLVMBackend<'ctx>, Vec<(HirId, u64, String)>)> {
         let target_machine = self.target_machine()?;
         // Step 1: Lower HIR → LLVM IR.
-        let mut backend = LLVMBackend::new(self.context, "zyntax_jit");
+        let mut backend = LLVMBackend::new(self.context(), "zyntax_jit");
         backend.register_symbol_signatures(&self.symbol_signatures);
         backend.set_only_compile_reachable(self.only_compile_reachable.clone());
         backend.set_cross_tier_callees(self.pending_cross_tier.clone());
@@ -839,7 +898,7 @@ impl<'ctx> LLVMJitBackend<'ctx> {
             .module()
             .set_data_layout(&target_machine.get_target_data().get_data_layout());
         // Both optimization cost models and MCJIT codegen use the host CPU.
-        Self::stamp_host_target_attributes(self.context, &backend);
+        Self::stamp_host_target_attributes(self.context(), &backend);
 
         if std::env::var("ZYNTAX_DUMP_LLVM_IR").is_ok() {
             let ir = backend.module().print_to_string().to_string();

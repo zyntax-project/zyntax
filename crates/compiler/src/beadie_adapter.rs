@@ -556,6 +556,7 @@ mod llvm_impl {
     > {
         use inkwell::context::Context;
 
+        crate::llvm_targets::run_static_initializers();
         let context: Box<Context> = Box::new(Context::create());
         // SAFETY: `context` is moved into the `LlvmContextKeepAlive`
         // which the caller stores in an `Arc` for the runtime's

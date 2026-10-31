@@ -1872,6 +1872,7 @@ pub struct InterpOptStats {
 /// caller that only wants to read the IR does not take that dependency.
 #[cfg(feature = "llvm-backend")]
 pub fn compile_module_to_llvm_ir(module: &HirModule, name: &str) -> CompilerResult<String> {
+    llvm_targets::run_static_initializers();
     let context = inkwell::context::Context::create();
     let mut backend = llvm_backend::LLVMBackend::new(&context, name);
     backend.compile_module(module)

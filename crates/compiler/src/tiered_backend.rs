@@ -56,8 +56,6 @@ use crate::{CompilerError, CompilerResult};
 use crate::beadie_adapter::ZyntaxLlvmBackend;
 #[cfg(feature = "llvm-backend")]
 use crate::llvm_jit_backend::LLVMJitBackend;
-#[cfg(feature = "llvm-backend")]
-use inkwell::context::Context;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types (preserved from the legacy API)
@@ -1247,11 +1245,6 @@ pub struct TieredBackend {
     #[cfg(feature = "llvm-backend")]
     llvm: Option<Arc<ZyntaxLlvmBackend>>,
 
-    /// Owned LLVM context (must outlive the backend it powers).
-    /// `Option` is used only so we can move it during `shutdown`.
-    #[cfg(feature = "llvm-backend")]
-    _llvm_context: Option<Box<Context>>,
-
     /// Per-function entries keyed by HIR function id.
     functions: HashMap<HirId, FunctionEntry>,
     /// Functions compiled on their first native call, through the stub
@@ -1390,17 +1383,18 @@ impl TieredBackend {
         lap("cranelift");
 
         #[cfg(feature = "llvm-backend")]
-        let (_llvm_context, llvm) = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
-            let context = Box::new(Context::create());
-            // SAFETY: the `Box<Context>` is held alive for the lifetime of
-            // `TieredBackend`. We hand a `'static` reference to the JIT
-            // backend; the backend will never observe the context drop
-            // before itself.
-            let context_ref = unsafe { &*(context.as_ref() as *const Context) };
-            let jit = LLVMJitBackend::new(context_ref)?;
-            (Some(context), Some(Arc::new(ZyntaxLlvmBackend::new(jit))))
+        let llvm = if matches!(config.tier2_backend, Tier2Backend::LLVM) {
+            // LLVM's static initialisers, when the link left them to the
+            // runtime, run on a thread of their own while the program
+            // loads; the backend makes its context at its first compile.
+            let _ = std::thread::Builder::new()
+                .name("zyntax-llvm-init".into())
+                .spawn(crate::llvm_targets::run_static_initializers);
+            Some(Arc::new(
+                ZyntaxLlvmBackend::new(LLVMJitBackend::deferred()?),
+            ))
         } else {
-            (None, None)
+            None
         };
         lap("llvm");
 
@@ -1432,8 +1426,6 @@ impl TieredBackend {
             cranelift,
             #[cfg(feature = "llvm-backend")]
             llvm,
-            #[cfg(feature = "llvm-backend")]
-            _llvm_context,
             functions: HashMap::new(),
             lazy: HashSet::new(),
             optimized_bodies: Arc::new(OptimizedBodies::default()),
