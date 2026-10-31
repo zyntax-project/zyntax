@@ -13,7 +13,7 @@
 //! typed entry. Closures capture through cells or copies in the record.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use full_moon::ast::{self, BinOp, Block, Expression, Prefix, Stmt, Suffix, UnOp, Var};
 use full_moon::tokenizer::TokenReference;
@@ -171,6 +171,10 @@ struct Module<'a> {
     /// What the debug library is told of the chunk, when the program
     /// keeps its call stack.
     debug: Option<DebugInfo>,
+    /// Whether this chunk's outermost code runs once, as a program's
+    /// main chunk does: a field stored there in a table made once is
+    /// then there for good wherever the store has run.
+    runs_once: bool,
 }
 
 /// What a chunk of a program that keeps its call stack records: the
@@ -303,6 +307,34 @@ const MAX_SLOTS: usize = 63;
 struct Finder {
     helper: String,
     ends: Vec<(ShapeId, End)>,
+}
+
+/// How a call site finds which end its lookup takes.
+enum Dispatch {
+    /// By calling the `Which` finder.
+    Finder(String),
+    /// Decided where it stands.
+    Folded(FoldPlan),
+}
+
+/// A call site's lookup decided where it stands.
+struct FoldPlan {
+    /// The end taken by the metatable's shape, by shape id, none taking
+    /// any; or none when every table takes end 0.
+    arms: Option<Vec<(i64, i64)>>,
+    /// Whether the ends are fields of the metatable, rather than of the
+    /// table itself.
+    via_meta: bool,
+}
+
+/// Where a lookup surely ends at the place it is made.
+enum Folded {
+    /// In the table's own field, holding this type.
+    Own(Ty),
+    /// By the shape of the table's metatable: for each, the table the
+    /// lookup ends in, by shape, and the field's type; none when the
+    /// name is nowhere along the way.
+    Classes(Vec<(ShapeId, Option<(ShapeId, Ty)>)>),
 }
 
 /// What a finder answers.
@@ -748,6 +780,10 @@ struct Lowerer<'m, 'a> {
     /// The `end` of a function's body, where the variables its
     /// outermost block declares are closed.
     end_span: Option<Span>,
+    /// Fields of tables made once that are surely there: on every path
+    /// to this point a store of a value that is never nil put them
+    /// there, and they are never taken away.
+    present: BTreeSet<(ShapeId, String)>,
 }
 
 /// A local in scope, as `debug.getlocal` numbers them: a variable, or
@@ -1635,6 +1671,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             lines: std::collections::BTreeSet::new(),
             tail_span: None,
             end_span: None,
+            present: BTreeSet::new(),
         }
     }
 
@@ -6490,13 +6527,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 // key reaches, keeps its bit set.
                 let settled = info.always_present(&name) && !info.dynamic_keys;
                 let then = self.slot_store(&t.node, layout, slot, stored.clone(), settled, span);
-                let boxed = self.coerce(stored, Ty::Any);
-                let boxed_t = self.coerce(t, Ty::Any);
-                let k = self.constant_key(&key).expect("a constant key");
-                let els = vec![
-                    expr_stmt(call("zl_setindex_key", vec![boxed_t, k, boxed], unit, span)),
-                    self.pending_check_described(span, &descs),
-                ];
+                let els = if no_newindex {
+                    // Only a nil receiver gets here: it raises, on the
+                    // cold path a read takes.
+                    let mut raise = vec![
+                        self.set_line(span),
+                        expr_stmt(call("zl_index_nil", vec![], Type::Any, span)),
+                    ];
+                    raise.extend(self.leave_described(span, &descs));
+                    raise
+                } else {
+                    let boxed = self.coerce(stored, Ty::Any);
+                    let boxed_t = self.coerce(t, Ty::Any);
+                    let k = self.constant_key(&key).expect("a constant key");
+                    vec![
+                        expr_stmt(call("zl_setindex_key", vec![boxed_t, k, boxed], unit, span)),
+                        self.pending_check_described(span, &descs),
+                    ]
+                };
                 pre.push(if_(fast, then, Some(els), span));
                 return stmt(
                     TypedStatement::Block(TypedBlock {
@@ -7524,6 +7572,188 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         Ok(self.prefixed(pre, multi, span))
     }
 
+    /// Note the fields an assignment that has just run surely put in
+    /// tables made once: a constant key, a value never nil, a table that
+    /// keeps the field.
+    fn note_stores(&mut self, targets: &[&Var], exprs: &[&Expression]) {
+        if !self.m.runs_once {
+            return;
+        }
+        for (target, e) in targets.iter().zip(exprs) {
+            let Var::Expression(v) = target else {
+                continue;
+            };
+            let suffixes: Vec<&Suffix> = v.suffixes().collect();
+            let Some((Suffix::Index(index), init)) = suffixes.split_last() else {
+                continue;
+            };
+            if self.typer().global_member(v.prefix(), &suffixes).is_some() {
+                continue;
+            }
+            if let Some(name) = types::constant_key(index)
+                && self.typer().non_nil(e)
+            {
+                let receiver = self.typer().suffixed_ty(v.prefix(), init);
+                self.note_store(receiver, name);
+            }
+        }
+    }
+
+    /// Note the field `function a.b:m()` stores the function in.
+    fn note_declaration(&mut self, f: &ast::FunctionDeclaration) {
+        if !self.m.runs_once {
+            return;
+        }
+        let names: Vec<&TokenReference> = f.name().names().iter().collect();
+        let method = f.name().method_name();
+        if names.len() == 1 && method.is_none() {
+            return;
+        }
+        let (path, last) = match method {
+            Some(m) => (&names[..], ident(m)),
+            None => (&names[..names.len() - 1], ident(names[names.len() - 1])),
+        };
+        let typer = self.typer();
+        let mut receiver = match self.scopes().binding(path[0]) {
+            Some(b) => typer.binding_ty(b),
+            None => return,
+        };
+        for name in &path[1..] {
+            receiver = typer.field_ty(receiver, &ident(name));
+        }
+        self.note_store(receiver, last);
+    }
+
+    fn note_store(&mut self, receiver: Ty, name: String) {
+        if let Ty::Shape(k) = receiver
+            && self.m.inferred.singleton(k)
+            && self.m.inferred.keeps(k, &name)
+        {
+            self.present.insert((k, name));
+        }
+    }
+
+    /// Whether a table of shape `k` surely holds `name` here: every
+    /// table of the shape has it from birth on, or the one table of the
+    /// shape has had it stored on every path here.
+    fn known_present(&self, k: ShapeId, name: &str) -> bool {
+        self.m.inferred.born_present(k, name) || self.present.contains(&(k, name.to_string()))
+    }
+
+    /// Whether `lookup` surely ends where it says once its first hop
+    /// has found a metatable of its shape: each table after it holds
+    /// what the lookup goes on through, and the last one the field.
+    fn lookup_holds(&self, lookup: &types::Lookup, name: &str) -> bool {
+        let inferred = self.m.inferred;
+        let mut at: Option<ShapeId> = None;
+        for hop in &lookup.hops {
+            at = match (*hop, at) {
+                (Hop::Meta(c), None) => Some(c),
+                (Hop::Meta(c), Some(from)) if inferred.fixed_meta(from) == Some(c) => Some(c),
+                (Hop::Index(c), Some(from)) if from == c && self.known_present(c, "__index") => {
+                    match inferred.shape(c).field("__index") {
+                        Some((_, Ty::Shape(next))) => Some(next),
+                        _ => return false,
+                    }
+                }
+                _ => return false,
+            };
+        }
+        at == Some(lookup.shape) && (lookup.sure || self.known_present(lookup.shape, name))
+    }
+
+    /// Where a lookup of `name` from a table of shape `k` surely ends
+    /// here, decided without asking the tables on the way: none when
+    /// one of them may lack what the lookup goes through.
+    fn folded_lookups(&self, k: ShapeId, name: &str) -> Option<Folded> {
+        let inferred = self.m.inferred;
+        let lookups = inferred.lookups(k, name)?;
+        if let Some(own) = lookups.first().filter(|l| l.hops.is_empty()) {
+            return (own.sure || self.known_present(k, name)).then_some(Folded::Own(own.ty));
+        }
+        let mut out = Vec::new();
+        for class in &inferred.shape(k).classes {
+            // The first lookup through this metatable that may fail
+            // leaves the rest to run time.
+            let first = lookups
+                .iter()
+                .find(|l| l.hops.first() == Some(&Hop::Meta(*class)));
+            let end = match first {
+                Some(l) if self.lookup_holds(l, name) => Some((l.shape, l.ty)),
+                Some(_) => return None,
+                None => None,
+            };
+            out.push((*class, end));
+        }
+        Some(Folded::Classes(out))
+    }
+
+    /// The ends of a call through a table of shape `k` whose lookup of
+    /// `name` is decided here, and how the site picks one. None when an
+    /// end is no known function, or holds a closure's record somewhere
+    /// the site cannot read it from: the metatable itself, or the table.
+    fn fold_plan(
+        &self,
+        k: ShapeId,
+        name: &str,
+        folded: Folded,
+    ) -> Option<(Vec<(ShapeId, End)>, FoldPlan)> {
+        let inferred = self.m.inferred;
+        match folded {
+            Folded::Own(ty @ Ty::Func(_)) => {
+                self.slot_of(k, name)?;
+                Some((
+                    vec![(k, End::Slot(ty))],
+                    FoldPlan {
+                        arms: None,
+                        via_meta: false,
+                    },
+                ))
+            }
+            Folded::Own(_) => None,
+            Folded::Classes(classes) => {
+                let mut ends: Vec<(ShapeId, End)> = Vec::new();
+                let mut arms = Vec::new();
+                for (class, end) in &classes {
+                    let gid = self.m.layout(*class)?.gid;
+                    let Some((shape, ty)) = *end else {
+                        continue;
+                    };
+                    let Ty::Func(f) = ty else {
+                        return None;
+                    };
+                    if self.m.takes_env(f) && !(shape == *class && inferred.singleton(shape)) {
+                        return None;
+                    }
+                    self.slot_of(shape, name)?;
+                    let end = (shape, End::Slot(ty));
+                    let at = match ends.iter().position(|e| *e == end) {
+                        Some(i) => i,
+                        None => {
+                            ends.push(end);
+                            ends.len() - 1
+                        }
+                    };
+                    arms.push((gid, at as i64));
+                }
+                if ends.is_empty() {
+                    return None;
+                }
+                // One end every metatable leads to, and a metatable every
+                // table has: nothing to pick.
+                let one =
+                    ends.len() == 1 && arms.len() == classes.len() && inferred.meta_never_nil(k);
+                Some((
+                    ends,
+                    FoldPlan {
+                        arms: (!one).then_some(arms),
+                        via_meta: true,
+                    },
+                ))
+            }
+        }
+    }
+
     /// `obj:name(args)`, or `obj.name(args)` by `kind`, for a receiver
     /// of shape `k` whose lookups of `name` all end in slots holding
     /// known functions or in `__index` functions giving one: the
@@ -7547,28 +7777,39 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         desc: Desc,
         span: Span,
     ) -> Result<Option<Multi>> {
-        let Some(which) = self.finder(k, name, FinderMode::Which, span) else {
-            return Ok(None);
+        // A lookup decided here needs no finder.
+        let folded = self
+            .folded_lookups(k, name)
+            .and_then(|folded| self.fold_plan(k, name, folded));
+        let (ends, dispatch) = match folded {
+            Some((ends, plan)) => (ends, Dispatch::Folded(plan)),
+            None => {
+                let Some(which) = self.finder(k, name, FinderMode::Which, span) else {
+                    return Ok(None);
+                };
+                (which.ends.clone(), Dispatch::Finder(which.helper))
+            }
         };
-        let direct = which.ends.iter().all(|(_, end)| match end {
+        let direct = ends.iter().all(|(_, end)| match end {
             End::Slot(ty) => matches!(ty, Ty::Func(_)),
             End::Handler { ty, .. } => kind == CallKind::Method && matches!(ty, Ty::Func(_)),
         });
         if !direct {
             return Ok(None);
         }
-        let takes_place = which.ends.iter().any(|(_, end)| match *end {
+        let takes_place = ends.iter().any(|(_, end)| match *end {
             End::Slot(Ty::Func(f)) => self.m.takes_env(f),
             End::Slot(_) => false,
             End::Handler { .. } => true,
         });
-        let place = if takes_place {
-            match self.finder(k, name, FinderMode::Where, span) {
-                Some(place) => Some(place),
-                None => return Ok(None),
+        let place = match &dispatch {
+            Dispatch::Finder(_) if takes_place => {
+                match self.finder(k, name, FinderMode::Where, span) {
+                    Some(place) => Some(place),
+                    None => return Ok(None),
+                }
             }
-        } else {
-            None
+            _ => None,
         };
         let table_t = self.ir(Ty::Table);
         let i64_t = prim(PrimitiveType::I64);
@@ -7593,22 +7834,89 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             None,
             span,
         ));
-        let w = self.hold(
-            Val {
-                node: call(&which.helper, vec![obj.node.clone()], i64_t.clone(), span),
-                ty: Ty::Int,
-            },
-            &mut head,
-        );
-        let place = place.map(|place| {
-            self.hold(
-                Val {
-                    node: call(&place.helper, vec![obj.node.clone()], table_t.clone(), span),
-                    ty: Ty::Table,
-                },
-                &mut head,
-            )
-        });
+        // Every table takes the one end: nothing is picked at run time.
+        let sure = matches!(&dispatch, Dispatch::Folded(plan) if plan.arms.is_none());
+        let (w, place) = match dispatch {
+            Dispatch::Finder(helper) => {
+                let w = self.hold(
+                    Val {
+                        node: call(&helper, vec![obj.node.clone()], i64_t.clone(), span),
+                        ty: Ty::Int,
+                    },
+                    &mut head,
+                );
+                let place = place.map(|place| {
+                    self.hold(
+                        Val {
+                            node: call(
+                                &place.helper,
+                                vec![obj.node.clone()],
+                                table_t.clone(),
+                                span,
+                            ),
+                            ty: Ty::Table,
+                        },
+                        &mut head,
+                    )
+                });
+                (w, place)
+            }
+            Dispatch::Folded(plan) => {
+                let meta = (plan.via_meta && (plan.arms.is_some() || takes_place)).then(|| {
+                    self.hold(
+                        Val {
+                            node: field(obj.node.clone(), "meta", table_t.clone(), span),
+                            ty: Ty::Table,
+                        },
+                        &mut head,
+                    )
+                });
+                let w = match &plan.arms {
+                    None => Val {
+                        node: int_lit(0, span),
+                        ty: Ty::Int,
+                    },
+                    // The end by the metatable's shape; none without one.
+                    Some(arms) => {
+                        let m = meta.as_ref().expect("a dispatch by metatable reads it");
+                        let shape = field(m.node.clone(), "shape", i64_t.clone(), span);
+                        let mut chosen = int_lit(-1, span);
+                        for (gid, at) in arms.iter().rev() {
+                            let is = binary(
+                                BinaryOp::Eq,
+                                shape.clone(),
+                                int_lit(*gid, span),
+                                bool_t.clone(),
+                                span,
+                            );
+                            chosen = if_value(is, int_lit(*at, span), chosen, i64_t.clone(), span);
+                        }
+                        let no_meta = binary(
+                            BinaryOp::Eq,
+                            m.node.clone(),
+                            null(table_t.clone(), span),
+                            bool_t.clone(),
+                            span,
+                        );
+                        self.hold(
+                            Val {
+                                node: if_value(
+                                    no_meta,
+                                    int_lit(-1, span),
+                                    chosen,
+                                    i64_t.clone(),
+                                    span,
+                                ),
+                                ty: Ty::Int,
+                            },
+                            &mut head,
+                        )
+                    }
+                };
+                let place = takes_place.then(|| meta.unwrap_or_else(|| obj.clone()));
+                (w, place)
+            }
+        };
         let is_end = |i: usize| {
             binary(
                 BinaryOp::Eq,
@@ -7620,8 +7928,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         };
         // What each end calls through: a closure's record read from its
         // slot, or what the `__index` function gives for the name.
-        let mut through: Vec<Option<Val>> = Vec::with_capacity(which.ends.len());
-        for (i, (shape, end)) in which.ends.iter().enumerate() {
+        let mut through: Vec<Option<Val>> = Vec::with_capacity(ends.len());
+        for (i, (shape, end)) in ends.iter().enumerate() {
             let found = match (*end, &place) {
                 (End::Slot(Ty::Func(f)), Some(place)) if self.m.takes_env(f) => {
                     let (layout, slot) = self
@@ -7629,7 +7937,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         .expect("a finder's slot end has a slot");
                     let record = self.slot_read(&place.node, layout, &slot, span);
                     Some(Val {
-                        node: if_value(is_end(i), record.node, nil(span), Type::Any, span),
+                        node: if sure {
+                            record.node
+                        } else {
+                            if_value(is_end(i), record.node, nil(span), Type::Any, span)
+                        },
                         ty: Ty::Any,
                     })
                 }
@@ -7690,13 +8002,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Returns::Fixed(types) => Yield::Fixed(types.iter().map(|t| t.settled()).collect()),
             Returns::Dynamic | Returns::Unknown => Yield::Dynamic,
         };
-        let raise = self.call_nil(name, kind, span);
-        let mut value = self.yield_as(Multi::None(raise), &shape, span);
+        let mut value = if sure {
+            None
+        } else {
+            let raise = self.call_nil(name, kind, span);
+            Some(self.yield_as(Multi::None(raise), &shape, span))
+        };
         let callee_desc = Some(match kind {
             CallKind::Method => format!("method '{name}'"),
             CallKind::Field => format!("field '{name}'"),
         });
-        for (i, (_, end)) in which.ends.iter().enumerate().rev() {
+        for (i, (_, end)) in ends.iter().enumerate().rev() {
             let arm = match *end {
                 End::Slot(Ty::Func(f)) => {
                     let multi = self.direct_call_vals(
@@ -7718,9 +8034,15 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 _ => unreachable!("a which call's ends hold functions"),
             };
-            let ty = arm.ty.clone();
-            value = if_value(is_end(i), arm, value, ty, span);
+            value = Some(match value {
+                Some(rest) => {
+                    let ty = arm.ty.clone();
+                    if_value(is_end(i), arm, rest, ty, span)
+                }
+                None => arm,
+            });
         }
+        let value = value.expect("a which call has an end");
         Ok(Some(self.yielded(
             block_value(head, value, span),
             &shape,
@@ -8926,7 +9248,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.depth = 1;
         let mut segments = Vec::new();
         let mut out = Vec::new();
+        let entry = self.present.clone();
         for s in block.stmts() {
+            if let Stmt::Label(_) = s {
+                self.present = entry.clone();
+            }
             let at = out.len();
             self.line_needed = false;
             self.stmt(s, &mut out)?;
@@ -8966,7 +9292,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.depth += 1;
         let live = self.live.len();
         let mut out = Vec::new();
+        // A `goto` reaches a label from anywhere in the block, past
+        // stores that may not have run.
+        let entry = self.present.clone();
         for s in block.stmts() {
+            if let Stmt::Label(_) = s {
+                self.present = entry.clone();
+            }
             let at = out.len();
             self.line_needed = false;
             self.stmt(s, &mut out)?;
@@ -9246,7 +9578,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Vec<St>) -> Result<()> {
+        // What a nested block stores may not have run once it is left.
+        let nested = matches!(
+            s,
+            Stmt::Do(_)
+                | Stmt::If(_)
+                | Stmt::While(_)
+                | Stmt::Repeat(_)
+                | Stmt::NumericFor(_)
+                | Stmt::GenericFor(_)
+        );
+        let before = nested.then(|| self.present.clone());
         self.stmt_of(s, out)?;
+        if let Some(before) = before {
+            self.present = before;
+        }
         // The locals a declaration makes are in scope from the next
         // statement on.
         match s {
@@ -9312,6 +9658,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let v = self.expr(exprs[0])?;
                     let st = self.assign_target(targets[0], v, span)?;
                     out.push(st);
+                    self.note_stores(&targets, &exprs);
                     return Ok(());
                 }
                 // Every target's table and key, then every right side,
@@ -9334,6 +9681,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     let st = self.store_prepared(target, v, span)?;
                     out.push(st);
                 }
+                self.note_stores(&targets, &exprs);
             }
             Stmt::FunctionCall(c) => {
                 let suffixes: Vec<&Suffix> = c.suffixes().collect();
@@ -9416,6 +9764,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             Stmt::FunctionDeclaration(f) => {
                 let id = self.scopes().function_of(f.body());
                 let is_method = f.name().method_name().is_some();
+                // The function is reached only through the field it is
+                // stored in, so its body runs with the field there.
+                self.note_declaration(f);
                 self.lower_function(id, f.body(), is_method)?;
                 let names: Vec<&TokenReference> = f.name().names().iter().collect();
                 if names.len() == 1 && !is_method {
@@ -11089,6 +11440,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let mut child = Lowerer::new(self.m, id);
         child.frames = self.m.debug.is_some();
         child.live = info.params.iter().map(|v| Live::Var(*v)).collect();
+        // The function runs after it is made, when everything there by
+        // then still is.
+        child.present = self.present.clone();
         let mut params = Vec::new();
         let mut statements = Vec::new();
         if has_env {
@@ -11694,6 +12048,7 @@ fn chunk_module(
         sorts: RefCell::new(HashMap::new()),
         debug: debug.info(),
         layouts: shape_layouts(inferred, chunk_index, slots),
+        runs_once: false,
     };
     let span = Span::new(0, source.len());
     let lower = |module: &Module<'_>| -> Result<Vec<St>> {
@@ -12747,6 +13102,7 @@ pub(crate) fn program(
         sorts: RefCell::new(HashMap::new()),
         debug: debug.info(),
         layouts: shape_layouts(&inferred, 0, true),
+        runs_once: entry_kind == Entry::Program,
     };
     let span = Span::new(0, source.len());
     // Lowered twice: the first time finds which functions may raise, so

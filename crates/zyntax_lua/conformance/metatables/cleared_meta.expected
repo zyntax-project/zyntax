@@ -1,0 +1,2 @@
+1	2
+1	false	cleared_meta.lua:9: attempt to call a nil value (method 'get')

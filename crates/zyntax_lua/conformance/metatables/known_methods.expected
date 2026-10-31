@@ -1,0 +1,7 @@
+1	2	8	9
+false	known_methods.lua:22: attempt to call a nil value (method 'twice')
+4
+false	known_methods.lua:25: attempt to call a nil value (method 'twice')
+1	-2
+false	known_methods.lua:31: attempt to call a nil value (method 'maybe')
+6150

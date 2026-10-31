@@ -212,6 +212,21 @@ pub struct ShapeInfo {
     pub untyped_reads: Reads,
     /// The line the first constructor is on, for naming.
     pub line: usize,
+    /// The constructors making tables of this shape, by the byte offset
+    /// of their brace.
+    pub sites: BTreeSet<usize>,
+    /// Whether one of them may run more than once: it stands in a
+    /// function or a loop, or in a chunk that jumps or is called.
+    pub remade: bool,
+    /// The fields a store may leave nil: given a value that may be nil,
+    /// at birth or later.
+    pub nil_stores: BTreeSet<String>,
+    /// The constructors built inside `setmetatable` with a metatable
+    /// that is never nil: their tables have it from birth.
+    pub born_meta: BTreeSet<usize>,
+    /// Whether `setmetatable` may leave a table of this shape without a
+    /// metatable.
+    pub meta_cleared: bool,
 }
 
 /// Reads out of a table that hand what they find to code the types do
@@ -388,6 +403,9 @@ pub struct Inferred {
     /// with such reads undecided: a store of what such a read yields
     /// is then typed from it.
     pub settling: bool,
+    /// The locals that never hold nil: declared with a value that is
+    /// never nil and never assigned again.
+    pub non_nil_vars: HashSet<VarId>,
 }
 
 impl Inferred {
@@ -476,6 +494,59 @@ impl Inferred {
             && info.classes.iter().all(|c| {
                 self.shape(*c).field("__len").is_none() && !self.may_hold_unnamed(*c, "__len")
             })
+    }
+
+    /// Whether at most one table of shape `k` is ever made: its one
+    /// constructor is in the main chunk's outermost code, run once.
+    pub fn singleton(&self, k: ShapeId) -> bool {
+        let info = self.shape(k);
+        info.sites.len() == 1 && !info.remade
+    }
+
+    /// Whether a table of shape `k` keeps `name` once a store puts it
+    /// there: the store lands in the slot, as no metatable it may have
+    /// holds a `__newindex`, and nothing stores nil there, by name or
+    /// through a key or a receiver the types do not follow.
+    pub fn keeps(&self, k: ShapeId, name: &str) -> bool {
+        let info = self.shape(k);
+        info.field(name).is_some()
+            && !info.escapes
+            && !info.dynamic_keys
+            && !info.unknown_meta
+            && !info.nil_stores.contains(name)
+            && info
+                .classes
+                .iter()
+                .all(|c| !self.class_may_hold(*c, "__newindex"))
+    }
+
+    /// Whether every table of shape `k` holds `name` from birth on:
+    /// every constructor sets it to something that is never nil, and
+    /// the table keeps it.
+    pub fn born_present(&self, k: ShapeId, name: &str) -> bool {
+        let info = self.shape(k);
+        info.field(name).is_some_and(|(i, _)| i < info.born) && self.keeps(k, name)
+    }
+
+    /// Whether every table of shape `k` has a metatable from birth on
+    /// and never loses it.
+    pub fn meta_never_nil(&self, k: ShapeId) -> bool {
+        let info = self.shape(k);
+        !info.unknown_meta
+            && !info.meta_cleared
+            && !info.classes.is_empty()
+            && !info.sites.is_empty()
+            && info.sites.is_subset(&info.born_meta)
+    }
+
+    /// The shape of the metatable every table of shape `k` has from
+    /// birth on, when it has one shape only and is never taken away.
+    pub fn fixed_meta(&self, k: ShapeId) -> Option<ShapeId> {
+        let info = self.shape(k);
+        match info.classes.iter().collect::<Vec<_>>().as_slice() {
+            [c] if self.meta_never_nil(k) => Some(**c),
+            _ => None,
+        }
     }
 
     /// The functions `name` may resolve to for a table whose metatable
@@ -914,6 +985,102 @@ pub fn builtin_named(scopes: &Scopes, name: &str) -> Option<&'static Builtin> {
     builtin_global(name)
 }
 
+/// Whether `e` is never nil: a function, a table, a literal other than
+/// nil, a comparison or `not`, a local in `vars`, or `setmetatable` of
+/// one of these, which returns its first argument.
+pub fn non_nil(scopes: &Scopes, vars: &HashSet<VarId>, e: &Expression) -> bool {
+    match e {
+        Expression::Function(_)
+        | Expression::TableConstructor(_)
+        | Expression::Number(_)
+        | Expression::String(_) => true,
+        Expression::Symbol(t) => matches!(t.token().to_string().trim(), "true" | "false"),
+        Expression::Parentheses { expression, .. } => non_nil(scopes, vars, expression),
+        Expression::UnaryOperator { unop, .. } => matches!(unop, UnOp::Not(_)),
+        Expression::BinaryOperator { binop, .. } => matches!(
+            binop,
+            BinOp::TwoEqual(_)
+                | BinOp::TildeEqual(_)
+                | BinOp::LessThan(_)
+                | BinOp::LessThanEqual(_)
+                | BinOp::GreaterThan(_)
+                | BinOp::GreaterThanEqual(_)
+        ),
+        Expression::Var(Var::Name(token)) => matches!(
+            scopes.binding(token),
+            Some(Binding::Local(v) | Binding::Upvalue(v)) if vars.contains(v)
+        ),
+        Expression::FunctionCall(c) => {
+            let suffixes: Vec<&Suffix> = c.suffixes().collect();
+            let (
+                Prefix::Name(callee),
+                [
+                    Suffix::Call(ast::Call::AnonymousCall(ast::FunctionArgs::Parentheses {
+                        arguments,
+                        ..
+                    })),
+                ],
+            ) = (c.prefix(), suffixes.as_slice())
+            else {
+                return false;
+            };
+            matches!(scopes.binding(callee), Some(Binding::Global(name)) if name == "setmetatable")
+                && builtin_named(scopes, "setmetatable").is_some()
+                && arguments
+                    .iter()
+                    .next()
+                    .is_some_and(|first| non_nil(scopes, vars, first))
+        }
+        _ => false,
+    }
+}
+
+/// The locals of a chunk that never hold nil: declared with a value
+/// that is never nil, by `local function` or a `local` statement, and
+/// never assigned again, where the debug library cannot rebind them.
+fn non_nil_vars(scopes: &Scopes, ast: &ast::Ast) -> HashSet<VarId> {
+    struct Walk<'a> {
+        scopes: &'a Scopes,
+        out: HashSet<VarId>,
+    }
+    impl Walk<'_> {
+        fn fixed(&self, v: VarId) -> bool {
+            let info = self.scopes.var(v);
+            !info.assigned
+                && !self.scopes.debug_setlocal
+                && !(self.scopes.debug_rebinds && info.captured)
+        }
+    }
+    impl full_moon::visitors::Visitor for Walk<'_> {
+        fn visit_local_assignment(&mut self, l: &ast::LocalAssignment) {
+            let exprs: Vec<&Expression> = l.expressions().iter().collect();
+            for (i, name) in l.names().iter().enumerate() {
+                let v = self.scopes.declared(name);
+                // A name past the last expression takes one of its
+                // later values, or nil.
+                if let Some(e) = exprs.get(i)
+                    && self.fixed(v)
+                    && non_nil(self.scopes, &self.out, e)
+                {
+                    self.out.insert(v);
+                }
+            }
+        }
+        fn visit_local_function(&mut self, f: &ast::LocalFunction) {
+            let v = self.scopes.declared(f.name());
+            if self.fixed(v) {
+                self.out.insert(v);
+            }
+        }
+    }
+    let mut walk = Walk {
+        scopes,
+        out: HashSet::new(),
+    };
+    full_moon::visitors::Visitor::visit_ast(&mut walk, ast);
+    walk.out
+}
+
 /// The variable of a numeric `for` with a start and a step of these
 /// types: a float loop when either is a float, an integer loop when
 /// both are integers, else the loop's kind is decided when it starts
@@ -1075,6 +1242,14 @@ impl<'a> Typer<'a> {
                 Suffix::Call(ast::Call::AnonymousCall(_)),
             ] => builtin_member(self.scopes, name, &ident(member)),
             _ => None,
+        }
+    }
+
+    /// Whether `e` is never nil, by its form or by its type.
+    pub fn non_nil(&self, e: &Expression) -> bool {
+        non_nil(self.scopes, &self.known.non_nil_vars, e) || {
+            let ty = self.ty_of(e);
+            ty != Ty::Unknown && !ty.may_be_nil()
         }
     }
 
@@ -1690,6 +1865,11 @@ struct Round<'a> {
     /// Whether `getmetatable` is applied to a receiver the types do
     /// not know, or whether its result is a class: classes escape.
     blind_getmetatable: bool,
+    /// How many loops enclose what is being walked in its function.
+    loops: usize,
+    /// Whether the main chunk's own code holds a `goto` or a label, so
+    /// a statement of it may run more than once.
+    chunk_jumps: bool,
 }
 
 impl<'a> Round<'a> {
@@ -1785,13 +1965,14 @@ impl<'a> Round<'a> {
         }
     }
 
-    /// A store of `ty` into field `name` of the tables of shape `k`.
-    fn store_field(&mut self, k: ShapeId, name: &str, ty: Ty) {
-        let slot = self.out.shapes[k.0 as usize]
-            .fields
-            .get(name)
-            .copied()
-            .unwrap_or(Ty::Unknown);
+    /// A store of `ty` into field `name` of the tables of shape `k`;
+    /// `non_nil` when the value is never nil.
+    fn store_field(&mut self, k: ShapeId, name: &str, ty: Ty, non_nil: bool) {
+        let info = &mut self.out.shapes[k.0 as usize];
+        if !non_nil {
+            info.nil_stores.insert(name.to_string());
+        }
+        let slot = info.fields.get(name).copied().unwrap_or(Ty::Unknown);
         let joined = self.join_into(slot, ty);
         self.out.shapes[k.0 as usize]
             .fields
@@ -1808,10 +1989,18 @@ impl<'a> Round<'a> {
     }
 
     /// A store through `receiver` under `key` of a value of type `ty`:
-    /// into the shape's field or element, or blind.
-    fn store_through(&mut self, receiver: Ty, key: Option<String>, key_ty: Ty, ty: Ty) {
+    /// into the shape's field or element, or blind; `non_nil` when the
+    /// value is never nil.
+    fn store_through(
+        &mut self,
+        receiver: Ty,
+        key: Option<String>,
+        key_ty: Ty,
+        ty: Ty,
+        non_nil: bool,
+    ) {
         match (receiver, key) {
-            (Ty::Shape(k), Some(name)) => self.store_field(k, &name, ty),
+            (Ty::Shape(k), Some(name)) => self.store_field(k, &name, ty, non_nil),
             // Under a number the value is an element and stays typed.
             // Under a string it may land in any field, or under a name
             // that is none; under anything else in the hash part: what
@@ -1829,7 +2018,7 @@ impl<'a> Round<'a> {
                         .cloned()
                         .collect();
                     for name in names {
-                        self.store_field(k, &name, ty);
+                        self.store_field(k, &name, ty, non_nil);
                     }
                 }
                 if !key_is_number(key_ty) {
@@ -2256,7 +2445,7 @@ impl<'a> Round<'a> {
             // its field.
             Binding::Field(env, name, _) => {
                 let receiver = self.known.var(*env);
-                self.store_through(receiver, Some(name.clone()), Ty::Str, ty);
+                self.store_through(receiver, Some(name.clone()), Ty::Str, ty, false);
             }
         }
     }
@@ -2387,7 +2576,10 @@ impl<'a> Round<'a> {
                     }
                 }
                 let types = self.assigned_types(&exprs, targets.len());
-                for (target, ty) in targets.iter().zip(types) {
+                for (i, (target, ty)) in targets.iter().zip(types).enumerate() {
+                    // A target takes the first value of its own
+                    // expression, or one the last expression adds.
+                    let non_nil = exprs.get(i).is_some_and(|e| self.typer().non_nil(e));
                     match target {
                         Var::Name(token) => {
                             if let Some(b) = self.scopes.binding(token).cloned() {
@@ -2413,7 +2605,7 @@ impl<'a> Round<'a> {
                                     }
                                     _ => Ty::Str,
                                 };
-                                self.store_through(receiver, key, key_ty, ty);
+                                self.store_through(receiver, key, key_ty, ty, non_nil);
                             }
                         }
                         _ => {}
@@ -2450,7 +2642,7 @@ impl<'a> Round<'a> {
                     for name in &names[1..path_len] {
                         receiver = self.typer().field_ty(receiver, &ident(name));
                     }
-                    self.store_through(receiver, Some(last), Ty::Str, Ty::Func(id));
+                    self.store_through(receiver, Some(last), Ty::Str, Ty::Func(id), true);
                 }
                 self.function(f.body());
             }
@@ -2479,7 +2671,7 @@ impl<'a> Round<'a> {
                         };
                         self.assign_var(*v, ty);
                     }
-                    self.block(f.block());
+                    self.loop_block(f.block());
                     return;
                 }
                 // `ipairs` gives an integer key and each element; a
@@ -2524,7 +2716,7 @@ impl<'a> Round<'a> {
                     };
                     self.assign_var(*v, ty);
                 }
-                self.block(f.block());
+                self.loop_block(f.block());
             }
             Stmt::If(i) => {
                 self.value(i.condition());
@@ -2572,18 +2764,30 @@ impl<'a> Round<'a> {
                 let ty = numeric_for_ty(start, step);
                 let v = self.scopes.declared(f.index_variable());
                 self.assign_var(v, ty);
-                self.block(f.block());
+                self.loop_block(f.block());
             }
             Stmt::Repeat(r) => {
+                self.loops += 1;
                 self.block(r.block());
                 self.value(r.until());
+                self.loops -= 1;
             }
             Stmt::While(w) => {
+                self.loops += 1;
                 self.value(w.condition());
                 self.block(w.block());
+                self.loops -= 1;
             }
+            Stmt::Goto(_) | Stmt::Label(_) if self.func == CHUNK => self.chunk_jumps = true,
             _ => {}
         }
+    }
+
+    /// A loop's body, which may run any number of times.
+    fn loop_block(&mut self, block: &Block) {
+        self.loops += 1;
+        self.block(block);
+        self.loops -= 1;
     }
 
     /// A nested function: walked as its own, its signature recorded.
@@ -2686,7 +2890,7 @@ impl<'a> Round<'a> {
                 let tys: Vec<Ty> = args.iter().map(|a| self.typer().ty_of(a)).collect();
                 match b.name {
                     "insert" if tys.len() >= 2 => {
-                        self.store_through(tys[0], None, Ty::Int, tys[tys.len() - 1]);
+                        self.store_through(tys[0], None, Ty::Int, tys[tys.len() - 1], false);
                     }
                     // What it reads of a table with a metatable may come
                     // through `__index`.
@@ -2705,7 +2909,7 @@ impl<'a> Round<'a> {
                             }
                         };
                         let into = tys.get(4).copied().unwrap_or(tys[0]);
-                        self.store_through(into, None, Ty::Int, element);
+                        self.store_through(into, None, Ty::Int, element, false);
                     }
                     _ => {}
                 }
@@ -2776,6 +2980,21 @@ impl<'a> Round<'a> {
         match name {
             "setmetatable" => {
                 let meta = tys.get(1).copied().unwrap_or(Ty::Nil);
+                // A metatable that is never nil, given to a table being
+                // built, is the table's from birth; one that may be nil
+                // may take the table's away.
+                if let Ty::Shape(k) = receiver {
+                    let kept = args.get(1).is_some_and(|m| self.typer().non_nil(m));
+                    let built = args.first().and_then(|a| constructor_in(a));
+                    let info = &mut self.out.shapes[k.0 as usize];
+                    match built {
+                        Some(t) if kept => {
+                            info.born_meta.insert(constructor_site(t));
+                        }
+                        _ if kept => {}
+                        _ => info.meta_cleared = true,
+                    }
+                }
                 match (receiver, meta) {
                     (Ty::Shape(k), Ty::Shape(c)) => {
                         self.out.shapes[k.0 as usize].classes.insert(c);
@@ -2814,7 +3033,7 @@ impl<'a> Round<'a> {
                 let key = args.get(1).and_then(|k| crate::scope::literal_string(k));
                 let key_ty = tys.get(1).copied().unwrap_or(Ty::Nil);
                 let value = tys.get(2).copied().unwrap_or(Ty::Nil);
-                self.store_through(receiver, key, key_ty, value);
+                self.store_through(receiver, key, key_ty, value, false);
                 for t in tys.iter().skip(3) {
                     self.escape(*t);
                 }
@@ -3111,6 +3330,11 @@ impl<'a> Round<'a> {
     /// value stores as through an index.
     fn table(&mut self, t: &ast::TableConstructor) {
         let shape = self.shape_for(t);
+        let info = &mut self.out.shapes[shape.0 as usize];
+        info.sites.insert(constructor_site(t));
+        if self.func != CHUNK || self.loops > 0 {
+            info.remade = true;
+        }
         let count = t.fields().len();
         for (i, field) in t.fields().iter().enumerate() {
             match field {
@@ -3119,7 +3343,8 @@ impl<'a> Round<'a> {
                         Some(name) => {
                             self.expr(value);
                             let ty = self.typer().ty_of(value);
-                            self.store_field(shape, &name, ty);
+                            let non_nil = self.typer().non_nil(value);
+                            self.store_field(shape, &name, ty, non_nil);
                         }
                         // Any other key stores as `t[k] = v` does: into
                         // the element, dyn_value or named fields its
@@ -3133,14 +3358,15 @@ impl<'a> Round<'a> {
                             }
                             let key_ty = self.typer().ty_of(key);
                             let ty = self.typer().ty_of(value);
-                            self.store_through(Ty::Shape(shape), None, key_ty, ty);
+                            self.store_through(Ty::Shape(shape), None, key_ty, ty, false);
                         }
                     }
                 }
                 ast::Field::NameKey { key, value, .. } => {
                     self.expr(value);
                     let ty = self.typer().ty_of(value);
-                    self.store_field(shape, &ident(key), ty);
+                    let non_nil = self.typer().non_nil(value);
+                    self.store_field(shape, &ident(key), ty, non_nil);
                 }
                 // A positional value is an element; the last one's
                 // several values all are.
@@ -3336,6 +3562,15 @@ pub fn constructor_site(t: &ast::TableConstructor) -> usize {
     crate::scope::pos_of(t.braces().tokens().0)
 }
 
+/// The constructor `e` is, in parentheses or not.
+fn constructor_in(e: &Expression) -> Option<&ast::TableConstructor> {
+    match e {
+        Expression::TableConstructor(t) => Some(t),
+        Expression::Parentheses { expression, .. } => constructor_in(expression),
+        _ => None,
+    }
+}
+
 /// The shape a constructor's tables have, if one is known.
 pub fn constructor_shape(known: &Inferred, t: &ast::TableConstructor) -> Option<ShapeId> {
     let keys = constructor_keys(t);
@@ -3497,6 +3732,8 @@ pub fn infer(scopes: &Scopes, ast: &ast::Ast) -> Inferred {
                 blind_keyed_reads: Reads::default(),
                 loop_iterator: None,
                 blind_getmetatable: false,
+                loops: 0,
+                chunk_jumps: false,
             },
             named: HashMap::new(),
         };
@@ -3505,6 +3742,7 @@ pub fn infer(scopes: &Scopes, ast: &ast::Ast) -> Inferred {
         known.shape_by_keys = visitor.round.out.shape_by_keys;
         known.shape_by_site = visitor.round.out.shape_by_site;
     }
+    known.non_nil_vars = non_nil_vars(scopes, ast);
     // Two fixed points, one inside the other. The inner one types the
     // chunk with a given set of escaping functions, whose parameters
     // take anything, and notes what else escapes; the outer one adds
@@ -3552,6 +3790,7 @@ fn infer_given(
         shape_by_keys: seed.shape_by_keys.clone(),
         shape_by_site: seed.shape_by_site.clone(),
         escaping: escaping.clone(),
+        non_nil_vars: seed.non_nil_vars.clone(),
         ..Default::default()
     };
     for _ in 0..32 {
@@ -3565,6 +3804,8 @@ fn infer_given(
             blind_keyed_reads: Reads::default(),
             loop_iterator: None,
             blind_getmetatable: false,
+            loops: 0,
+            chunk_jumps: false,
         };
         // The signatures from the last round carry over so a recursive
         // call in this one sees them; params are rejoined from calls.
@@ -3574,6 +3815,7 @@ fn infer_given(
         // their classes and what reaches them are found again.
         round.out.escaping = escaping.clone();
         round.out.settling = known.settling;
+        round.out.non_nil_vars = known.non_nil_vars.clone();
         // A variable the debug library may rebind holds anything; a
         // numeric loop keeps its own kind for its counter.
         if scopes.debug_rebinds || scopes.debug_setlocal {
@@ -3605,6 +3847,13 @@ fn infer_given(
             );
         }
         round.block(ast.nodes());
+        // The chunk's outermost code runs once, unless it jumps or the
+        // chunk is called as a value.
+        if round.chunk_jumps || round.is_escaping(CHUNK) {
+            for shape in &mut round.out.shapes {
+                shape.remade = true;
+            }
+        }
         let chunk = round.returns.take();
         // A chunk used as a value hands what it returns to callers the
         // types do not see.
@@ -3655,8 +3904,9 @@ fn infer_given(
 fn trace_types(scopes: &Scopes, known: &Inferred) {
     if std::env::var_os("ZYNTAX_TRACE_TYPES").is_some() {
         for (i, shape) in known.shapes.iter().enumerate() {
+            let k = ShapeId(i as u32);
             eprintln!(
-                "[types] shape {i}@{}: {:?} born={} element={:?} classes={:?}{}{}{}{}",
+                "[types] shape {i}@{}: {:?} born={} element={:?} classes={:?}{}{}{}{}{}{}{}",
                 shape.line,
                 shape.fields,
                 shape.born,
@@ -3685,6 +3935,17 @@ fn trace_types(scopes: &Scopes, known: &Inferred) {
                         if r.elements { ":elements" } else { "" },
                         if r.through_meta { ":meta" } else { "" },
                     ),
+                },
+                if known.singleton(k) { " once" } else { "" },
+                if known.meta_never_nil(k) {
+                    " meta-kept"
+                } else {
+                    ""
+                },
+                if shape.nil_stores.is_empty() {
+                    String::new()
+                } else {
+                    format!(" nil-stores={:?}", shape.nil_stores)
                 },
             );
         }
