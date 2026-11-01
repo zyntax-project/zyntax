@@ -1358,7 +1358,9 @@ pub fn compile_function_with(
             // ZRTL string pointer and reads it the same way as a
             // runtime-allocated one.
             if let Some(global) = module.globals.get(global_id) {
-                if let Some(&ptr) = memory.globals.get(global_id) {
+                // Another tier's storage first, a string constant's
+                // included: that tier reads the global from there.
+                if let Some(ptr) = memory.bound_global(*global_id) {
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
                     const_idx_for.insert(*val_id, idx);
@@ -2997,6 +2999,13 @@ pub struct ProfileSample {
     pub instructions_executed: u64,
 }
 
+/// Where a module global lives in another execution tier, asked the
+/// first time the interpreter touches the global.
+pub type GlobalSource = std::sync::Arc<dyn Fn(HirId) -> Option<*mut u8> + Send + Sync>;
+
+/// A function's tick callback; see [`HirInterpreter::register_tick_callback`].
+pub type TickCallback = Box<dyn FnMut() -> Option<*const u8> + Send>;
+
 #[derive(Default)]
 pub struct Memory {
     allocations: Vec<Box<[u8]>>,
@@ -3004,6 +3013,8 @@ pub struct Memory {
     /// One storage slot per module global, shared by every function
     /// that names it.
     globals: HashMap<HirId, *mut u8>,
+    /// Asked for a global's storage before the interpreter makes its own.
+    global_source: Option<GlobalSource>,
 }
 
 impl Memory {
@@ -3069,10 +3080,22 @@ impl Memory {
         self.allocations[index] = replacement;
         ptr
     }
-    /// The slot of global `id`, allocated zeroed on first use.
-    pub fn global_slot(&mut self, id: HirId, n_bytes: usize) -> *mut u8 {
+    /// The storage global `id` is bound to, or that the global source
+    /// has for it, which it is then bound to.
+    pub fn bound_global(&mut self, id: HirId) -> Option<*mut u8> {
         if let Some(ptr) = self.globals.get(&id) {
-            return *ptr;
+            return Some(*ptr);
+        }
+        let ptr = self.global_source.as_ref().and_then(|source| source(id))?;
+        self.globals.insert(id, ptr);
+        Some(ptr)
+    }
+
+    /// The slot of global `id`: its [`Self::bound_global`] storage, else
+    /// allocated zeroed on first use.
+    pub fn global_slot(&mut self, id: HirId, n_bytes: usize) -> *mut u8 {
+        if let Some(ptr) = self.bound_global(id) {
+            return ptr;
         }
         let ptr = self.alloc_zeroed(n_bytes.max(8));
         self.globals.insert(id, ptr);
@@ -3176,8 +3199,17 @@ pub struct HirInterpreter {
     /// Per-function tick callbacks. Invoked once per call entry; the
     /// callback returns the function's native entry once one exists,
     /// and the call goes there instead of into the bytecode.
+    tick_callbacks: IdMap<TickCallback>,
+    /// Makes a function's tick callback at its first call, when none was
+    /// registered; see [`Self::set_tick_source`].
     #[allow(clippy::type_complexity)]
-    tick_callbacks: IdMap<Box<dyn FnMut() -> Option<*const u8> + Send>>,
+    tick_source: Option<Box<dyn FnMut(HirId) -> Option<TickCallback> + Send>>,
+    /// Functions the tick source had no callback for.
+    tick_misses: std::collections::HashSet<HirId, std::hash::BuildHasherDefault<fnv::FnvHasher>>,
+    /// The generation of the tick source the callbacks were made by.
+    tick_generation: Option<u64>,
+    /// The generation of the global source the bound slots came from.
+    global_generation: Option<u64>,
     /// Where a function's body comes from when the runtime keeps one
     /// apart from the module's: see [`Self::set_body_source`].
     body_source: Option<Box<dyn FnMut(HirId) -> Option<std::sync::Arc<HirFunction>> + Send>>,
@@ -3349,6 +3381,10 @@ impl HirInterpreter {
             cache: IdMap::default(),
             uncompilable: IdMap::default(),
             tick_callbacks: IdMap::default(),
+            tick_source: None,
+            tick_misses: Default::default(),
+            tick_generation: None,
+            global_generation: None,
             body_source: None,
             source_bodies: IdMap::default(),
             frame_exit_hook: None,
@@ -3488,12 +3524,65 @@ impl HirInterpreter {
     /// the function; returning `Some(entry)` sends the call to that
     /// native code. The host-side beadie wrapper plugs `on_invoke` in
     /// here.
-    pub fn register_tick_callback(
-        &mut self,
-        func_id: HirId,
-        cb: Box<dyn FnMut() -> Option<*const u8> + Send>,
-    ) {
+    pub fn register_tick_callback(&mut self, func_id: HirId, cb: TickCallback) {
         self.tick_callbacks.insert(func_id, cb);
+    }
+
+    /// Make each function's tick callback at its first call from
+    /// `source`, for functions none was registered for. A source of
+    /// another `generation` than the last drops the callbacks made
+    /// before: they hold what that generation compiled with.
+    pub fn set_tick_source(
+        &mut self,
+        source: Box<dyn FnMut(HirId) -> Option<TickCallback> + Send>,
+        generation: u64,
+    ) {
+        if self.tick_generation != Some(generation) {
+            self.clear_tick_callbacks();
+        }
+        self.tick_source = Some(source);
+        self.tick_generation = Some(generation);
+    }
+
+    /// Drop every tick callback, so each is made anew at the function's
+    /// next call.
+    pub fn clear_tick_callbacks(&mut self) {
+        self.tick_callbacks = IdMap::default();
+        self.tick_misses.clear();
+    }
+
+    /// The tick of a function's first call with no callback yet: makes
+    /// one from the tick source and runs it.
+    fn first_tick(&mut self, func_id: HirId) -> Option<*const u8> {
+        if self.tick_misses.contains(&func_id) {
+            return None;
+        }
+        let made = self.tick_source.as_mut().and_then(|source| source(func_id));
+        let Some(mut cb) = made else {
+            self.tick_misses.insert(func_id);
+            return None;
+        };
+        let native = cb();
+        self.tick_callbacks.insert(func_id, cb);
+        native
+    }
+
+    /// Find module globals' storage through `source` as the interpreter
+    /// first touches them. The slots it holds already are looked up
+    /// again under a new `generation`, the first included: a source of
+    /// another generation than the last moved them.
+    pub fn set_global_source(&mut self, source: GlobalSource, generation: u64) {
+        let moved = self.global_generation != Some(generation);
+        self.memory.global_source = Some(std::sync::Arc::clone(&source));
+        self.global_generation = Some(generation);
+        if moved {
+            let bound: Vec<HirId> = self.memory.globals.keys().copied().collect();
+            for id in bound {
+                if let Some(ptr) = source(id) {
+                    self.bind_global_slot(id, ptr);
+                }
+            }
+        }
     }
 
     /// The body to run for a function, asked once at its first run,
@@ -3517,7 +3606,9 @@ impl HirInterpreter {
     /// Drop the bridge and every tick callback. They hold the native
     /// tiers' backends, which the runtime shuts down after them.
     pub fn clear_native_bridge(&mut self) {
-        self.tick_callbacks = IdMap::default();
+        self.clear_tick_callbacks();
+        self.tick_source = None;
+        self.memory.global_source = None;
         self.thunk_source = None;
         self.entry_source = None;
         self.bead_source = None;
@@ -4071,7 +4162,7 @@ impl HirInterpreter {
         let phases = first && std::env::var_os("ZYNTAX_TRACE_LOWER_PHASES").is_some();
         let native = match self.tick_callbacks.get_mut(&func_id) {
             Some(cb) => cb(),
-            None => None,
+            None => self.first_tick(func_id),
         };
         if let Some(entry) = native {
             return self.call_function_natively(module, func_id, entry, &args, dest);

@@ -798,15 +798,24 @@ impl TieredRuntime {
 
         let started = web_time::Instant::now();
         // Store function name -> ID mapping and signatures (resolve InternedString to actual string)
+        // The interpreter ticks the function each name stands for now.
+        let mut ticked = Vec::new();
+        let mut unticked = Vec::new();
         for (id, func) in &module.functions {
             if let Some(name) = func.name.resolve_global() {
-                self.function_ids.insert(name.clone(), *id);
+                if let Some(old) = self.function_ids.insert(name.clone(), *id)
+                    && old != *id
+                {
+                    unticked.push(old);
+                }
+                ticked.push(*id);
 
                 // Store the function signature for later use in call/call_async
                 let native_sig = NativeSignature::from_hir_signature(&func.signature);
                 self.function_signatures.insert(name, native_sig);
             }
         }
+        self.backend.set_ticked_functions(ticked, unticked);
 
         // A joining module stays at its tier, so it asks for no other.
         self.backend
@@ -861,10 +870,9 @@ impl TieredRuntime {
         // code, which holds the interpreter. Such a chunk is entered by
         // native pointer and runs natively, so it needs no binding, and
         // its constants are initialised natively too.
-        let binding = self.backend.interpreter_binding(
-            Arc::clone(&self.plugin_signatures),
-            self.function_ids.values().copied(),
-        );
+        let binding = self
+            .backend
+            .interpreter_binding(Arc::clone(&self.plugin_signatures));
         // Calls native code makes before a function has code run in
         // interpreters bound the same way, the chunk's functions included.
         binding.serve_native_calls();
@@ -1993,10 +2001,9 @@ impl TieredRuntime {
     /// a reload or a rollback replaces. Skipped while the interpreter
     /// is running, as at load.
     fn rebind_interpreter_ticks(&self) {
-        let binding = self.backend.interpreter_binding(
-            Arc::clone(&self.plugin_signatures),
-            self.function_ids.values().copied(),
-        );
+        let binding = self
+            .backend
+            .interpreter_binding(Arc::clone(&self.plugin_signatures));
         binding.serve_native_calls();
         let Ok(mut interp) = self.interpreter.try_lock() else {
             return;

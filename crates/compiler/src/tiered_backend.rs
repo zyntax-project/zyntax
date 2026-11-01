@@ -1343,6 +1343,15 @@ pub struct TieredBackend {
 
     /// Runtime FFI symbols registered post-construction.
     runtime_symbols: Arc<RwLock<Vec<RuntimeSymbol>>>,
+    /// The symbol table interpreters share, with the count of registered
+    /// symbols and the signature map it was made from.
+    #[allow(clippy::type_complexity)]
+    shared_symbols: Mutex<Option<(usize, usize, Arc<crate::hir_interp::SharedSymbols>)>>,
+    /// The loaded functions as interpreters' bindings see them.
+    binding_view: Arc<RwLock<BindingView>>,
+    /// Bumped whenever the callbacks an interpreter made from a binding
+    /// go stale: a new compile queue, a reload, a rollback.
+    binding_generation: u64,
 
     config: TieredConfig,
 }
@@ -1452,6 +1461,9 @@ impl TieredBackend {
             first_compiles: Arc::new((Mutex::new(HashMap::new()), std::sync::Condvar::new())),
             held_promotions: Arc::new(Mutex::new(HashMap::new())),
             runtime_symbols: Arc::new(RwLock::new(Vec::new())),
+            shared_symbols: Mutex::new(None),
+            binding_view: Arc::new(RwLock::new(BindingView::default())),
+            binding_generation: 0,
             config,
         })
     }
@@ -1668,6 +1680,7 @@ impl TieredBackend {
                 },
             );
         }
+        self.publish_bindings(module_context.functions.keys());
 
         // Every bead now exists, so the handlers can capture them. The
         // lazy compiler first: the requester hands interpreted requests
@@ -1676,6 +1689,11 @@ impl TieredBackend {
         // earlier functions for the first time afterwards.
         self.lazy.extend(lazy.iter().copied());
         self.finished.extend(finished.iter().copied());
+        {
+            let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
+            view.lazy.extend(lazy.iter().copied());
+            view.finished.extend(finished.iter().copied());
+        }
         if !lazy.is_empty() {
             let (all_lazy, all_finished) = (self.lazy.clone(), self.finished.clone());
             self.install_lazy_compiler(&all_lazy, &all_finished);
@@ -1843,6 +1861,7 @@ impl TieredBackend {
                 entry.body_source = Some(Arc::clone(&bodies));
             }
         }
+        self.publish_bindings(module.functions.keys());
         self.loaded[at] = Loaded {
             module: shells,
             bodies: Some(bodies),
@@ -2531,6 +2550,7 @@ impl TieredBackend {
         self.reloaded = Some(Arc::clone(&module_context));
         self.globals_moved += 1;
         self.current_module = Some(module_context);
+        self.publish_all_bindings();
 
         // The promotion requester captured each function's body when it
         // was installed; reinstall so a later promotion compiles the
@@ -2620,6 +2640,7 @@ impl TieredBackend {
             self.reloaded = Some(Arc::clone(module));
         }
         self.globals_moved += 1;
+        self.publish_all_bindings();
 
         self.scratches.clear();
         self.install_promotion_requester();
@@ -3282,12 +3303,44 @@ impl TieredBackend {
     /// global slots, an entry callback for each of `ticks`, bodies,
     /// addresses and the bridge into native code. Bound into the
     /// runtime's interpreter and into those native calls enter.
+    /// Bound in the same time however much is loaded: the parts share
+    /// the backend's view of the loaded functions, global slots and tick
+    /// callbacks are found as the interpreter first needs them, and the
+    /// symbol table is made again only once more symbols are registered.
     pub fn interpreter_binding(
         &self,
         typed: Arc<HashMap<String, crate::zrtl::ZrtlSymbolSig>>,
-        ticks: impl IntoIterator<Item = HirId>,
     ) -> InterpreterBinding {
+        InterpreterBinding {
+            parts: Arc::new(self.binding_parts()),
+            symbols: self.shared_symbols(typed),
+            globals_moved: self.globals_moved,
+        }
+    }
+
+    /// The runtime symbols, typed where `typed` names one, as one table
+    /// interpreters share and build on their first lookup.
+    fn shared_symbols(
+        &self,
+        typed: Arc<HashMap<String, crate::zrtl::ZrtlSymbolSig>>,
+    ) -> Arc<crate::hir_interp::SharedSymbols> {
         use crate::hir_interp::SymbolEntry;
+        let count = self
+            .runtime_symbols
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let signatures = Arc::as_ptr(&typed) as usize;
+        let mut cached = self
+            .shared_symbols
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((n, sigs, shared)) = cached.as_ref()
+            && *n == count
+            && *sigs == signatures
+        {
+            return Arc::clone(shared);
+        }
         let registered = Arc::clone(&self.runtime_symbols);
         let symbols: Box<dyn FnOnce() -> HashMap<String, SymbolEntry> + Send> =
             Box::new(move || {
@@ -3305,43 +3358,71 @@ impl TieredBackend {
                     })
                     .collect()
             });
-        InterpreterBinding {
-            parts: Arc::new(self.binding_parts()),
-            symbols: Arc::new(std::sync::LazyLock::new(symbols)),
-            globals: Arc::new(
-                self.interpreter_globals()
-                    .into_iter()
-                    .map(|(id, ptr)| (id, ptr as usize))
-                    .collect(),
-            ),
-            ticks: Arc::new(ticks.into_iter().collect()),
+        let shared = Arc::new(std::sync::LazyLock::new(symbols));
+        *cached = Some((count, signatures, Arc::clone(&shared)));
+        shared
+    }
+
+    /// Change which functions an interpreter's calls tick, as the host
+    /// names them: `added` ticked from now on, `removed` no longer.
+    pub fn set_ticked_functions(
+        &self,
+        added: impl IntoIterator<Item = HirId>,
+        removed: impl IntoIterator<Item = HirId>,
+    ) {
+        let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
+        for id in removed {
+            view.ticked.remove(&id);
         }
+        view.ticked.extend(added);
+    }
+
+    /// Bring the binding view's entries for `ids` up to date with the
+    /// backend's: added, changed, or gone.
+    fn publish_bindings<'a>(&self, ids: impl IntoIterator<Item = &'a HirId>) {
+        let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            match self.functions.get(id) {
+                Some(entry) => {
+                    view.by_bead.insert(entry.bead_id, *id);
+                    view.functions.insert(*id, BoundFunction::of(entry));
+                }
+                None => {
+                    if let Some(gone) = view.functions.remove(id) {
+                        view.by_bead.remove(&gone.bead_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make the binding view anew from the backend, after a change that
+    /// touches every function, and let interpreters remake the
+    /// callbacks they made from it.
+    fn publish_all_bindings(&mut self) {
+        let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
+        view.functions = self
+            .functions
+            .iter()
+            .map(|(id, entry)| (*id, BoundFunction::of(entry)))
+            .collect();
+        view.by_bead = view
+            .functions
+            .iter()
+            .map(|(id, f)| (f.bead_id, *id))
+            .collect();
+        view.lazy = self.lazy.clone();
+        view.finished = self.finished.clone();
+        view.static_hot = self.static_hot.clone();
+        drop(view);
+        self.binding_generation += 1;
     }
 
     /// The loaded functions as the interpreter's bindings see them.
     fn binding_parts(&self) -> BindingParts {
-        let functions: HashMap<HirId, BoundFunction> = self
-            .functions
-            .iter()
-            .map(|(id, e)| {
-                (
-                    *id,
-                    BoundFunction {
-                        bound: e.bound.clone(),
-                        module: Arc::clone(&e.module),
-                        function: e.function.clone(),
-                        body_source: e.body_source.clone(),
-                        bead_id: e.bead_id,
-                    },
-                )
-            })
-            .collect();
         BindingParts {
-            by_bead: functions.iter().map(|(id, f)| (f.bead_id, *id)).collect(),
-            functions,
-            lazy: self.lazy.clone(),
-            finished: self.finished.clone(),
-            static_hot: self.static_hot.clone(),
+            view: Arc::clone(&self.binding_view),
+            generation: self.binding_generation,
             cranelift: Arc::clone(&self.cranelift),
             #[cfg(feature = "llvm-backend")]
             llvm: self.llvm.as_ref().map(Arc::clone),
@@ -4131,6 +4212,7 @@ impl TieredBackend {
             let queue = Arc::new(CompileQueue::new(Arc::clone(&stop), workers));
             osr::set_compile_workers_present(true);
             self.compile_queue = Some(Arc::clone(&queue));
+            self.binding_generation += 1;
             *queue_cell.lock().unwrap() = Some(Arc::clone(&queue));
             // Quick baselines the workers before these had not replaced.
             for (bead_id, compiled) in self.first_compiles.0.lock().unwrap().iter() {
@@ -4245,16 +4327,23 @@ impl TieredBackend {
     fn static_hot_beads(&mut self, lazy: &HashSet<HirId>) -> HashSet<u64> {
         let off = std::env::var_os("ZYNTAX_DISABLE_STATIC_HOT").is_some();
         let mut beads = HashSet::new();
+        let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
         for id in lazy {
             let Some(entry) = self.functions.get(id) else {
                 continue;
             };
-            let hot =
-                *self.static_hot.entry(*id).or_insert_with(|| {
-                    !off && entry.module.functions.get(id).is_some_and(|f| {
-                        !f.attributes.cold && crate::loop_facts::hot_static_loop(f)
-                    })
-                });
+            let hot = match self.static_hot.get(id) {
+                Some(hot) => *hot,
+                None => {
+                    let hot = !off
+                        && entry.module.functions.get(id).is_some_and(|f| {
+                            !f.attributes.cold && crate::loop_facts::hot_static_loop(f)
+                        });
+                    self.static_hot.insert(*id, hot);
+                    view.static_hot.insert(*id, hot);
+                    hot
+                }
+            };
             if hot {
                 beads.insert(entry.bead_id);
             }
@@ -4938,6 +5027,7 @@ impl TieredBackend {
             osr::unregister_bead(entry.bead_id);
         }
         self.functions.clear();
+        *self.binding_view.write().unwrap_or_else(|e| e.into_inner()) = BindingView::default();
     }
 
     /// Register an FFI symbol (used when reloading modules to make ZRTL
@@ -5661,15 +5751,40 @@ struct BoundFunction {
     bead_id: u64,
 }
 
+impl BoundFunction {
+    fn of(entry: &FunctionEntry) -> Self {
+        Self {
+            bound: entry.bound.clone(),
+            module: Arc::clone(&entry.module),
+            function: entry.function.clone(),
+            body_source: entry.body_source.clone(),
+            bead_id: entry.bead_id,
+        }
+    }
+}
+
+/// The loaded functions as interpreters' bindings see them: kept by
+/// the backend as functions load, change and go, and shared by every
+/// binding rather than copied into each.
+#[derive(Default)]
+struct BindingView {
+    functions: HashMap<HirId, BoundFunction>,
+    by_bead: HashMap<u64, HirId>,
+    /// The functions an interpreter ticks: see
+    /// [`TieredBackend::set_ticked_functions`].
+    ticked: HashSet<HirId>,
+    lazy: HashSet<HirId>,
+    finished: HashSet<HirId>,
+    static_hot: HashMap<HirId, bool>,
+}
+
 /// The loaded functions and the backend pieces an interpreter's
 /// callbacks reach, taken as they stand: every callback is made from
 /// it, as often as asked and on any thread.
 struct BindingParts {
-    functions: HashMap<HirId, BoundFunction>,
-    by_bead: HashMap<u64, HirId>,
-    lazy: HashSet<HirId>,
-    finished: HashSet<HirId>,
-    static_hot: HashMap<HirId, bool>,
+    view: Arc<RwLock<BindingView>>,
+    /// The backend's binding generation when these parts were taken.
+    generation: u64,
     cranelift: Arc<ZyntaxCraneliftBackend>,
     #[cfg(feature = "llvm-backend")]
     llvm: Option<Arc<ZyntaxLlvmBackend>>,
@@ -5696,7 +5811,8 @@ impl BindingParts {
         &self,
         func_id: HirId,
     ) -> Option<Box<dyn FnMut() -> Option<*const u8> + Send>> {
-        let entry = self.functions.get(&func_id)?;
+        let view = self.view.read().unwrap_or_else(|e| e.into_inner());
+        let entry = view.functions.get(&func_id)?;
         // Everything a compile needs, behind one count the closure
         // handed to beadie clones per call.
         struct Compile {
@@ -5728,7 +5844,7 @@ impl BindingParts {
         });
         let bound = entry.bound.clone();
         let adapter = Arc::clone(&self.adapter);
-        let lazy = self.lazy.contains(&func_id);
+        let lazy = view.lazy.contains(&func_id);
         let threshold = self.baseline_threshold.max(1);
         // Calls at which a function counts as warm: it will cross the
         // threshold if the program goes on as it has, so its compile is
@@ -5738,7 +5854,8 @@ impl BindingParts {
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let queue = self.compile_queue.clone();
         let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
-        let mut compile_first = self.static_hot.get(&func_id).copied().unwrap_or(false);
+        let mut compile_first = view.static_hot.get(&func_id).copied().unwrap_or(false);
+        drop(view);
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
                 // A loop hot before the first call: that call waits for
@@ -5830,6 +5947,38 @@ impl BindingParts {
         }))
     }
 
+    /// Makes the [`Self::tick_callback`] of each function the host has
+    /// it tick at the function's first call.
+    fn tick_source(
+        self: &Arc<Self>,
+    ) -> Box<dyn FnMut(HirId) -> Option<crate::hir_interp::TickCallback> + Send> {
+        let parts = Arc::clone(self);
+        Box::new(move |id| {
+            let ticked = parts
+                .view
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ticked
+                .contains(&id);
+            if ticked {
+                parts.tick_callback(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Where a module global lives in the ground tier, read when the
+    /// interpreter first touches it.
+    fn global_source(&self) -> crate::hir_interp::GlobalSource {
+        let cranelift = Arc::clone(&self.cranelift);
+        Arc::new(move |id| {
+            cranelift
+                .with_lock(|be| be.global_data_addr(id))
+                .map(|(ptr, _)| ptr as *mut u8)
+        })
+    }
+
     /// The body the interpreter runs for each lazy function: the
     /// optimised one once its first compile has made it, so a frame can
     /// move to the code compiled from it; before that, the module's as
@@ -5840,47 +5989,37 @@ impl BindingParts {
     /// optimiser does to it. `None` leaves the module's body to the
     /// interpreter.
     fn body_source(&self) -> Box<dyn FnMut(HirId) -> Option<Arc<HirFunction>> + Send> {
-        let beads: HashMap<HirId, u64> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bead_id))
-            .collect();
+        let view = Arc::clone(&self.view);
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let interp_bodies = Arc::clone(&self.interp_bodies);
         let make_interp_body = self.make_interp_body.clone();
-        let finished = self.finished.clone();
-        // A finished body kept encoded is decoded as it was stored when
-        // no optimiser answers for it, as the module's own copy would be.
-        let sources: HashMap<HirId, Arc<LazyModule>> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| finished.contains(id))
-            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
-            .collect();
-        // A joined module's bodies, kept encoded once its code is
-        // installed: the only functions outside `lazy` with a source.
-        let kept: HashMap<HirId, Arc<LazyModule>> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| !self.lazy.contains(id))
-            .filter_map(|(id, entry)| Some((*id, Arc::clone(entry.body_source.as_ref()?))))
-            .collect();
         Box::new(move |id: HirId| {
-            if let Some(source) = kept.get(&id) {
-                return source.function(id).map(Arc::new);
+            let (lazy, finished, bead, source) = {
+                let view = view.read().unwrap_or_else(|e| e.into_inner());
+                let entry = view.functions.get(&id)?;
+                (
+                    view.lazy.contains(&id),
+                    view.finished.contains(&id),
+                    entry.bead_id,
+                    entry.body_source.clone(),
+                )
+            };
+            // A joined module's bodies, kept encoded once its code is
+            // installed: the only functions outside `lazy` with a source.
+            if !lazy {
+                return source?.function(id).map(Arc::new);
             }
-            let bead = beads.get(&id)?;
             let tier = match optimized_bodies.get(id) {
                 Some(body) => Some(body),
-                None if finished.contains(&id) => {
-                    Some(osr::lazy_optimized_body(*bead).or_else(|| {
-                        sources
-                            .get(&id)
-                            .and_then(|source| source.function(id))
-                            .map(Arc::new)
-                    })?)
-                }
+                // A finished body kept encoded is decoded as it was
+                // stored when no optimiser answers for it, as the
+                // module's own copy would be.
+                None if finished => Some(osr::lazy_optimized_body(bead).or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|source| source.function(id))
+                        .map(Arc::new)
+                })?),
                 None => None,
             };
             if let Some(body) = tier {
@@ -5892,7 +6031,7 @@ impl BindingParts {
                     .tier_weak = Arc::downgrade(&body);
                 return Some(body);
             }
-            interp_body(&interp_bodies, id, *bead, make_interp_body.as_ref())
+            interp_body(&interp_bodies, id, bead, make_interp_body.as_ref())
         })
     }
 
@@ -5902,16 +6041,18 @@ impl BindingParts {
     /// body the first time, which is mostly run once. Answers whether
     /// it was.
     fn frame_exit_hook(&self) -> Box<dyn FnMut(HirId) -> bool + Send> {
-        let beads: HashMap<HirId, TieredBound> = self
-            .functions
-            .iter()
-            .filter(|(id, _)| self.lazy.contains(id))
-            .map(|(id, e)| (*id, e.bound.clone()))
-            .collect();
+        let view = Arc::clone(&self.view);
         let interp_bodies = Arc::clone(&self.interp_bodies);
         Box::new(move |id: HirId| {
-            let Some(bound) = beads.get(&id) else {
-                return false;
+            let bound = {
+                let view = view.read().unwrap_or_else(|e| e.into_inner());
+                if !view.lazy.contains(&id) {
+                    return false;
+                }
+                match view.functions.get(&id) {
+                    Some(f) => f.bound.clone(),
+                    None => return false,
+                }
             };
             let mut bodies = interp_bodies.lock().unwrap();
             let Some(entry) = bodies.get_mut(&id) else {
@@ -5934,18 +6075,20 @@ impl BindingParts {
     /// stub, or the code a tier above installed in a bead.
     fn address_source(&self) -> Box<dyn Fn(usize) -> Option<HirId> + Send + Sync> {
         let cranelift = Arc::clone(&self.cranelift);
-        let beads: Vec<(HirId, TieredBound)> = self
-            .functions
-            .iter()
-            .map(|(id, e)| (*id, e.bound.clone()))
-            .collect();
+        let view = Arc::clone(&self.view);
         Box::new(move |addr: usize| {
             if let Some(id) = cranelift.with_lock(|be| be.function_at(addr)) {
                 return Some(id);
             }
-            beads
+            let view = view.read().unwrap_or_else(|e| e.into_inner());
+            view.functions
                 .iter()
-                .find(|(_, bound)| bound.bead().compiled().is_some_and(|p| p as usize == addr))
+                .find(|(_, f)| {
+                    f.bound
+                        .bead()
+                        .compiled()
+                        .is_some_and(|p| p as usize == addr)
+                })
                 .map(|(id, _)| *id)
         })
     }
@@ -5976,15 +6119,11 @@ impl BindingParts {
         });
         // With OSR off an interpreted loop stays where it is, as a
         // native one does.
-        let beads: HashMap<HirId, u64> = if self.enable_osr {
-            self.functions
-                .iter()
-                .map(|(id, e)| (*id, e.bead_id))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-        let bead = Box::new(move |id: HirId| beads.get(&id).copied());
+        let view = self.enable_osr.then(|| Arc::clone(&self.view));
+        let bead = Box::new(move |id: HirId| {
+            let view = view.as_ref()?.read().unwrap_or_else(|e| e.into_inner());
+            view.functions.get(&id).map(|f| f.bead_id)
+        });
         (thunk, entry, bead)
     }
 }
@@ -5997,18 +6136,16 @@ impl BindingParts {
 pub struct InterpreterBinding {
     parts: Arc<BindingParts>,
     symbols: Arc<crate::hir_interp::SharedSymbols>,
-    globals: Arc<Vec<(HirId, usize)>>,
-    ticks: Arc<Vec<HirId>>,
+    /// The backend's count of global moves when the binding was taken.
+    globals_moved: u64,
 }
 
 impl InterpreterBinding {
     /// Give `interp` every symbol, global slot and callback.
     pub fn bind(&self, interp: &mut crate::hir_interp::HirInterpreter) {
         interp.share_symbols(Arc::clone(&self.symbols));
-        for (id, ptr) in self.globals.iter() {
-            interp.bind_global_slot(*id, *ptr as *mut u8);
-        }
-        self.bind_ticks(interp);
+        interp.set_global_source(self.parts.global_source(), self.globals_moved);
+        interp.set_tick_source(self.parts.tick_source(), self.parts.generation);
         interp.set_body_source(self.parts.body_source());
         interp.set_frame_exit_hook(self.parts.frame_exit_hook());
         interp.set_address_source(self.parts.address_source());
@@ -6017,19 +6154,17 @@ impl InterpreterBinding {
     }
 
     /// Give `interp` each function's entry callback anew, as a reload
-    /// that swapped bodies needs.
+    /// that swapped bodies needs: each is made again at its next call.
     pub fn bind_ticks(&self, interp: &mut crate::hir_interp::HirInterpreter) {
-        for id in self.ticks.iter() {
-            if let Some(tick) = self.parts.tick_callback(*id) {
-                interp.register_tick_callback(*id, tick);
-            }
-        }
+        interp.clear_tick_callbacks();
+        interp.set_tick_source(self.parts.tick_source(), self.parts.generation);
     }
 
     /// The function behind `bead_id` and the module it runs in.
     fn function_of_bead(&self, bead_id: u64) -> Option<(HirId, Arc<HirModule>)> {
-        let id = *self.parts.by_bead.get(&bead_id)?;
-        let f = self.parts.functions.get(&id)?;
+        let view = self.parts.view.read().unwrap_or_else(|e| e.into_inner());
+        let id = *view.by_bead.get(&bead_id)?;
+        let f = view.functions.get(&id)?;
         Some((id, Arc::clone(&f.module)))
     }
 
@@ -6064,8 +6199,9 @@ impl InterpreterBinding {
             // in the interpreter for its whole run, and a library body is
             // a shell in the module, compiled as it is.
             let runs = *eligible.lock().unwrap().entry(bead_id).or_insert_with(|| {
-                binding.parts.lazy.contains(&func_id)
-                    && !binding.parts.finished.contains(&func_id)
+                let view = binding.parts.view.read().unwrap_or_else(|e| e.into_inner());
+                view.lazy.contains(&func_id)
+                    && !view.finished.contains(&func_id)
                     && module.functions.get(&func_id).is_some_and(|f| {
                         !f.blocks.is_empty() && osr::find_loop_headers(f).is_empty()
                     })
