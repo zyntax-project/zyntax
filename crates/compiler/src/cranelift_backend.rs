@@ -658,6 +658,44 @@ struct StructLayout {
     alignment: u32,
 }
 
+/// Whether a callee declared as `declared` takes the calls code compiled
+/// against `expected` makes. The two are the same text, except that the
+/// code may extend a narrow argument its callee, declared here, does not
+/// ask for: a function the program defines is declared without the
+/// extension an external declaration of it carries. The caller extending
+/// more than the callee assumes is safe; the callee assuming an extension
+/// the caller does not make is not.
+fn callee_signature_accepts(declared: &str, expected: &str) -> bool {
+    if declared == expected {
+        return true;
+    }
+    let split = |text: &str| -> Option<(Vec<String>, String)> {
+        let open = text.find('(')?;
+        let close = text.find(')')?;
+        let params = text[open + 1..close]
+            .split(", ")
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Some((params, text[close + 1..].to_owned()))
+    };
+    let (Some((declared_params, declared_rest)), Some((expected_params, expected_rest))) =
+        (split(declared), split(expected))
+    else {
+        return false;
+    };
+    declared_rest == expected_rest
+        && declared_params.len() == expected_params.len()
+        && declared_params.iter().zip(&expected_params).all(|(d, e)| {
+            d == e
+                || (!d.ends_with(" uext")
+                    && !d.ends_with(" sext")
+                    && [" uext", " sext"]
+                        .iter()
+                        .any(|ext| *e == format!("{d}{ext}")))
+        })
+}
+
 /// The ISA every JIT module of this process compiles for. Opt level is
 /// fixed on the ISA, so it is process-wide rather than per tier:
 /// `ZYNTAX_OPT_LEVEL=none|speed|speed_and_size` measures what
@@ -1059,7 +1097,10 @@ impl CraneliftBackend {
             };
             let callee = &callee;
             let declared = signature_of(self, here(*callee));
-            if declared.as_deref() != Some(signature) {
+            if !declared
+                .as_deref()
+                .is_some_and(|d| callee_signature_accepts(d, signature))
+            {
                 let caller = placeable
                     .iter()
                     .find(|f| {
@@ -12631,6 +12672,23 @@ fn block_param_sources(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_callee_asks_for_no_more_extension_than_the_code_makes() {
+        use super::callee_signature_accepts as accepts;
+        let code = "(i64, i64, i8 uext) -> i8 system_v";
+        // The program defines the function: no extension assumed.
+        assert!(accepts("(i64, i64, i8) -> i8 system_v", code));
+        assert!(accepts(code, code));
+        // The callee assumes an extension the code does not make.
+        assert!(!accepts(code, "(i64, i64, i8) -> i8 system_v"));
+        assert!(!accepts("(i64, i64, i8 sext) -> i8 system_v", code));
+        // Anything else that differs still declines.
+        assert!(!accepts("(i64, i8) -> i8 system_v", code));
+        assert!(!accepts("(i64, i64, i16) -> i8 system_v", code));
+        assert!(!accepts("(i64, i64, i8) -> i32 system_v", code));
+        assert!(!accepts("(i64, i64, i8) -> i8 fast", code));
+    }
+
     use super::*;
 
     #[test]
