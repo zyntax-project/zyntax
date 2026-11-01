@@ -783,40 +783,55 @@ impl Drop for BaselineBusy {
     }
 }
 
-/// Hold an optimizing compile until the baseline tier has gone quiet:
-/// no baseline compile under way and none for the quiet window. While
-/// the program is still reaching new code the baseline compiles take
-/// the cores, and a short run ends on baseline code before an
-/// optimizing install would pay for itself; a running loop moves up
-/// through its resume points once the compile lands. Waits at most
-/// [`OPTIMIZE_WAIT_MAX`]. `ZYNTAX_OPTIMIZE_QUIET_MS=<n>` sets the
-/// window, 0 waiting for nothing; safe to run with.
+/// Whether an optimizing compile can run beside `in_flight` baseline
+/// compiles on `cores`: when none is under way, or when they, the
+/// program's thread and the compile together fit the cores.
+fn baseline_leaves_a_core(in_flight: usize, cores: usize) -> bool {
+    in_flight == 0 || in_flight + 2 <= cores
+}
+
+/// Hold an optimizing compile until the baseline tier leaves a core
+/// free: while the baseline compiles the program waits on or asked for
+/// would, with the program's own thread and this compile, take more
+/// threads than the process has cores, they take the cores a short run
+/// needs them for. Waits at most [`OPTIMIZE_WAIT_MAX`].
+/// `ZYNTAX_OPTIMIZE_QUIET_MS=<n>` waits instead for the baseline to be
+/// idle for n ms, 0 waiting for nothing; safe to run with.
 fn wait_for_baseline_quiet() {
-    static QUIET_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static QUIET_US: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let quiet = *QUIET_US.get_or_init(|| {
         std::env::var("ZYNTAX_OPTIMIZE_QUIET_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(OPTIMIZE_QUIET_MS)
-            * 1000
+            .map(|ms| ms * 1000)
     });
-    if quiet == 0 {
+    if quiet == Some(0) {
         return;
     }
+    // The threads that may run at once, for the whole wait.
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
     let started = web_time::Instant::now();
     loop {
-        let now = baseline_epoch().elapsed().as_micros() as u64;
-        let idle = BASELINE_IN_FLIGHT.load(Ordering::Acquire) == 0
-            && now.saturating_sub(BASELINE_LAST_US.load(Ordering::Acquire)) >= quiet;
+        let in_flight = BASELINE_IN_FLIGHT.load(Ordering::Acquire);
+        let idle = match quiet {
+            Some(quiet) => {
+                let now = baseline_epoch().elapsed().as_micros() as u64;
+                in_flight == 0
+                    && now.saturating_sub(BASELINE_LAST_US.load(Ordering::Acquire)) >= quiet
+            }
+            None => baseline_leaves_a_core(in_flight, cores),
+        };
         if idle || started.elapsed() >= OPTIMIZE_WAIT_MAX {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
-
-/// The baseline quiet time an optimizing compile waits for.
-const OPTIMIZE_QUIET_MS: u64 = 20;
 
 /// The stack a first-call compile runs on: the calling thread's, when it
 /// has this much room left, else a thread started with it.
@@ -6608,6 +6623,18 @@ fn remap_body(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_optimizing_compile_waits_only_when_the_cores_are_taken() {
+        use super::baseline_leaves_a_core;
+        // Nothing to wait for, whatever the cores.
+        assert!(baseline_leaves_a_core(0, 1));
+        // One baseline compile, the program and this compile: three threads.
+        assert!(!baseline_leaves_a_core(1, 2));
+        assert!(baseline_leaves_a_core(1, 3));
+        assert!(!baseline_leaves_a_core(3, 4));
+        assert!(baseline_leaves_a_core(2, 4));
+    }
+
     #[cfg(feature = "llvm-backend")]
     use super::llvm_whole_body_has_headroom;
     use super::{llvm_list_entry_has_headroom, record_profile_sample};
