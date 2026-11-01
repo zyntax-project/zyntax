@@ -208,37 +208,67 @@ fn run_function(func: &mut HirFunction, nonnull: &HashSet<HirId>) -> SignFoldSta
 pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<HirId> {
     use crate::hir::{CastOp, Intrinsic};
 
-    let mut set: HashSet<HirId> = HashSet::default();
+    let constant = |id: &HirId| {
+        matches!(
+            func.values.get(id).map(|value| &value.kind),
+            Some(HirValueKind::Constant(c)) if const_i128(c).is_some_and(|n| n != 0)
+        )
+    };
+    let start = |id: &HirId| {
+        matches!(
+            func.values.get(id).map(|value| &value.kind),
+            Some(HirValueKind::Instruction)
+        ) || constant(id)
+    };
+    // Every candidate to begin with; one whose rule fails drops out,
+    // until none does. Only what the rules below can keep is a candidate:
+    // the result of any other instruction would drop out at once.
+    let mut set: HashSet<HirId> = func
+        .values
+        .iter()
+        .filter(|(id, _)| constant(id))
+        .map(|(id, _)| *id)
+        .collect();
     let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
-    for (id, value) in &func.values {
-        match &value.kind {
-            HirValueKind::Constant(c) if const_i128(c).is_some_and(|n| n != 0) => {
-                set.insert(*id);
-            }
-            HirValueKind::Instruction => {
-                set.insert(*id);
-            }
-            _ => {}
-        }
-    }
     for block in func.blocks.values() {
         for inst in &block.instructions {
-            if let Some(result) = inst.result_id() {
+            let Some(result) = inst.result_id() else {
+                continue;
+            };
+            let kept = match inst {
+                HirInstruction::Call {
+                    callee: crate::hir::HirCallable::Intrinsic(Intrinsic::Malloc),
+                    ..
+                } => true,
+                HirInstruction::Call {
+                    callee: crate::hir::HirCallable::Function(callee),
+                    ..
+                } => nonnull.contains(callee),
+                HirInstruction::Cast {
+                    op: CastOp::PtrToInt | CastOp::IntToPtr | CastOp::Bitcast,
+                    ..
+                }
+                | HirInstruction::Select { .. } => true,
+                _ => false,
+            };
+            if kept && start(&result) {
                 defs.insert(result, inst);
+                set.insert(result);
+            } else {
+                set.remove(&result);
             }
         }
     }
-    let phis: HashMap<HirId, Vec<HirId>> = func
-        .blocks
-        .values()
-        .flat_map(|block| block.phis.iter())
-        .map(|phi| {
-            (
-                phi.result,
-                phi.incoming.iter().map(|(value, _)| *value).collect(),
-            )
-        })
-        .collect();
+    let mut phis: HashMap<HirId, Vec<HirId>> = HashMap::default();
+    for phi in func.blocks.values().flat_map(|block| block.phis.iter()) {
+        phis.insert(
+            phi.result,
+            phi.incoming.iter().map(|(value, _)| *value).collect(),
+        );
+        if start(&phi.result) {
+            set.insert(phi.result);
+        }
+    }
 
     loop {
         let before = set.len();
@@ -250,31 +280,16 @@ pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<
                     !incoming.is_empty() && incoming.iter().all(|value| set.contains(value))
                 } else if let Some(inst) = defs.get(id) {
                     match inst {
-                        HirInstruction::Call {
-                            callee: crate::hir::HirCallable::Intrinsic(Intrinsic::Malloc),
-                            ..
-                        } => true,
-                        HirInstruction::Call {
-                            callee: crate::hir::HirCallable::Function(callee),
-                            ..
-                        } => nonnull.contains(callee),
-                        HirInstruction::Cast {
-                            op: CastOp::PtrToInt | CastOp::IntToPtr | CastOp::Bitcast,
-                            operand,
-                            ..
-                        } => set.contains(operand),
+                        HirInstruction::Cast { operand, .. } => set.contains(operand),
                         HirInstruction::Select {
                             true_val,
                             false_val,
                             ..
                         } => set.contains(true_val) && set.contains(false_val),
-                        _ => false,
+                        _ => true,
                     }
                 } else {
-                    matches!(
-                        func.values.get(id).map(|value| &value.kind),
-                        Some(HirValueKind::Constant(c)) if const_i128(c).is_some_and(|n| n != 0)
-                    )
+                    true
                 };
                 !holds
             })
@@ -294,36 +309,70 @@ pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<
 /// between two, and a phi whose every incoming is one. The greatest
 /// such set.
 fn non_negative(func: &HirFunction) -> HashSet<HirId> {
+    let constant = |id: &HirId| {
+        matches!(
+            func.values.get(id).map(|v| &v.kind),
+            Some(HirValueKind::Constant(c)) if const_i128(c).is_some_and(|n| n >= 0)
+        )
+    };
+    let start = |id: &HirId| {
+        matches!(
+            func.values.get(id).map(|v| &v.kind),
+            Some(HirValueKind::Instruction)
+        ) || constant(id)
+    };
     // Every candidate to begin with; one whose rule fails drops out,
-    // until none does. Only phis and the instructions below can stay.
-    let mut set: HashSet<HirId> = HashSet::default();
+    // until none does. Only phis and the instructions below can stay;
+    // a compare is kept for the floor correction to read.
+    let mut set: HashSet<HirId> = func
+        .values
+        .iter()
+        .filter(|(id, _)| constant(id))
+        .map(|(id, _)| *id)
+        .collect();
     let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
-    for (id, value) in &func.values {
-        match &value.kind {
-            HirValueKind::Constant(c) => {
-                if const_i128(c).is_some_and(|n| n >= 0) {
-                    set.insert(*id);
-                }
-            }
-            HirValueKind::Instruction => {
-                set.insert(*id);
-            }
-            _ => {}
-        }
-    }
     for block in func.blocks.values() {
         for inst in &block.instructions {
-            if let Some(result) = inst.result_id() {
+            let Some(result) = inst.result_id() else {
+                continue;
+            };
+            let kept = matches!(
+                inst,
+                HirInstruction::Binary {
+                    op: BinaryOp::Rem
+                        | BinaryOp::And
+                        | BinaryOp::Shr
+                        | BinaryOp::Div
+                        | BinaryOp::Add
+                        | BinaryOp::Mul,
+                    ..
+                } | HirInstruction::Select { .. }
+            );
+            if kept
+                || matches!(
+                    inst,
+                    HirInstruction::Binary {
+                        op: BinaryOp::Lt,
+                        ..
+                    }
+                )
+            {
                 defs.insert(result, inst);
+            }
+            if kept && start(&result) {
+                set.insert(result);
+            } else {
+                set.remove(&result);
             }
         }
     }
-    let phis: HashMap<HirId, Vec<HirId>> = func
-        .blocks
-        .values()
-        .flat_map(|b| b.phis.iter())
-        .map(|p| (p.result, p.incoming.iter().map(|(v, _)| *v).collect()))
-        .collect();
+    let mut phis: HashMap<HirId, Vec<HirId>> = HashMap::default();
+    for p in func.blocks.values().flat_map(|b| b.phis.iter()) {
+        phis.insert(p.result, p.incoming.iter().map(|(v, _)| *v).collect());
+        if start(&p.result) {
+            set.insert(p.result);
+        }
+    }
     loop {
         let before = set.len();
         let holds = |id: &HirId, set: &HashSet<HirId>| -> bool {
@@ -331,29 +380,16 @@ fn non_negative(func: &HirFunction) -> HashSet<HirId> {
                 return incoming.iter().all(|v| set.contains(v));
             }
             let Some(inst) = defs.get(id) else {
-                // A constant kept above, or a parameter and the like,
-                // which nothing here can show anything about.
-                return matches!(
-                    func.values.get(id).map(|v| &v.kind),
-                    Some(HirValueKind::Constant(_))
-                );
+                // A constant kept above.
+                return true;
             };
             match inst {
                 // A sum or product of non-negatives is one, short of the
                 // wrap the integer type would take, which the program
                 // was not written for either.
-                HirInstruction::Binary {
-                    op:
-                        BinaryOp::Rem
-                        | BinaryOp::And
-                        | BinaryOp::Shr
-                        | BinaryOp::Div
-                        | BinaryOp::Add
-                        | BinaryOp::Mul,
-                    left,
-                    right,
-                    ..
-                } => set.contains(left) && set.contains(right),
+                HirInstruction::Binary { left, right, .. } => {
+                    set.contains(left) && set.contains(right)
+                }
                 HirInstruction::Select {
                     condition,
                     true_val,
