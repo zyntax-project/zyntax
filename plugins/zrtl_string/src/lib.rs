@@ -117,6 +117,39 @@ pub extern "C" fn string_join_n(data: *const StringPtr, n: i64, sep: StringPtr) 
     unsafe { join_parts(std::slice::from_raw_parts(data, n as usize), sep) }
 }
 
+/// Copy `src` to `dst`. A run of up to 16 bytes is moved inline as two
+/// overlapping words, or bytes, read within `src`: joined pieces are
+/// mostly that short, and a call to `memcpy` costs more than the copy.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` bytes and not overlap `src`.
+#[inline(always)]
+unsafe fn copy_bytes(src: &[u8], dst: *mut u8) {
+    let n = src.len();
+    let s = src.as_ptr();
+    match n {
+        0 => {}
+        1..=3 => {
+            *dst = *s;
+            *dst.add(n / 2) = *s.add(n / 2);
+            *dst.add(n - 1) = *s.add(n - 1);
+        }
+        4..=7 => {
+            let head = s.cast::<u32>().read_unaligned();
+            let tail = s.add(n - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(n - 4).cast::<u32>().write_unaligned(tail);
+        }
+        8..=16 => {
+            let head = s.cast::<u64>().read_unaligned();
+            let tail = s.add(n - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(n - 8).cast::<u64>().write_unaligned(tail);
+        }
+        _ => std::ptr::copy_nonoverlapping(s, dst, n),
+    }
+}
+
 /// `parts` joined with `sep`: TEXT when all of them are.
 ///
 /// # Safety
@@ -135,12 +168,12 @@ unsafe fn join_parts(parts: &[StringPtr], sep: StringPtr) -> StringPtr {
     }
     let fill = |mut at: *mut u8| {
         for (i, &p) in parts.iter().enumerate() {
-            if i > 0 {
-                std::ptr::copy_nonoverlapping(sep_bytes.as_ptr(), at, sep_bytes.len());
+            if i > 0 && !sep_bytes.is_empty() {
+                copy_bytes(sep_bytes, at);
                 at = at.add(sep_bytes.len());
             }
             let part = string_as_bytes(p);
-            std::ptr::copy_nonoverlapping(part.as_ptr(), at, part.len());
+            copy_bytes(part, at);
             at = at.add(part.len());
         }
     };
@@ -856,6 +889,20 @@ mod tests {
 
         let empty = string_new("");
         assert_eq!(string_is_empty(empty), 1);
+    }
+
+    #[test]
+    fn join_copies_pieces_of_every_length() {
+        let text: String = ('a'..='z').cycle().take(40).collect();
+        let pieces: Vec<&str> = (0..=40).map(|n| &text[..n]).collect();
+        let ptrs: Vec<StringPtr> = pieces.iter().map(|p| string_new(p)).collect();
+        for sep in ["", ",", ", ", "-separator-of-20-b-"] {
+            let joined = string_join_n(ptrs.as_ptr(), ptrs.len() as i64, string_new(sep));
+            assert_eq!(
+                unsafe { string_as_str(joined) },
+                Some(pieces.join(sep).as_str())
+            );
+        }
     }
 
     #[test]
