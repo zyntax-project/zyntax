@@ -39,6 +39,9 @@
 //!   scaled to bytes by the GEP's `ty` the way the backends scale them.
 //! * Every Load's pointer resolves to a known field offset for which
 //!   we know the stored type.
+//! * Every access at an offset has that one type, and no access reaches
+//!   into another offset's bytes: a load is forwarded the value stored
+//!   at its offset, which is only its value when both are the same.
 //! * No instruction outside the home block references any tracked id
 //!   (the malloc result, GEPs, casts). Phi-incomings and terminator
 //!   operands in any other block also count.
@@ -334,6 +337,7 @@ fn build_candidate(
     let mut store_iidxs: Vec<usize> = Vec::new();
     let mut free_iidxs: Vec<usize> = Vec::new();
     let mut field_ty: HashMap<u64, HirType> = HashMap::default();
+    let mut accessed: HashMap<u64, HirType> = HashMap::default();
     let mut stores_linear: Vec<(usize, u64, HirId)> = Vec::new();
     let mut loads_linear: Vec<(usize, HirId, u64)> = Vec::new();
 
@@ -514,6 +518,9 @@ fn build_candidate(
                         }
                     }
                 };
+                if !same_field(&mut accessed, off, ty) {
+                    return None;
+                }
                 // Record the field type (Load.ty wins over any
                 // previously-recorded Store type).
                 field_ty.insert(off, ty.clone());
@@ -540,9 +547,11 @@ fn build_candidate(
                 };
                 // Type-of-stored value, only used if no Load fixes the
                 // field's type more precisely.
-                if let Some(ty) = type_of(func, *value) {
-                    field_ty.entry(off).or_insert(ty);
+                let ty = type_of(func, *value)?;
+                if !same_field(&mut accessed, off, &ty) {
+                    return None;
                 }
+                field_ty.entry(off).or_insert(ty);
                 stores_linear.push((idx, off, *value));
                 if !store_iidxs.contains(&idx) {
                     store_iidxs.push(idx);
@@ -616,6 +625,17 @@ fn build_candidate(
             .is_some_and(|blocks| blocks.iter().any(|b| *b != bid))
     };
     if tracked.iter().any(used_elsewhere) || encoded.iter().any(used_elsewhere) {
+        return None;
+    }
+
+    // A field stored whole and read in parts would be read from the
+    // wrong register.
+    let mut spans: Vec<(u64, u64)> = accessed
+        .iter()
+        .map(|(off, ty)| (*off, *off + crate::value_layout::size_of_hir_ty(ty) as u64))
+        .collect();
+    spans.sort_unstable();
+    if spans.windows(2).any(|w| w[0].1 > w[1].0) {
         return None;
     }
 
@@ -773,6 +793,39 @@ fn const_as_i64(c: &HirConstant) -> Option<i64> {
         HirConstant::U64(v) => i64::try_from(*v).ok(),
         _ => None,
     }
+}
+
+/// Record an access of `ty` at `off`; false when an earlier access at
+/// the same offset had a type whose value this one could not stand in
+/// for. Pointers stand in for one another, as do integers of a width
+/// and structs of the same fields.
+fn same_field(accessed: &mut HashMap<u64, HirType>, off: u64, ty: &HirType) -> bool {
+    let Some(seen) = accessed.get(&off) else {
+        accessed.insert(off, ty.clone());
+        return true;
+    };
+    let int = |t: &HirType| {
+        matches!(
+            t,
+            HirType::I8
+                | HirType::I16
+                | HirType::I32
+                | HirType::I64
+                | HirType::U8
+                | HirType::U16
+                | HirType::U32
+                | HirType::U64
+                | HirType::ISize
+                | HirType::USize
+        )
+    };
+    seen == ty
+        || matches!((seen, ty), (HirType::Ptr(_), HirType::Ptr(_)))
+        || matches!((seen, ty), (HirType::Struct(a), HirType::Struct(b))
+            if a.fields == b.fields && a.packed == b.packed)
+        || (int(seen)
+            && int(ty)
+            && crate::value_layout::size_of_hir_ty(seen) == crate::value_layout::size_of_hir_ty(ty))
 }
 
 fn type_of(func: &HirFunction, id: HirId) -> Option<HirType> {
@@ -1020,6 +1073,75 @@ mod tests {
             }
             _ => panic!("expected Return"),
         }
+    }
+
+    /// A field stored as a `{ i64, i64, f64 }` and read back as its
+    /// leading `i64` is not forwarded: the stored value is the whole
+    /// struct, not the word the load reads.
+    #[test]
+    fn keeps_a_field_read_in_part() {
+        let _arena = AstArena::new();
+        let (mut f, entry) = mk_func();
+        let num = HirType::Struct(crate::hir::HirStructType {
+            name: None,
+            fields: vec![HirType::I64, HirType::I64, HirType::F64].into(),
+            packed: false,
+        });
+        let byte_ptr = HirType::Ptr(std::sync::Arc::new(HirType::U8));
+        let size = add_const_u64(&mut f, 24);
+        let malloc_ptr = add_inst(&mut f, byte_ptr.clone());
+        let off = add_const_i64(&mut f, 0);
+        let gep = add_inst(&mut f, byte_ptr);
+        let whole = add_inst(&mut f, num);
+        let tag = add_inst(&mut f, HirType::I64);
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Call {
+                result: Some(malloc_ptr),
+                callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                args: vec![size],
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::GetElementPtr {
+                result: gep,
+                ty: HirType::U8,
+                ptr: malloc_ptr,
+                indices: vec![off],
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Store {
+                value: whole,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        push(
+            &mut f,
+            entry,
+            HirInstruction::Load {
+                result: tag,
+                ty: HirType::I64,
+                ptr: gep,
+                align: 8,
+                volatile: false,
+            },
+        );
+        f.blocks.get_mut(&entry).unwrap().terminator = HirTerminator::Return { values: vec![tag] };
+
+        let (mut module, func_id) = empty_module(f);
+        assert_eq!(run_module(&mut module).mallocs_eliminated, 0);
+        assert_eq!(count_malloc(&module, func_id, entry), 1);
     }
 
     /// Malloc with a paired `Intrinsic::Free` — both should be removed.
