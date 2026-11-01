@@ -1729,8 +1729,9 @@ impl TieredBackend {
         }
         if trace {
             eprintln!(
-                "[OPT] codegen: registration {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
+                "[OPT] codegen: registration {:8.2} ms{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                crate::profiling::instructions_text()
             );
         }
 
@@ -1785,8 +1786,9 @@ impl TieredBackend {
         }
         if trace {
             eprintln!(
-                "[OPT] codegen: cranelift    {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
+                "[OPT] codegen: cranelift    {:8.2} ms{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                crate::profiling::instructions_text()
             );
         }
         if osr::osr_trace_enabled() {

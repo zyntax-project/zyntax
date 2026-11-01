@@ -830,8 +830,9 @@ impl TieredRuntime {
         });
         if trace_phases {
             eprintln!(
-                "[COMPILE] names+reach        {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
+                "[COMPILE] names+reach        {:8.2} ms{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                zyntax_compiler::profiling::instructions_text()
             );
         }
 
@@ -1737,8 +1738,9 @@ impl TieredRuntime {
             self.lower_typed_program(program, self.builtin_aliases.clone())?;
         if trace {
             eprintln!(
-                "[COMPILE] lower              {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
+                "[COMPILE] lower              {:8.2} ms{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                zyntax_compiler::profiling::instructions_text()
             );
         }
         let started = web_time::Instant::now();
@@ -1756,8 +1758,9 @@ impl TieredRuntime {
             .collect();
         if trace {
             eprintln!(
-                "[COMPILE] krio passes        {:8.2} ms",
-                started.elapsed().as_secs_f64() * 1000.0
+                "[COMPILE] krio passes        {:8.2} ms{}",
+                started.elapsed().as_secs_f64() * 1000.0,
+                zyntax_compiler::profiling::instructions_text()
             );
         }
 

@@ -94,8 +94,9 @@ pub(crate) fn lower_typed_program_in_place(
     let mut lap = |name: &str, at: &mut web_time::Instant| {
         if trace {
             eprintln!(
-                "[LOWER] {name:<20} {:8.2} ms",
-                at.elapsed().as_secs_f64() * 1000.0
+                "[LOWER] {name:<20} {:8.2} ms{}",
+                at.elapsed().as_secs_f64() * 1000.0,
+                zyntax_compiler::profiling::instructions_text()
             );
             *at = web_time::Instant::now();
         }

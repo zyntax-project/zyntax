@@ -146,7 +146,7 @@ fn run() -> ExitCode {
             eprintln!(
                 "[ZYLUA] {what:<10} {:8.2} ms{}",
                 phase.elapsed().as_secs_f64() * 1000.0,
-                instructions()
+                zyntax_compiler::profiling::instructions_text()
             );
         }
         phase = std::time::Instant::now();
@@ -276,32 +276,13 @@ fn note_clock(what: &str) {
         // SAFETY: `ts` is a live local the call fills.
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         let ms = ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6;
-        eprintln!("[ZYLUA] clock at {what:<6} {ms:.3} ms{}", instructions());
+        eprintln!(
+            "[ZYLUA] clock at {what:<6} {ms:.3} ms{}",
+            zyntax_compiler::profiling::instructions_text()
+        );
     }
     #[cfg(not(unix))]
     let _ = what;
-}
-
-/// The instructions the process has retired so far, as trace text; empty
-/// where the system does not count them.
-fn instructions() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `info` is a live local of the flavour's size, which the
-        // call fills.
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        let ok = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V4,
-                (&mut info as *mut libc::rusage_info_v4).cast(),
-            )
-        };
-        if ok == 0 {
-            return format!(", {:.2}M instructions", info.ri_instructions as f64 / 1e6);
-        }
-    }
-    String::new()
 }
 
 #[cfg(not(unix))]

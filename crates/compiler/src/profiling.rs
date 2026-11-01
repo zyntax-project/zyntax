@@ -358,3 +358,25 @@ mod tests {
         assert_eq!(stats.total_executions, 550);
     }
 }
+
+/// The instructions the process has retired so far, as trace text for a
+/// phase line; empty where the system does not count them.
+pub fn instructions_text() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `info` is a live local of the flavour's size, which the
+        // call fills.
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut info as *mut libc::rusage_info_v4).cast(),
+            )
+        };
+        if ok == 0 {
+            return format!(", {:.2}M instructions", info.ri_instructions as f64 / 1e6);
+        }
+    }
+    String::new()
+}
