@@ -2,6 +2,10 @@
 //! runs itself: it runs `ld` with the arguments it was given, then
 //! retypes the output's `__TEXT,__init_offsets` section as regular data,
 //! so dyld runs none of them at launch, and signs the output again.
+//! A library the link finds outside the system, with its static archive
+//! beside it, is linked from the archive: the executable then loads no
+//! dylib from outside the shared cache, and runs where that library is
+//! not installed.
 //! Built by `zrtl_native::build::emit_deferred_initializers` with the
 //! build's own `rustc`, and named to the compiler driver with `--ld-path`.
 
@@ -16,7 +20,7 @@ const S_INIT_FUNC_OFFSETS: u32 = 0x16;
 const S_REGULAR: u32 = 0x0;
 
 fn main() {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let args = archives_outside_system(std::env::args_os().skip(1).collect());
     let status = match Command::new("ld").args(&args).status() {
         Ok(status) => status,
         Err(e) => {
@@ -60,6 +64,49 @@ fn main() {
             exit(1);
         }
     }
+}
+
+/// `args` with each `-lNAME` that `ld` would take from a dylib outside
+/// the system replaced by the static archive beside that dylib, when
+/// there is one. Directories are searched as `ld` searches them: in
+/// order, each for every kind of library before the next.
+fn archives_outside_system(args: Vec<OsString>) -> Vec<OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut system = vec![PathBuf::from("/usr/lib"), PathBuf::from("/System")];
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let text = arg.to_string_lossy();
+        if text == "-L" || text == "-syslibroot" {
+            if let Some(dir) = iter.next() {
+                let dir = PathBuf::from(dir);
+                if text == "-L" {
+                    dirs.push(dir)
+                } else {
+                    system.push(dir)
+                }
+            }
+        } else if let Some(dir) = text.strip_prefix("-L") {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    args.into_iter()
+        .map(|arg| {
+            let archive = arg
+                .to_str()
+                .and_then(|text| text.strip_prefix("-l"))
+                .and_then(|name| {
+                    let dir = dirs.iter().find(|dir| {
+                        ["tbd", "dylib", "so", "a"]
+                            .iter()
+                            .any(|kind| dir.join(format!("lib{name}.{kind}")).exists())
+                    })?;
+                    let archive = dir.join(format!("lib{name}.a"));
+                    let outside = !system.iter().any(|root| dir.starts_with(root));
+                    (outside && archive.exists()).then_some(archive)
+                });
+            archive.map_or(arg, OsString::from)
+        })
+        .collect()
 }
 
 /// Retype the initialiser offsets of the 64-bit image at `path` as
