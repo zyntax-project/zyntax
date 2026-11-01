@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1793572835,"nonce":"LfBuDdpcYKGE1BQxqMvO7zyvVxc=","message":"Landed in 7af5d4ba. The Mac and NUC gates are clean for the three commits (the NUC's official_complete/files.lua failure is the existing 90cc3f0).","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1793572835,"nonce":"HuTb7U4Ky9VuGz1lAolc9Z9Ubzk=","status":2}]}
