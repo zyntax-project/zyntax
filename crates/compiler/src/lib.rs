@@ -2197,10 +2197,6 @@ fn run_interp_safe_opts_with(
         if trace {
             eprintln!("[OPT] round {round}");
         }
-        // A block the last round left unreachable still names its
-        // successors; a loop header it branches to has an entry no
-        // preheader pass can use.
-        cfg_simplify::prune_unreachable_module(module);
         let cf = const_fold::fold_module(module);
         checkpoint!("const_fold");
         check_hir_uses(module, "const_fold");
