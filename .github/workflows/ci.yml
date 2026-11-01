@@ -264,10 +264,12 @@ jobs:
           cargo clippy -p zyntax_wasm --lib --target wasm32-unknown-unknown --
           -A clippy::all -D clippy::disallowed_methods -D clippy::disallowed_types
 
+      # Pinned: the action's "latest" lookup can fall back to v0.9.1,
+      # whose wasm-opt rejects a module with more than one table.
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.15.1
 
       - name: Build zyntax_wasm (web target)
         working-directory: crates/zyntax_wasm
