@@ -857,7 +857,7 @@ fn compile_workers() -> usize {
 /// itself; the planned order of everything else fills the gaps.
 struct CompileQueue {
     /// Interpreted frames' requests, each with the OSR site it waits at.
-    promote: Mutex<std::collections::VecDeque<(u64, u64)>>,
+    promote: Mutex<std::collections::VecDeque<(u64, u64, bool)>>,
     /// Compile requests with the function's call count and the time
     /// when made: a request the function has not been called since is
     /// stale by the time the worker reaches it. A request made for the
@@ -882,7 +882,9 @@ struct CompileQueue {
 }
 
 enum Job {
-    Promote(u64, u64),
+    /// A promotion request at a site: from an interpreted frame, or
+    /// (the flag) from a compiled one.
+    Promote(u64, u64, bool),
     Compile(u64, Option<u32>, web_time::Instant),
 }
 
@@ -1015,7 +1017,19 @@ impl CompileQueue {
     /// A promotion request is queued even for a bead whose compile was:
     /// its resume points are what the frame waits on.
     fn request_promote(&self, bead_id: u64, site: u64) {
-        self.promote.lock().unwrap().push_back((bead_id, site));
+        self.promote
+            .lock()
+            .unwrap()
+            .push_back((bead_id, site, false));
+        self.ready.notify_one();
+    }
+
+    /// A compiled frame's request, taken as an interpreted frame's is.
+    fn request_promote_compiled(&self, bead_id: u64, site: u64) {
+        self.promote
+            .lock()
+            .unwrap()
+            .push_back((bead_id, site, true));
         self.ready.notify_one();
     }
 
@@ -1070,8 +1084,8 @@ impl CompileQueue {
     /// The next request, or `None` once there is none and no wait was
     /// asked for.
     fn take(&self) -> Option<Job> {
-        if let Some((b, site)) = self.promote.lock().unwrap().pop_front() {
-            return Some(Job::Promote(b, site));
+        if let Some((b, site, compiled)) = self.promote.lock().unwrap().pop_front() {
+            return Some(Job::Promote(b, site, compiled));
         }
         self.compile
             .lock()
@@ -4260,8 +4274,12 @@ impl TieredBackend {
                                 in_job = true;
                             }
                             match queue.take() {
-                                Some(Job::Promote(bead_id, site)) => {
+                                Some(Job::Promote(bead_id, site, false)) => {
                                     queue.run_promotions(bead_id, site);
+                                }
+                                Some(Job::Promote(bead_id, site, true)) => {
+                                    let _busy = BaselineBusy::enter();
+                                    osr::run_promotion(bead_id, osr::Requester::Compiled { site });
                                 }
                                 Some(Job::Compile(bead_id, count, at)) => {
                                     if queue.still_wanted(bead_id, count, at) {
@@ -4597,6 +4615,21 @@ impl TieredBackend {
                 // No thread to be had: the frame's own thread does the
                 // work below, as it did before there was a worker.
                 while queue.next_promotion(bead_id).is_some() {}
+            }
+            // A compiled frame in a loop of a function with no baseline of
+            // its own: the loop runs from the resume point an interpreted
+            // frame made, and the function's baseline is compiled before
+            // the promotion is submitted. A worker does that, so the frame
+            // keeps running the loop meanwhile.
+            if let osr::Requester::Compiled { site } = from
+                && site != osr::NO_SITE
+                && *lazy
+                && !ON_WARM_UP.with(|on| on.get())
+                && bound.bead().compiled().is_none()
+                && let Some(queue) = &queue
+            {
+                queue.request_promote_compiled(bead_id, site);
+                return true;
             }
             // A quick baseline has no optimised body yet: the request
             // waits for the replacement, which runs it once that body
