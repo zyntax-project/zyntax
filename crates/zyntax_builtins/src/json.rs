@@ -1,6 +1,7 @@
 //! `json.dumps` over dynamic values: pieces gathered into one list and
-//! joined once, so the text costs its length. Strings are escaped by
-//! the host; numbers print as Python prints them.
+//! joined once, so the text costs its length. A string that needs no
+//! escaping goes in as it is between two quote pieces; any other is
+//! escaped by the host. Numbers print as Python prints them.
 
 use crate::build::*;
 use crate::{DICT_TAG, SET_TAG, TUPLE_TAG, list_of};
@@ -15,6 +16,20 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         &[("s", string())],
         string(),
         Some("$Host$json_escape"),
+    ));
+    d.push(extern_fn(
+        "zb_json_plain",
+        &[("s", string())],
+        i64(),
+        Some("$Host$json_plain"),
+    ));
+    // Kept: the string may go into `pieces` as it is.
+    let s = kept("s", string());
+    d.push(define(
+        "zb_json_string_into",
+        &[&borrowed("pieces", strs.clone()), &s],
+        unit(),
+        string_pieces(&borrowed("pieces", strs.clone()), &s),
     ));
 
     let pieces = borrowed("pieces", strs.clone());
@@ -95,10 +110,10 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             when(
                 eq(cat.e(), int(5)),
                 vec![
-                    piece(call(
-                        "zb_json_escape",
-                        vec![call("zb_box_get_str", vec![x.e()], string())],
-                        string(),
+                    expr(call(
+                        "zb_json_string_into",
+                        vec![pieces.e(), call("zb_box_get_str", vec![x.e()], string())],
+                        unit(),
                     )),
                     ret_void(),
                 ],
@@ -205,6 +220,8 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         string(),
         vec![
             out.decl(list(Vec::new(), strs.clone())),
+            // A small dict's pieces without growing the list.
+            expr(mcall(out.e(), "reserve", vec![int(32)], unit())),
             expr(call("zb_json_into", vec![out.e(), x.e()], unit())),
             ret(call("zb_str_join", vec![text(""), out.e()], string())),
         ],
@@ -227,4 +244,15 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
     d
+}
+
+/// `s` as JSON into `pieces`: itself between quotes when nothing in it
+/// needs escaping, which costs no new string, else the host's escape.
+fn string_pieces(pieces: &Local, s: &Local) -> Vec<Stmt> {
+    let piece = |p: Expr| expr(mcall(pieces.e(), "push", vec![p], unit()));
+    vec![if_(
+        ne(call("zb_json_plain", vec![s.e()], i64()), int(0)),
+        vec![piece(text("\"")), piece(s.e()), piece(text("\""))],
+        vec![piece(call("zb_json_escape", vec![s.e()], string()))],
+    )]
 }

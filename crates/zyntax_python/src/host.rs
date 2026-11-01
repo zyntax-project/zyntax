@@ -439,6 +439,15 @@ extern "C" fn host_json_escape(s: StringConstPtr) -> StringPtr {
     zrtl::string::string_from_bytes(out.as_bytes())
 }
 
+/// Whether `json.dumps` writes a string as it is between quotes:
+/// printable ASCII with no `"` or `\\`. 1 when it does, 0 otherwise.
+extern "C" fn host_json_plain(s: StringConstPtr) -> i64 {
+    // SAFETY: a string the program holds.
+    let text = unsafe { zrtl::string::string_as_str(s) }.unwrap_or("");
+    text.bytes()
+        .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\') as i64
+}
+
 /// `struct.unpack`: the integer of `size` bytes at `offset`, signed or
 /// not, big-endian or little. An unsigned value past i64 is clamped to
 /// i64::MAX, the widest int here.
@@ -551,7 +560,7 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 36] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),
@@ -610,6 +619,7 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
         host_struct_float as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Host$json_escape".as_ptr(), host_json_escape as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$json_plain".as_ptr(), host_json_plain as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Host$bytes_from_hex".as_ptr(),
         host_bytes_from_hex as *const u8,

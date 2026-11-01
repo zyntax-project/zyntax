@@ -1419,8 +1419,9 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
         let jp = borrowed("pieces", strs.clone());
         let jpiece = |p: Expr| expr(mcall(jp.e(), "push", vec![p], unit()));
         let jfirst = local("first", boolean());
+        let json_string = |s: Expr| expr(call("zb_json_string_into", vec![jp.e(), s], unit()));
         let key_text = match t.key {
-            Field::Str => Some(call("zb_json_escape", vec![t.key_of(en.e())], string())),
+            Field::Str => Some(t.key_of(en.e())),
             Field::Any => None,
             _ => Some(text("")),
         };
@@ -1429,7 +1430,7 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
             jfirst.set(bool(false)),
         ];
         match (t.key, key_text) {
-            (Field::Str, Some(k)) => body.push(jpiece(k)),
+            (Field::Str, Some(k)) => body.push(json_string(k)),
             (Field::Any, _) => {
                 body.push(when(
                     ne(
@@ -1457,7 +1458,7 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
         body.push(match vf {
             Field::Int => jpiece(call("zb_str_of_int", vec![value], string())),
             Field::Float => jpiece(call("zb_json_float", vec![value], string())),
-            Field::Str => jpiece(call("zb_json_escape", vec![value], string())),
+            Field::Str => json_string(value),
             Field::Bool => jpiece(if_expr(value, text("true"), text("false"))),
             other => expr(call(
                 "zb_json_into",

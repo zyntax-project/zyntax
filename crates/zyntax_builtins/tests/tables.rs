@@ -47,7 +47,7 @@ extern "C" fn unreached() -> i64 {
     std::process::abort()
 }
 static HOST_INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"test_host".as_ptr());
-static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
+static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 36] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_at".as_ptr(), unreached as *const u8),
@@ -77,6 +77,7 @@ static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 35] = [
     zrtl::ZrtlSymbol::new(c"$Host$is_float_literal".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$is_int_literal".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$json_escape".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$json_plain".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$md5".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$missing_arg".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$path_basename".as_ptr(), unreached as *const u8),
