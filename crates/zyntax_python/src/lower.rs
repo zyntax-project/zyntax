@@ -9047,10 +9047,10 @@ impl<'m> Lowerer<'m> {
         if left.ty == Ty::Str || right.ty == Ty::Str {
             match (op, left.ty, right.ty) {
                 (py::Operator::Add, Ty::Str, Ty::Str) => {
-                    return Ok(Val {
-                        node: binary(BinaryOp::Add, left.node, right.node, Ty::Str, span),
-                        ty: Ty::Str,
-                    });
+                    let node =
+                        crate::format::concat_pieces(vec![left.node, right.node], Ty::Str, span)
+                            .expect("two pieces");
+                    return Ok(Val { node, ty: Ty::Str });
                 }
                 (py::Operator::Mult, Ty::Str, Ty::Int | Ty::Bool) => {
                     let n = self.coerce(right, Ty::Int);
@@ -9074,8 +9074,11 @@ impl<'m> Lowerer<'m> {
             match (op, left.ty, right.ty) {
                 // Concatenation copies bytes, as it does for strings.
                 (py::Operator::Add, Ty::Bytes, Ty::Bytes) => {
+                    let node =
+                        crate::format::concat_pieces(vec![left.node, right.node], Ty::Bytes, span)
+                            .expect("two pieces");
                     return Ok(Val {
-                        node: binary(BinaryOp::Add, left.node, right.node, Ty::Bytes, span),
+                        node,
                         ty: Ty::Bytes,
                     });
                 }
@@ -16959,34 +16962,34 @@ impl<'m> Lowerer<'m> {
             };
             values.push(v);
         }
-        let mut line: Option<Node> = None;
-        for v in values {
-            let s = self.str_of(v);
-            line = Some(match line {
-                None => s,
-                Some(prev) => {
-                    let with_sep = binary(BinaryOp::Add, prev, sep.clone(), Ty::Str, span);
-                    binary(BinaryOp::Add, with_sep, s, Ty::Str, span)
-                }
-            });
+        let mut pieces: Vec<Node> = Vec::with_capacity(values.len() * 2 + 1);
+        for (i, v) in values.into_iter().enumerate() {
+            if i > 0 {
+                pieces.push(sep.clone());
+            }
+            pieces.push(self.str_of(v));
         }
-        let line = line.unwrap_or_else(|| str_lit("", span));
         if let Some(file) = file {
-            let end = end.unwrap_or_else(|| str_lit("\n", span));
-            let text = binary(BinaryOp::Add, line, end, Ty::Str, span);
+            pieces.push(end.unwrap_or_else(|| str_lit("\n", span)));
+            let text = crate::format::concat_pieces(pieces, Ty::Str, span)
+                .unwrap_or_else(|| str_lit("", span));
             return Ok(Val {
                 node: call("zb_file_write", vec![file, text], Ty::None, span),
                 ty: Ty::None,
             });
         }
         let node = match end {
-            None => call("zb_print_line", vec![line], Ty::None, span),
-            Some(end) => call(
-                "zb_print_text",
-                vec![binary(BinaryOp::Add, line, end, Ty::Str, span)],
-                Ty::None,
-                span,
-            ),
+            None => {
+                let line = crate::format::concat_pieces(pieces, Ty::Str, span)
+                    .unwrap_or_else(|| str_lit("", span));
+                call("zb_print_line", vec![line], Ty::None, span)
+            }
+            Some(end) => {
+                pieces.push(end);
+                let text = crate::format::concat_pieces(pieces, Ty::Str, span)
+                    .unwrap_or_else(|| str_lit("", span));
+                call("zb_print_text", vec![text], Ty::None, span)
+            }
         };
         Ok(Val { node, ty: Ty::None })
     }

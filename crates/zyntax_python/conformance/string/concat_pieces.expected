@@ -1,0 +1,16 @@
+xyéz
+xyézxyézxyézx
+xyézxyé
+x-yé-z-7-14
+x|yé|7| 3.14
+x:yé:7
+x--yé--z--7!
+0,1,2,3,4,
+'' 3
+b'abcd\xc3\xa9' 6
+b'ABC' b'5-zz'
+b'\xffab'
+b'\xff\xff\xff' 3
+é!
+b'\x00\x00\x00\xff\xff\xff\x07\x07\x07' 9
+abcdefghijkl 12

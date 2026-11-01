@@ -241,6 +241,58 @@ pub(crate) fn parse_spec(text: &str) -> std::result::Result<Spec, String> {
     Ok(spec)
 }
 
+/// The pieces of a concatenation flattened into `out`, in order: a sum
+/// of `ty` that is itself a sum contributes its own operands.
+fn flatten_sum(node: Node, ty: &zyntax_typed_ast::Type, out: &mut Vec<Node>) {
+    if let TypedExpression::Binary(b) = &node.node
+        && b.op == BinaryOp::Add
+        && node.ty == *ty
+    {
+        let TypedExpression::Binary(b) = node.node else {
+            unreachable!("matched above")
+        };
+        flatten_sum(*b.left, ty, out);
+        flatten_sum(*b.right, ty, out);
+    } else {
+        out.push(node);
+    }
+}
+
+/// Most pieces one concatenation call takes.
+const MAX_CONCAT: usize = 8;
+
+/// The pieces, strings or bytes per `ty`, as one value in order. Three
+/// or more go to a call that builds the result in one allocation; a
+/// longer run is joined `MAX_CONCAT` at a time, each call taking the
+/// result so far as its first piece. None for no pieces.
+pub(crate) fn concat_pieces(pieces: Vec<Node>, ty: Ty, span: Span) -> Option<Node> {
+    let element = crate::lower::ir(ty);
+    let mut flat = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        flatten_sum(piece, &element, &mut flat);
+    }
+    let mut rest = flat.into_iter();
+    let mut acc = rest.next()?;
+    let mut pending: Vec<Node> = Vec::new();
+    loop {
+        pending.clear();
+        let room = MAX_CONCAT - 1;
+        pending.extend(rest.by_ref().take(room));
+        if pending.is_empty() {
+            return Some(acc);
+        }
+        acc = if pending.len() == 1 {
+            let piece = pending.pop().expect("one piece");
+            crate::lower::binary(BinaryOp::Add, acc, piece, ty, span)
+        } else {
+            let mut args = vec![acc];
+            args.append(&mut pending);
+            let name = format!("zb_str_concat{}", args.len());
+            crate::lower::call(&name, args, ty, span)
+        };
+    }
+}
+
 impl Lowerer<'_> {
     /// An f-string: its pieces concatenated left to right.
     pub(crate) fn fstring(&mut self, f: &py::ExprFString, span: Span) -> Result<Val> {
@@ -257,11 +309,8 @@ impl Lowerer<'_> {
                 }
             }
         }
-        let mut it = pieces.into_iter();
-        let first = it.next().unwrap_or_else(|| crate::lower::str_lit("", span));
-        let node = it.fold(first, |acc, piece| {
-            crate::lower::binary(BinaryOp::Add, acc, piece, Ty::Str, span)
-        });
+        let node =
+            concat_pieces(pieces, Ty::Str, span).unwrap_or_else(|| crate::lower::str_lit("", span));
         Ok(Val { node, ty: Ty::Str })
     }
 
@@ -386,11 +435,8 @@ impl Lowerer<'_> {
         if !literal.is_empty() {
             pieces.push(crate::lower::str_lit(&literal, span));
         }
-        let mut it = pieces.into_iter();
-        let first = it.next().unwrap_or_else(|| crate::lower::str_lit("", span));
-        let node = it.fold(first, |acc, piece| {
-            crate::lower::binary(BinaryOp::Add, acc, piece, Ty::Str, span)
-        });
+        let node =
+            concat_pieces(pieces, Ty::Str, span).unwrap_or_else(|| crate::lower::str_lit("", span));
         Ok(Val { node, ty: Ty::Str })
     }
 
@@ -472,11 +518,8 @@ impl Lowerer<'_> {
                 }
             }
         }
-        let mut it = pieces.into_iter();
-        let first = it.next().unwrap_or_else(|| crate::lower::str_lit("", span));
-        let node = it.fold(first, |acc, piece| {
-            crate::lower::binary(BinaryOp::Add, acc, piece, Ty::Str, span)
-        });
+        let node =
+            concat_pieces(pieces, Ty::Str, span).unwrap_or_else(|| crate::lower::str_lit("", span));
         Ok(Val { node, ty: Ty::Str })
     }
 

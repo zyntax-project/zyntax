@@ -530,21 +530,98 @@ pub fn string_empty() -> StringPtr {
 /// `a` followed by `b`: TEXT when both are, otherwise as the joined
 /// bytes decide.
 pub fn string_concat(a: StringConstPtr, b: StringConstPtr) -> StringPtr {
+    string_concat_n(&[a, b])
+}
+
+/// Copy `src` to `dst`. A run of up to 16 bytes is moved inline as two
+/// overlapping words, or bytes, read within `src`: joined pieces are
+/// mostly that short, and a call to `memcpy` costs more than the copy.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` bytes and not overlap `src`.
+#[inline(always)]
+pub unsafe fn copy_bytes(src: &[u8], dst: *mut u8) {
+    let n = src.len();
+    let s = src.as_ptr();
+    match n {
+        0 => {}
+        1..=3 => {
+            *dst = *s;
+            *dst.add(n / 2) = *s.add(n / 2);
+            *dst.add(n - 1) = *s.add(n - 1);
+        }
+        4..=7 => {
+            let head = s.cast::<u32>().read_unaligned();
+            let tail = s.add(n - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(n - 4).cast::<u32>().write_unaligned(tail);
+        }
+        8..=16 => {
+            let head = s.cast::<u64>().read_unaligned();
+            let tail = s.add(n - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(n - 8).cast::<u64>().write_unaligned(tail);
+        }
+        _ => std::ptr::copy_nonoverlapping(s, dst, n),
+    }
+}
+
+/// The pieces in order as one string: TEXT when all of them are,
+/// otherwise as the joined bytes decide. One allocation unless the
+/// joined bytes of a byte string have to be checked for UTF-8.
+pub fn string_concat_n(parts: &[StringConstPtr]) -> StringPtr {
     // SAFETY: null or strings the caller holds.
     unsafe {
-        let (x, y) = (string_as_bytes(a), string_as_bytes(b));
-        let text = |p: StringConstPtr| p.is_null() || string_flags(p) & TEXT != 0;
-        if text(a) && text(b) {
-            let chars = string_char_count(a) + string_char_count(b);
-            if x.len() + y.len() <= 2 {
-                return make(&[x, y].concat(), chars as u32, true);
+        let mut total = 0usize;
+        let mut chars = 0usize;
+        // Whether the join is UTF-8 without looking at it: every piece
+        // is TEXT or ASCII.
+        let mut text = true;
+        // Whether a byte that no UTF-8 text holds is among the pieces.
+        let mut binary = false;
+        for &p in parts {
+            let bytes = string_as_bytes(p);
+            total += bytes.len();
+            if p.is_null() || string_flags(p) & TEXT != 0 {
+                chars += string_char_count(p);
+            } else if bytes.is_ascii() {
+                chars += bytes.len();
+            } else {
+                text = false;
+                binary |= bytes
+                    .iter()
+                    .any(|&b| matches!(b, 0xC0 | 0xC1 | 0xF8..=0xFF));
             }
-            return string_build(x.len() + y.len(), chars, true, |d| {
-                std::ptr::copy_nonoverlapping(x.as_ptr(), d, x.len());
-                std::ptr::copy_nonoverlapping(y.as_ptr(), d.add(x.len()), y.len());
-            });
         }
-        string_from_bytes(&[x, y].concat())
+        let fill = |mut at: *mut u8| {
+            for &p in parts {
+                let bytes = string_as_bytes(p);
+                copy_bytes(bytes, at);
+                at = at.add(bytes.len());
+            }
+        };
+        if total <= 2 {
+            // The short results are shared constants.
+            let mut small = [0u8; 2];
+            fill(small.as_mut_ptr());
+            return if text {
+                make(&small[..total], chars as u32, true)
+            } else {
+                string_from_bytes(&small[..total])
+            };
+        }
+        if !text {
+            if binary {
+                return string_build(total, total, false, fill);
+            }
+            // Pieces may split a character: the joined bytes decide.
+            let mut joined = Vec::with_capacity(total);
+            for &p in parts {
+                joined.extend_from_slice(string_as_bytes(p));
+            }
+            return string_from_bytes(&joined);
+        }
+        string_build(total, chars, true, fill)
     }
 }
 
@@ -1005,6 +1082,42 @@ unsafe impl Sync for OwnedString {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concat_n_joins_text_and_bytes() {
+        let join = |parts: &[StringPtr]| {
+            let parts: Vec<StringConstPtr> = parts.iter().map(|p| *p as StringConstPtr).collect();
+            string_concat_n(&parts)
+        };
+        let text = |p: StringPtr| unsafe { string_flags(p) } & TEXT != 0;
+
+        let t = join(&[string_new("ab"), string_new("\u{e9}"), string_new("c")]);
+        assert_eq!(unsafe { string_as_str(t) }, Some("ab\u{e9}c"));
+        assert_eq!(unsafe { string_char_count(t) }, 4);
+
+        // ASCII bytes join to text; the halves of one character join
+        // to that character; bytes no text holds stay bytes.
+        assert!(text(join(&[bytes_new(b"ab"), bytes_new(b"cd")])));
+        let split = join(&[bytes_new(&[0xC3]), string_new(""), bytes_new(&[0xA9])]);
+        assert!(text(split));
+        assert_eq!(unsafe { string_as_str(split) }, Some("\u{e9}"));
+        let raw = join(&[bytes_new(&[0xFF]), bytes_new(&[0xFF]), bytes_new(&[0xFF])]);
+        assert!(!text(raw));
+        assert_eq!(unsafe { string_as_bytes(raw) }, &[0xFF, 0xFF, 0xFF][..]);
+        let stray = join(&[bytes_new(&[0x80]), bytes_new(b"abc")]);
+        assert!(!text(stray));
+
+        // Short results, nulls and no pieces.
+        assert_eq!(unsafe { string_length(join(&[])) }, 0);
+        assert_eq!(
+            unsafe { string_length(join(&[std::ptr::null_mut(), string_new("q")])) },
+            1
+        );
+        assert_eq!(
+            unsafe { string_as_bytes(join(&[bytes_new(&[7]), bytes_new(&[9])])) },
+            &[7, 9][..]
+        );
+    }
 
     #[test]
     fn test_string_new() {

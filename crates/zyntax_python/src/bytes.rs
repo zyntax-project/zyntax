@@ -4,9 +4,7 @@
 //! whole when it is closed.
 
 use crate::format::{Percent, parse_percent};
-use crate::lower::{
-    Lowerer, Node, Stmt, Val, binary, call, int_lit, node, str_lit, unsupported, var,
-};
+use crate::lower::{Lowerer, Node, Stmt, Val, call, int_lit, node, str_lit, unsupported, var};
 use crate::types::{Elem, Ty};
 use crate::{Error, Result, intern};
 use ruff_python_ast as py;
@@ -14,7 +12,7 @@ use zyntax_typed_ast::source::Span;
 use zyntax_typed_ast::typed_ast::{
     TypedExpression, TypedFieldAccess, TypedLet, TypedLiteral, TypedStatement,
 };
-use zyntax_typed_ast::{BinaryOp, Mutability, Type, TypedNode};
+use zyntax_typed_ast::{Mutability, Type, TypedNode};
 
 impl Lowerer<'_> {
     /// A bytes literal. UTF-8 bytes are a string literal, laid out in
@@ -245,11 +243,10 @@ impl Lowerer<'_> {
                 }
             }
         }
-        let mut it = pieces.into_iter();
-        let first = it.next().unwrap_or_else(|| self.bytes_lit(&[], span).node);
-        let node = it.fold(first, |acc, piece| {
-            binary(BinaryOp::Add, acc, piece, Ty::Bytes, span)
-        });
+        let node = match crate::format::concat_pieces(pieces, Ty::Bytes, span) {
+            Some(node) => node,
+            None => self.bytes_lit(&[], span).node,
+        };
         Ok(Val {
             node,
             ty: Ty::Bytes,

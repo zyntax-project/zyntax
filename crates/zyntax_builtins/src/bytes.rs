@@ -896,16 +896,11 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             end.decl(add(pos.e(), n.e())),
             when(
                 gt(end.e(), old_len.e()),
-                vec![block_of(for_range(
-                    &i,
-                    old_len.e(),
-                    end.e(),
-                    vec![expr(mcall(
-                        buffer.e(),
-                        "push",
-                        vec![cast(int(0), u8())],
-                        unit(),
-                    ))],
+                vec![expr(mcall(
+                    buffer.e(),
+                    "resize_filled",
+                    vec![end.e(), int(0)],
+                    unit(),
                 ))],
             ),
             expr(call(

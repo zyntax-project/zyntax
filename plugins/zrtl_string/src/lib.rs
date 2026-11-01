@@ -30,7 +30,9 @@
 //! - `$String$parse_int`, `$String$parse_float` - Parse numbers
 //! - `$String$from_int`, `$String$from_float` - Convert to string
 
-use zrtl::string::{string_as_bytes, string_build, string_flags, string_from_bytes, TEXT};
+use zrtl::string::{
+    copy_bytes, string_as_bytes, string_build, string_flags, string_from_bytes, TEXT,
+};
 use zrtl::{
     array_new, array_push, string_as_str, string_data, string_length, string_new, zrtl_plugin,
     ArrayPtr, StringPtr,
@@ -68,6 +70,26 @@ pub extern "C" fn string_is_empty(s: StringPtr) -> i32 {
 #[no_mangle]
 pub extern "C" fn string_concat(a: StringPtr, b: StringPtr) -> StringPtr {
     zrtl::string::string_concat(a, b)
+}
+
+/// The pieces of a formatted string joined in one allocation: the
+/// intermediate strings a chain of concatenations makes never exist.
+macro_rules! concat_fns {
+    ($($name:ident($($piece:ident),+);)+) => {$(
+        #[no_mangle]
+        pub extern "C" fn $name($($piece: StringPtr),+) -> StringPtr {
+            zrtl::string::string_concat_n(&[$($piece as _),+])
+        }
+    )+};
+}
+
+concat_fns! {
+    string_concat3(a, b, c);
+    string_concat4(a, b, c, d);
+    string_concat5(a, b, c, d, e);
+    string_concat6(a, b, c, d, e, f);
+    string_concat7(a, b, c, d, e, f, g);
+    string_concat8(a, b, c, d, e, f, g, h);
 }
 
 /// Repeat string n times
@@ -115,39 +137,6 @@ pub extern "C" fn string_join_n(data: *const StringPtr, n: i64, sep: StringPtr) 
         return string_new("");
     }
     unsafe { join_parts(std::slice::from_raw_parts(data, n as usize), sep) }
-}
-
-/// Copy `src` to `dst`. A run of up to 16 bytes is moved inline as two
-/// overlapping words, or bytes, read within `src`: joined pieces are
-/// mostly that short, and a call to `memcpy` costs more than the copy.
-///
-/// # Safety
-/// `dst` must be valid for `src.len()` bytes and not overlap `src`.
-#[inline(always)]
-unsafe fn copy_bytes(src: &[u8], dst: *mut u8) {
-    let n = src.len();
-    let s = src.as_ptr();
-    match n {
-        0 => {}
-        1..=3 => {
-            *dst = *s;
-            *dst.add(n / 2) = *s.add(n / 2);
-            *dst.add(n - 1) = *s.add(n - 1);
-        }
-        4..=7 => {
-            let head = s.cast::<u32>().read_unaligned();
-            let tail = s.add(n - 4).cast::<u32>().read_unaligned();
-            dst.cast::<u32>().write_unaligned(head);
-            dst.add(n - 4).cast::<u32>().write_unaligned(tail);
-        }
-        8..=16 => {
-            let head = s.cast::<u64>().read_unaligned();
-            let tail = s.add(n - 8).cast::<u64>().read_unaligned();
-            dst.cast::<u64>().write_unaligned(head);
-            dst.add(n - 8).cast::<u64>().write_unaligned(tail);
-        }
-        _ => std::ptr::copy_nonoverlapping(s, dst, n),
-    }
 }
 
 /// `parts` joined with `sep`: TEXT when all of them are.
@@ -812,6 +801,12 @@ zrtl_plugin! {
         ("$String$char_count", string_char_count),
         ("$String$is_empty", string_is_empty),
         ("$String$concat", string_concat),
+        ("$String$concat3", string_concat3),
+        ("$String$concat4", string_concat4),
+        ("$String$concat5", string_concat5),
+        ("$String$concat6", string_concat6),
+        ("$String$concat7", string_concat7),
+        ("$String$concat8", string_concat8),
         ("$String$repeat", string_repeat),
         ("$String$join", string_join),
         ("$String$join_n", string_join_n),
@@ -911,6 +906,38 @@ mod tests {
         let b = string_new(" world");
         let result = string_concat(a, b);
         assert_eq!(unsafe { string_as_str(result) }, Some("hello world"));
+    }
+
+    #[test]
+    fn test_concat_pieces() {
+        let (a, b, c) = (string_new("ab"), string_new("\u{e9}"), string_new("c"));
+        let joined = string_concat3(a, b, c);
+        assert_eq!(unsafe { string_as_str(joined) }, Some("ab\u{e9}c"));
+        assert_eq!(unsafe { zrtl::string::string_char_count(joined) }, 4);
+
+        // Byte strings that are ASCII join to text; the bytes of one
+        // character split across pieces join to that character.
+        let (x, y) = (zrtl::bytes_new(&[0xC3]), zrtl::bytes_new(&[0xA9]));
+        let split = string_concat3(string_new(""), x, y);
+        assert_eq!(unsafe { string_as_str(split) }, Some("\u{e9}"));
+
+        // Bytes that are not UTF-8 stay a byte string.
+        let raw = string_concat3(zrtl::bytes_new(&[0xFF]), a, c);
+        assert_eq!(
+            unsafe { string_as_bytes(raw) },
+            &[0xFF, b'a', b'b', b'c'][..]
+        );
+        assert_eq!(unsafe { string_flags(raw) } & TEXT, 0);
+
+        let pixel = string_concat3(
+            zrtl::bytes_new(&[7]),
+            zrtl::bytes_new(&[7]),
+            zrtl::bytes_new(&[7]),
+        );
+        assert_eq!(unsafe { string_as_bytes(pixel) }, &[7, 7, 7][..]);
+
+        let eight = string_concat8(a, a, a, a, a, a, a, a);
+        assert_eq!(unsafe { zrtl::string::string_length(eight) }, 16);
     }
 
     #[test]
