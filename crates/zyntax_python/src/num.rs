@@ -36,6 +36,20 @@ pub(crate) fn enabled() -> bool {
 /// TypeError None would in arithmetic.
 const NUMBERS: u8 = Ty::NUM_BOOL | Ty::NUM_INT | Ty::NUM_FLOAT;
 
+/// Whether a Num of type `ty` passed where a library function takes
+/// `want`, a float or an int, converts on its parts: every kind it
+/// admits converts without a raise. Otherwise it is read through its box.
+pub(crate) fn argument_converts(ty: Ty, want: Ty) -> bool {
+    let Ty::Num(mask) = ty else {
+        return false;
+    };
+    match want {
+        Ty::Float => mask & !NUMBERS == 0,
+        Ty::Int => mask & !(Ty::NUM_BOOL | Ty::NUM_INT) == 0,
+        _ => false,
+    }
+}
+
 /// What `left op right` is when a [`Ty::Num`] takes part and the
 /// lowering computes it on the parts: `+ - * // %` and `** 2` on
 /// operands that cannot be None give an int when neither may be a float,

@@ -7544,7 +7544,12 @@ impl<'m> Lowerer<'m> {
                 lowered.push(self.callable_value(a)?);
                 continue;
             }
-            let v = self.expr(a)?;
+            let v = self.expr_num(a)?;
+            if num::argument_converts(v.ty, want) {
+                lowered.push(self.coerce(v, want));
+                continue;
+            }
+            let v = self.boxed_num(v);
             let node = match (v.ty, want) {
                 (Ty::Object, Ty::Float) => call("zb_any_float", vec![v.node], Ty::Float, span),
                 (Ty::Object, Ty::Int) => call("zb_any_int", vec![v.node], Ty::Int, span),
