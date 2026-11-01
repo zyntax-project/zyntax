@@ -192,7 +192,7 @@ fn run_with(func: &mut HirFunction, pure: &HashSet<HirId>, exact: &AliasNames) -
     // to the outer-loop invariance check on the same run.
     for lp in lf.loops() {
         stats.loops_visited += 1;
-        let preheader = match unique_outside_predecessor(func, lp) {
+        let preheader = match unique_outside_predecessor(func, lp, &dt) {
             Some(p) => p,
             None => {
                 stats.loops_skipped_no_preheader += 1;
@@ -271,13 +271,18 @@ fn rebuild_cfg_edges(func: &mut HirFunction) {
     }
 }
 
-fn unique_outside_predecessor(func: &HirFunction, lp: &NaturalLoop) -> Option<HirId> {
+fn unique_outside_predecessor(
+    func: &HirFunction,
+    lp: &NaturalLoop,
+    dt: &DominatorTree,
+) -> Option<HirId> {
     let header = func.blocks.get(&lp.header)?;
+    // A block nothing reaches enters no loop, whatever its branch says.
     let outside: Vec<HirId> = header
         .predecessors
         .iter()
         .copied()
-        .filter(|p| !lp.body.contains(p))
+        .filter(|p| !lp.body.contains(p) && dt.rpo_position(*p).is_some())
         .collect();
     if outside.len() == 1 {
         Some(outside[0])
