@@ -70,6 +70,7 @@ pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always availa
 pub mod host_heap; // A host's heap and collector behind the allocation entry points
 pub mod inline;
 pub mod interned; // The boxes every program shares
+pub mod jump_thread; // Branches on a phi of constants, taken by the predecessors
 mod known_bits;
 pub mod late_symbols; // Symbols an embedder supplies after the code generators were set up
 pub mod licm;
@@ -1819,6 +1820,7 @@ pub struct InterpOptStats {
     pub sign_fold: sign_fold::SignFoldStats,
     pub bounds_version: bounds_version::BoundsVersionStats,
     pub branch_fold: branch_fold::BranchFoldStats,
+    pub jump_thread: jump_thread::JumpThreadStats,
     pub error_flag: error_flag::ErrorFlagStats,
     pub licm: licm::LicmStats,
     pub affine_loop: affine_loop::AffineLoopStats,
@@ -2203,6 +2205,12 @@ fn run_interp_safe_opts_with(
         stats.sign_fold.selects += sf.selects;
         checkpoint!("sign_fold");
         check_hir_uses(module, "sign_fold");
+        // Before cse: a test made on the path where the same test held
+        // is dominated by it only once the merged boolean is gone.
+        let jt = jump_thread::run_module(module);
+        stats.jump_thread.threaded += jt.threaded;
+        checkpoint!("jump_thread");
+        check_hir_uses(module, "jump_thread");
         let cs = cse::eliminate_module(module);
         checkpoint!("cse");
         check_hir_uses(module, "cse");
@@ -2302,6 +2310,7 @@ fn run_interp_safe_opts_with(
         // point here rather than paying a round of every pass for each
         // step of it.
         let restructured = bf.folded > 0
+            || jt.threaded > 0
             || lcse.eliminated > 0
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
