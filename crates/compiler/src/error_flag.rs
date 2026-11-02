@@ -122,7 +122,8 @@ pub fn summaries(module: &HirModule) -> Summaries {
 }
 
 /// Record on each function of `module` whose calls leave the error flag
-/// as they found it that they do (`keeps_error_flag`), for a module that
+/// as they found it that they do (`keeps_error_flag`), and on each that
+/// leaves it set that it does (`sets_error_flag`), for a module that
 /// links the bodies later and holds some of them as shells. `flag` names
 /// the flag's global; when `module` defines none, no body stores to it.
 pub fn record_keeps(module: &mut HirModule, flag: &str) {
@@ -134,7 +135,9 @@ pub fn record_keeps(module: &mut HirModule, flag: &str) {
         .unwrap_or_else(HirId::new);
     let summaries = summaries_for(module, id);
     for (id, f) in module.functions.iter_mut() {
-        f.attributes.keeps_error_flag = summaries.0.get(id) == Some(&Effect::Keeps);
+        let effect = summaries.0.get(id);
+        f.attributes.keeps_error_flag = effect == Some(&Effect::Keeps);
+        f.attributes.sets_error_flag |= effect == Some(&Effect::Sets);
     }
 }
 
@@ -203,8 +206,42 @@ fn summaries_for(module: &HirModule, flag: HirId) -> Summaries {
             }
         }
     }
+    infer_sets(module, flag, &mut effects);
     Summaries(effects)
 }
+
+/// Bodies this small are read for the flag they leave set.
+const MAX_RAISER_BLOCKS: usize = 32;
+
+/// Mark the functions whose every return leaves the flag set: a body
+/// that ends in a call to a raiser, as a helper reporting one fixed
+/// error does. A caller's check after such a call is then decided.
+fn infer_sets(module: &HirModule, flag: HirId, effects: &mut HashMap<HirId, Effect>) {
+    let nonnull = crate::sign_fold::nonnull_callees(module);
+    for _ in 0..MAX_RAISER_ROUNDS {
+        let mut grew = false;
+        for (&id, f) in &module.functions {
+            if f.is_external
+                || f.blocks.is_empty()
+                || f.blocks.len() > MAX_RAISER_BLOCKS
+                || matches!(effects.get(&id), Some(Effect::Keeps | Effect::Sets))
+            {
+                continue;
+            }
+            if leaves_set(f, flag, effects, &nonnull) {
+                effects.insert(id, Effect::Sets);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+}
+
+/// Most passes over the module looking for raisers: a helper that calls
+/// one is found the pass after it.
+const MAX_RAISER_ROUNDS: usize = 4;
 
 /// Whether `f` keeps the flag provided every function it calls does,
 /// naming each such callee to `callee`.
@@ -257,7 +294,7 @@ pub fn run_module(module: &mut HirModule, summaries: &Summaries) -> ErrorFlagSta
     if candidates.is_empty() {
         return total;
     }
-    let effects = call_effects(module, &candidates, summaries);
+    let effects = call_effects(module, flag, &candidates, summaries);
     let nonnull = crate::sign_fold::nonnull_callees(module);
     for func in module.functions_to_optimize() {
         if !candidates.contains(&func.id) {
@@ -272,13 +309,15 @@ pub fn run_module(module: &mut HirModule, summaries: &Summaries) -> ErrorFlagSta
 
 /// What calling each function `bodies` call does to the flag: its
 /// summary, or for a function added since the summaries were read, what
-/// its attributes say.
+/// its attributes or its body say.
 fn call_effects(
     module: &HirModule,
+    flag: HirId,
     bodies: &HashSet<HirId>,
     summaries: &Summaries,
 ) -> HashMap<HirId, Effect> {
     let mut effects = HashMap::default();
+    let mut nonnull: Option<HashSet<HirId>> = None;
     for id in bodies {
         for b in module.functions[id].blocks.values() {
             for inst in &b.instructions {
@@ -291,23 +330,167 @@ fn call_effects(
                         if let Some(e) = summaries.0.get(c) {
                             return *e;
                         }
-                        module.functions.get(c).map_or(Effect::Unknown, |f| {
-                            if f.attributes.sets_error_flag {
-                                Effect::Sets
-                            } else if f.attributes.nothrow && f.is_external {
-                                Effect::Keeps
-                            } else if f.attributes.nothrow {
-                                Effect::KeepsClear
-                            } else {
-                                Effect::Unknown
-                            }
-                        })
+                        let Some(f) = module.functions.get(c) else {
+                            return Effect::Unknown;
+                        };
+                        if f.attributes.sets_error_flag {
+                            Effect::Sets
+                        } else if f.attributes.keeps_error_flag {
+                            Effect::Keeps
+                        } else if f.attributes.nothrow && f.is_external {
+                            Effect::Keeps
+                        } else if !f.blocks.is_empty() && !f.is_external {
+                            let nonnull = nonnull
+                                .get_or_insert_with(|| crate::sign_fold::nonnull_callees(module));
+                            read_body(module, flag, *c, summaries, nonnull, BODY_DEPTH)
+                        } else if f.attributes.nothrow {
+                            Effect::KeepsClear
+                        } else {
+                            Effect::Unknown
+                        }
                     });
                 }
             }
         }
     }
     effects
+}
+
+/// Calls deep a body is followed into the bodies it calls.
+const BODY_DEPTH: usize = 3;
+
+/// What the bodies read so far do to the flag, by function: a body's
+/// effect does not change with the passes, so what was found once
+/// stands for the process.
+static READ_BODIES: std::sync::LazyLock<std::sync::Mutex<HashMap<HirId, Effect>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::default()));
+
+/// What calling `id`, a function with a body the summaries do not
+/// cover, does to the flag, read from the body and, `depth` calls down,
+/// from the bodies it calls.
+fn read_body(
+    module: &HirModule,
+    flag: HirId,
+    id: HirId,
+    summaries: &Summaries,
+    nonnull: &HashSet<HirId>,
+    depth: usize,
+) -> Effect {
+    read_body_found(module, flag, id, summaries, nonnull, depth).0
+}
+
+/// [`read_body`], and whether the finding rests on everything it calls
+/// being known, so that reading again would find the same.
+fn read_body_found(
+    module: &HirModule,
+    flag: HirId,
+    id: HirId,
+    summaries: &Summaries,
+    nonnull: &HashSet<HirId>,
+    depth: usize,
+) -> (Effect, bool) {
+    if let Some(e) = summaries.0.get(&id) {
+        return (*e, true);
+    }
+    if let Some(e) = READ_BODIES.lock().ok().and_then(|m| m.get(&id).copied()) {
+        return (e, true);
+    }
+    let Some(f) = module.functions.get(&id) else {
+        return (Effect::Unknown, false);
+    };
+    let demoted = if f.attributes.nothrow {
+        Effect::KeepsClear
+    } else {
+        Effect::Unknown
+    };
+    if f.attributes.sets_error_flag {
+        return (Effect::Sets, true);
+    }
+    if f.attributes.keeps_error_flag {
+        return (Effect::Keeps, true);
+    }
+    if f.is_external || f.blocks.is_empty() {
+        let e = if f.is_external && f.attributes.nothrow {
+            Effect::Keeps
+        } else {
+            demoted
+        };
+        return (e, true);
+    }
+    if f.blocks.len() > MAX_RAISER_BLOCKS {
+        return (demoted, true);
+    }
+    if depth == 0 {
+        return (demoted, false);
+    }
+    let mut effects: HashMap<HirId, Effect> = HashMap::default();
+    let mut complete = true;
+    for b in f.blocks.values() {
+        for inst in &b.instructions {
+            if let HirInstruction::Call {
+                callee: HirCallable::Function(c),
+                ..
+            } = inst
+                && !effects.contains_key(c)
+            {
+                let (e, known) = read_body_found(module, flag, *c, summaries, nonnull, depth - 1);
+                complete &= known;
+                effects.insert(*c, e);
+            }
+        }
+    }
+    let ptrs = flag_pointers(f, flag);
+    let keeps = (ptrs.is_empty() || !address_escapes(f, &ptrs))
+        && f.blocks.values().all(|b| {
+            !matches!(b.terminator, HirTerminator::Invoke { .. })
+                && b.instructions.iter().all(|inst| {
+                    !matches!(inst, HirInstruction::Store { ptr, .. } if ptrs.contains(ptr))
+                        && effect_of(inst, &effects) == Effect::Keeps
+                })
+        });
+    let found = if keeps {
+        Effect::Keeps
+    } else if leaves_set(f, flag, &effects, nonnull) {
+        Effect::Sets
+    } else {
+        demoted
+    };
+    // A finding that rests on all its callees is the same every time it
+    // is read.
+    if complete && let Ok(mut m) = READ_BODIES.lock() {
+        m.insert(id, found);
+    }
+    (found, complete)
+}
+
+/// Whether every return of `f` leaves the flag set, whatever it held at
+/// entry.
+fn leaves_set(
+    f: &HirFunction,
+    flag: HirId,
+    effects: &HashMap<HirId, Effect>,
+    nonnull: &HashSet<HirId>,
+) -> bool {
+    let ptrs = flag_pointers(f, flag);
+    let raises = f.blocks.values().any(|b| {
+        b.instructions.iter().any(|inst| match inst {
+            HirInstruction::Call {
+                callee: HirCallable::Function(c),
+                ..
+            } => effects.get(c) == Some(&Effect::Sets),
+            HirInstruction::Store { ptr, .. } => ptrs.contains(ptr),
+            _ => false,
+        })
+    });
+    if !raises {
+        return false;
+    }
+    let mut g = f.clone();
+    g.rebuild_cfg_edges();
+    Flow::new(&g, flag, effects, nonnull)
+        .solve_from(&g, State::Unknown)
+        .exit
+        == State::Set
 }
 
 /// The effect of an instruction other than a store to the flag.
@@ -321,6 +504,7 @@ fn effect_of(inst: &HirInstruction, effects: &HashMap<HirId, Effect>) -> Effect 
                 Effect::Unknown
             }
             HirCallable::Intrinsic(_) => Effect::Keeps,
+            HirCallable::Symbol(name) if is_leaf_symbol(name) => Effect::Keeps,
             _ => Effect::Unknown,
         },
         // The flag's address is never taken (checked per function), so
@@ -361,6 +545,24 @@ fn effect_of(inst: &HirInstruction, effects: &HashMap<HirId, Effect>) -> Effect 
         | I::VectorDot { .. } => Effect::Keeps,
         _ => Effect::Unknown,
     }
+}
+
+/// Whether a runtime symbol is one of the string and box-making
+/// functions, which run no compiled code and so cannot reach the flag.
+fn is_leaf_symbol(name: &str) -> bool {
+    name.starts_with("$IO$string_")
+        || name.starts_with("$String$")
+        || matches!(
+            name,
+            "zyntax_box_i32"
+                | "zyntax_box_i64"
+                | "zyntax_box_f32"
+                | "zyntax_box_f64"
+                | "zyntax_box_bool"
+                | "zyntax_box_str"
+                | "zyntax_box_ptr"
+                | "zyntax_box_opaque"
+        )
 }
 
 /// The values naming the flag's address.
@@ -429,6 +631,8 @@ struct Solution {
     edges: HashMap<(HirId, HirId), State>,
     /// State at each flag load.
     at_load: HashMap<HirId, State>,
+    /// State where the function returns, joined over its returns.
+    exit: State,
 }
 
 impl Flow<'_> {
@@ -549,6 +753,11 @@ impl Flow<'_> {
     }
 
     fn solve(&self, f: &HirFunction) -> Solution {
+        self.solve_from(f, State::Clear)
+    }
+
+    /// The solution for a function entered with the flag in `start`.
+    fn solve_from(&self, f: &HirFunction, start: State) -> Solution {
         let nonnull = self.nonnull_stores(f);
         let mut entry: HashMap<HirId, State> = HashMap::default();
         let mut edges: HashMap<(HirId, HirId), State> = HashMap::default();
@@ -558,7 +767,7 @@ impl Flow<'_> {
             changed = false;
             for &b in rpo {
                 let mut s = if b == f.entry_block {
-                    State::Clear
+                    start
                 } else {
                     State::Unreached
                 };
@@ -578,10 +787,18 @@ impl Flow<'_> {
             }
         }
         let mut at_load = HashMap::default();
+        let mut exit = State::Unreached;
         for &b in rpo {
-            self.transfer(f, b, entry[&b], &nonnull, Some(&mut at_load));
+            let (out, _) = self.transfer(f, b, entry[&b], &nonnull, Some(&mut at_load));
+            if matches!(f.blocks[&b].terminator, HirTerminator::Return { .. }) {
+                exit = exit.join(out);
+            }
         }
-        Solution { edges, at_load }
+        Solution {
+            edges,
+            at_load,
+            exit,
+        }
     }
 
     /// The state along each edge out of `block`, given its end state.
@@ -1938,5 +2155,93 @@ mod tests {
         let f = b.finish(&mut m);
         run_all(&mut m.module);
         assert_eq!(branch_constant(body(&m, f), entry, raise), Some(false));
+    }
+
+    /// A helper whose body is a call to a raiser, then a return.
+    fn helper(m: &mut Module, raiser: HirId, guard: bool) -> HirId {
+        let mut h = Body::new(m);
+        let cond = h.param(0, HirType::Bool);
+        let entry = h.block();
+        let raising = h.block();
+        let quiet = h.block();
+        if guard {
+            h.term(
+                entry,
+                HirTerminator::CondBranch {
+                    condition: cond,
+                    true_target: raising,
+                    false_target: quiet,
+                },
+            );
+            h.call(raising, raiser);
+            h.ret(raising, 0);
+            h.ret(quiet, 0);
+        } else {
+            h.call(entry, raiser);
+            h.ret(entry, 0);
+        }
+        h.finish(m)
+    }
+
+    /// entry: call helper; check -> raise, ok.
+    fn after_helper(guard: bool) -> (Module, HirId, HirId, HirId) {
+        let mut m = Module::new(true);
+        let raiser = m.callee(
+            "raiser",
+            FunctionAttributes {
+                sets_error_flag: true,
+                ..Default::default()
+            },
+        );
+        let helper = helper(&mut m, raiser, guard);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, helper);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_all(&mut m.module);
+        (m, f, entry, raise)
+    }
+
+    #[test]
+    fn the_check_after_a_helper_that_always_raises_takes_the_raising_arm() {
+        let (m, f, entry, raise) = after_helper(false);
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(true));
+    }
+
+    #[test]
+    fn the_check_after_a_helper_that_raises_on_one_path_is_kept() {
+        let (m, f, entry, raise) = after_helper(true);
+        assert_eq!(branch_constant(body(&m, f), entry, raise), None);
+    }
+
+    /// A callee the summaries predate is read from its body.
+    #[test]
+    fn a_callee_added_after_the_summaries_is_read_from_its_body() {
+        let mut m = Module::new(true);
+        let raiser = m.callee(
+            "raiser",
+            FunctionAttributes {
+                sets_error_flag: true,
+                ..Default::default()
+            },
+        );
+        let s = summaries(&m.module);
+        let helper = helper(&mut m, raiser, false);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let raise = b.block();
+        let ok = b.block();
+        b.call(entry, helper);
+        b.check(entry, raise, ok);
+        b.ret(raise, -1);
+        b.ret(ok, 0);
+        let f = b.finish(&mut m);
+        run_module(&mut m.module, &s);
+        assert_eq!(branch_constant(body(&m, f), entry, raise), Some(true));
     }
 }

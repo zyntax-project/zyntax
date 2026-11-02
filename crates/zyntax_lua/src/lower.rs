@@ -3295,21 +3295,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 let d = d.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
                 str_lit(&d, span)
             };
-            assign(
-                Self::pending(span),
-                call(
-                    "zl_annotate",
-                    vec![
-                        Self::pending(span),
-                        text(&descs.operands[0]),
-                        text(&descs.operands[1]),
-                        bool_lit(descs.call, span),
-                    ],
-                    Type::Any,
-                    span,
-                ),
+            expr_stmt(call(
+                "zl_annotate",
+                vec![
+                    text(&descs.operands[0]),
+                    text(&descs.operands[1]),
+                    bool_lit(descs.call, span),
+                ],
+                Type::Primitive(PrimitiveType::Unit),
                 span,
-            )
+            ))
         };
         let leave = self.placeholder_return(span);
         vec![settle, leave]

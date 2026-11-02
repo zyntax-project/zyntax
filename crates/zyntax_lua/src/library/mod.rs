@@ -1205,7 +1205,8 @@ fn raising(t: &Types) -> Vec<Decl> {
     // The pending type error with the description of the operand it is
     // about, `left` or `right`, appended; the note is consumed. A
     // call's error is described at a call site only, and an
-    // operator's only at an operator's.
+    // operator's only at an operator's. Called with an error pending,
+    // which it leaves pending.
     let left = kept("left", string());
     let right = kept("right", string());
     let calling = local("calling", boolean());
@@ -1214,15 +1215,15 @@ fn raising(t: &Types) -> Vec<Decl> {
     let tail = " has no integer representation";
     d.push(define_cold(
         "zl_annotate",
-        &[&v, &left, &right, &calling],
-        any(),
+        &[&left, &right, &calling],
+        unit(),
         vec![
             mark.decl(read_global(VARINFO, i64())),
-            when(eq(mark.e(), int(0)), vec![ret(v.e())]),
+            when(eq(mark.e(), int(0)), vec![ret_void()]),
             set_global(VARINFO, int(0)),
             when(
                 ne(ne(bitand(mark.e(), int(VARINFO_CALL)), int(0)), calling.e()),
-                vec![ret(v.e())],
+                vec![ret_void()],
             ),
             described.decl(if_expr(
                 eq(bitand(mark.e(), int(3)), int(OPERAND_LEFT)),
@@ -1231,29 +1232,37 @@ fn raising(t: &Types) -> Vec<Decl> {
             )),
             when(
                 eq(call("zb_str_len", vec![described.e()], i64()), int(0)),
-                vec![ret(v.e())],
+                vec![ret_void()],
             ),
+            v.decl(pending()),
             s.decl(get_str(v.e())),
             when(
                 ne(bitand(mark.e(), int(VARINFO_INSIDE)), int(0)),
-                vec![ret(box_str(concat(vec![
-                    call(
-                        "zb_str_substring",
-                        vec![
-                            s.e(),
-                            int(0),
-                            sub(
-                                call("zb_str_len", vec![s.e()], i64()),
-                                int(tail.len() as i64),
+                vec![
+                    set_global(
+                        PENDING,
+                        box_str(concat(vec![
+                            call(
+                                "zb_str_substring",
+                                vec![
+                                    s.e(),
+                                    int(0),
+                                    sub(
+                                        call("zb_str_len", vec![s.e()], i64()),
+                                        int(tail.len() as i64),
+                                    ),
+                                ],
+                                string(),
                             ),
-                        ],
-                        string(),
+                            described.e(),
+                            text(tail),
+                        ])),
                     ),
-                    described.e(),
-                    text(tail),
-                ])))],
+                    ret_void(),
+                ],
             ),
-            ret(box_str(add(s.e(), described.e()))),
+            set_global(PENDING, box_str(add(s.e(), described.e()))),
+            ret_void(),
         ],
     ));
     // `error(v, level)`: a string message at a level above zero is
@@ -1444,6 +1453,20 @@ pub fn library(policy: &zyntax_builtins::Policy) -> (zyntax_builtins::Library, T
                 args: Vec::new(),
                 span: SPAN,
             });
+            // These return with an error pending on every path: the
+            // pending one stays, else they set one.
+            if f.name.resolve_global().is_some_and(|n| {
+                matches!(
+                    n.as_str(),
+                    "zl_type_error" | "zl_raise_value" | "zb_hook_raise" | "zl_annotate"
+                )
+            }) {
+                f.annotations.push(TypedAnnotation {
+                    name: intern("sets_error_flag"),
+                    args: Vec::new(),
+                    span: SPAN,
+                });
+            }
         }
     }
     lib.fallible = fallible_functions(&lib.declarations);
