@@ -234,41 +234,7 @@ pub fn run_module(module: &mut HirModule) -> LicmStats {
 /// block's terminator. Idempotent; safe to call before any analysis
 /// that reads those fields.
 fn rebuild_cfg_edges(func: &mut HirFunction) {
-    let mut succ_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
-    for (&id, block) in &func.blocks {
-        let succs = match &block.terminator {
-            HirTerminator::Branch { target } => vec![*target],
-            HirTerminator::CondBranch {
-                true_target,
-                false_target,
-                ..
-            } => vec![*true_target, *false_target],
-            HirTerminator::Switch { default, cases, .. } => {
-                let mut v = vec![*default];
-                for (_, t) in cases {
-                    v.push(*t);
-                }
-                v
-            }
-            HirTerminator::Invoke { normal, unwind, .. } => vec![*normal, *unwind],
-            HirTerminator::PatternMatch { .. }
-            | HirTerminator::Return { .. }
-            | HirTerminator::Unreachable => vec![],
-        };
-        succ_map.insert(id, succs);
-    }
-    // In block order, so the predecessor lists come out the same on
-    // every run: a function's fingerprint reads them.
-    let mut pred_map: HashMap<HirId, Vec<HirId>> = HashMap::default();
-    for src in func.blocks.keys() {
-        for &t in &succ_map[src] {
-            pred_map.entry(t).or_default().push(*src);
-        }
-    }
-    for (id, block) in func.blocks.iter_mut() {
-        block.successors = succ_map.remove(id).unwrap_or_default();
-        block.predecessors = pred_map.remove(id).unwrap_or_default();
-    }
+    func.rebuild_cfg_edges_ignoring_patterns();
 }
 
 fn unique_outside_predecessor(

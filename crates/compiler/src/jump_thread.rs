@@ -21,9 +21,7 @@
 use crate::analysis::DominatorTree;
 use crate::error_flag::dominance_holds;
 use crate::hir::IdHashMap as HashMap;
-use crate::hir::{
-    HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirTerminator, HirValueKind,
-};
+use crate::hir::{HirConstant, HirFunction, HirId, HirModule, HirTerminator, HirValueKind};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JumpThreadStats {
@@ -119,6 +117,7 @@ fn thread_round(func: &mut HirFunction) -> usize {
         return 0;
     }
     let dt = DominatorTree::of(func);
+    let uses = phi_uses(func, &merges);
     let mut plan: Vec<Thread> = Vec::new();
     let mut planned_preds: Vec<HirId> = Vec::new();
     for merge in merges {
@@ -142,7 +141,7 @@ fn thread_round(func: &mut HirFunction) -> usize {
         {
             continue;
         }
-        if !phis_used_only_here(func, merge, true_target, false_target) {
+        if !phis_used_only_here(func, &uses, merge, true_target, false_target) {
             continue;
         }
         for &(value, pred) in &phi.incoming {
@@ -180,7 +179,10 @@ fn thread_round(func: &mut HirFunction) -> usize {
         return 0;
     }
 
-    let saved = func.blocks.clone();
+    // A rewrite that broke dominance would be a bug in this pass, since
+    // the merge defines only its phis and they are read nowhere else; a
+    // debug build checks and restores.
+    let saved = cfg!(debug_assertions).then(|| func.blocks.clone());
     let mut threaded = 0;
     for Thread {
         pred,
@@ -233,61 +235,89 @@ fn thread_round(func: &mut HirFunction) -> usize {
         return 0;
     }
     func.rebuild_cfg_edges();
-    if !dominance_holds(func) {
-        if std::env::var_os("ZYNTAX_TRACE_JUMP_THREAD").is_some() {
-            eprintln!(
-                "[jump_thread] {}: rolled back {threaded} edge(s)",
-                func.name.resolve_global().unwrap_or_default()
-            );
-        }
+    if let Some(saved) = saved
+        && !dominance_holds(func)
+    {
+        eprintln!(
+            "[jump_thread] {}: rolled back {threaded} edge(s)",
+            func.name.resolve_global().unwrap_or_default()
+        );
         func.blocks = saved;
+        func.rebuild_cfg_edges();
+        debug_assert!(false, "jump threading broke dominance");
         return 0;
     }
     threaded
 }
 
+/// How a block reads a value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Phi,
+    Instruction,
+    Terminator,
+}
+
+/// Every read of the phis of `merges`, by value: the block that reads it
+/// and how, from one walk of the function.
+fn phi_uses(func: &HirFunction, merges: &[HirId]) -> HashMap<HirId, Vec<(HirId, Read)>> {
+    let mut uses: HashMap<HirId, Vec<(HirId, Read)>> = HashMap::default();
+    for merge in merges {
+        for phi in &func.blocks[merge].phis {
+            uses.insert(phi.result, Vec::new());
+        }
+    }
+    for (&id, block) in &func.blocks {
+        for phi in &block.phis {
+            for (v, _) in &phi.incoming {
+                if let Some(reads) = uses.get_mut(v) {
+                    reads.push((id, Read::Phi));
+                }
+            }
+        }
+        for inst in &block.instructions {
+            inst.for_each_operand(|v| {
+                if let Some(reads) = uses.get_mut(&v) {
+                    reads.push((id, Read::Instruction));
+                }
+            });
+        }
+        block.terminator.for_each_operand(|v| {
+            if let Some(reads) = uses.get_mut(&v) {
+                reads.push((id, Read::Terminator));
+            }
+        });
+    }
+    uses
+}
+
 /// Whether the phis of `merge` are read only by its branch and by the
 /// phis of the two targets: anywhere else they would be reached by a
 /// path that skips the merge.
-fn phis_used_only_here(func: &HirFunction, merge: HirId, yes: HirId, no: HirId) -> bool {
-    let defined: Vec<HirId> = func.blocks[&merge].phis.iter().map(|p| p.result).collect();
-    for (&id, block) in &func.blocks {
-        let phis_ok = id == yes || id == no;
-        for phi in &block.phis {
-            let reads = phi.incoming.iter().any(|(v, _)| defined.contains(v));
-            if reads && !phis_ok {
-                return false;
-            }
-        }
-        if id == merge {
-            continue;
-        }
-        for inst in &block.instructions {
-            if reads_any(inst, &defined) {
-                return false;
-            }
-        }
-        let mut read = false;
-        block
-            .terminator
-            .for_each_operand(|v| read |= defined.contains(&v));
-        if read {
-            return false;
-        }
-    }
-    true
-}
-
-fn reads_any(inst: &HirInstruction, defined: &[HirId]) -> bool {
-    let mut read = false;
-    inst.for_each_operand(|v| read |= defined.contains(&v));
-    read
+fn phis_used_only_here(
+    func: &HirFunction,
+    uses: &HashMap<HirId, Vec<(HirId, Read)>>,
+    merge: HirId,
+    yes: HirId,
+    no: HirId,
+) -> bool {
+    func.blocks[&merge].phis.iter().all(|phi| {
+        uses.get(&phi.result).is_none_or(|reads| {
+            reads.iter().all(|&(block, how)| match how {
+                Read::Phi => block == yes || block == no,
+                Read::Terminator => block == merge,
+                Read::Instruction => false,
+            })
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::{BinaryOp, HirBlock, HirFunctionSignature, HirPhi, HirType, HirValue};
+    use crate::hir::{
+        BinaryOp, HirBlock, HirFunctionSignature, HirInstruction, HirPhi, HirType, HirValue,
+    };
     use zyntax_typed_ast::InternedString;
 
     fn function() -> HirFunction {

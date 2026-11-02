@@ -1778,6 +1778,36 @@ impl HirTerminator {
         }
     }
 
+    /// [`Self::targets`], without making the list.
+    pub fn for_each_target(&self, mut f: impl FnMut(HirId)) {
+        match self {
+            HirTerminator::Branch { target } => f(*target),
+            HirTerminator::CondBranch {
+                true_target,
+                false_target,
+                ..
+            } => {
+                f(*true_target);
+                f(*false_target);
+            }
+            HirTerminator::Switch { default, cases, .. } => {
+                f(*default);
+                cases.iter().for_each(|(_, b)| f(*b));
+            }
+            HirTerminator::Invoke { normal, unwind, .. } => {
+                f(*normal);
+                f(*unwind);
+            }
+            HirTerminator::PatternMatch {
+                patterns, default, ..
+            } => {
+                patterns.iter().for_each(|p| f(p.target));
+                default.iter().for_each(|b| f(*b));
+            }
+            HirTerminator::Return { .. } | HirTerminator::Unreachable => {}
+        }
+    }
+
     /// The blocks this terminator can go to, in operand order.
     pub fn targets(&self) -> Vec<HirId> {
         match self {
@@ -2959,21 +2989,37 @@ impl HirFunction {
     /// (dominators, loops) reads them as they are. Predecessors come
     /// in block order, so they are the same on every run.
     pub fn rebuild_cfg_edges(&mut self) {
-        let mut preds: IdHashMap<HirId, Vec<HirId>> = IdHashMap::default();
-        let succs: Vec<(HirId, Vec<HirId>)> = self
-            .blocks
-            .iter()
-            .map(|(id, b)| (*id, b.terminator.targets()))
-            .collect();
-        for (from, to) in &succs {
-            for t in to {
-                preds.entry(*t).or_default().push(*from);
-            }
+        self.rebuild_edges(true);
+    }
+
+    /// [`Self::rebuild_cfg_edges`] for the passes that read a pattern
+    /// match as a terminator with no successors.
+    pub(crate) fn rebuild_cfg_edges_ignoring_patterns(&mut self) {
+        self.rebuild_edges(false);
+    }
+
+    fn rebuild_edges(&mut self, patterns: bool) {
+        // The lists keep the room they have. A predecessor list fills in
+        // block order, then in each terminator's operand order.
+        for block in self.blocks.values_mut() {
+            block.predecessors.clear();
+            block.successors.clear();
         }
-        for (id, to) in succs {
-            if let Some(b) = self.blocks.get_mut(&id) {
-                b.successors = to;
-                b.predecessors = preds.remove(&id).unwrap_or_default();
+        for at in 0..self.blocks.len() {
+            let Some((&id, block)) = self.blocks.get_index(at) else {
+                break;
+            };
+            let mut targets: smallvec::SmallVec<[HirId; 4]> = smallvec::SmallVec::new();
+            if patterns || !matches!(block.terminator, HirTerminator::PatternMatch { .. }) {
+                block.terminator.for_each_target(|t| targets.push(t));
+            }
+            for &t in &targets {
+                if let Some(target) = self.blocks.get_mut(&t) {
+                    target.predecessors.push(id);
+                }
+            }
+            if let Some((_, block)) = self.blocks.get_index_mut(at) {
+                block.successors.extend(targets);
             }
         }
     }

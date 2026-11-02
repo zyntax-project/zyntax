@@ -73,26 +73,31 @@ pub struct DominatorTree {
 }
 
 impl DominatorTree {
-    /// [`Self::new`] for `func` as its blocks stand, shared with the last
+    /// [`Self::new`] for `func` as its blocks stand, shared with a recent
     /// tree this thread built when the entry, the blocks in order and
     /// their successor and predecessor lists, which are all a tree is
-    /// built from, are the same: consecutive passes that leave the edges
-    /// alone build one tree between them.
+    /// built from, are the same: passes that leave the edges alone build
+    /// one tree between them.
     pub fn of(func: &HirFunction) -> std::sync::Arc<Self> {
+        /// Trees kept: a pass walks every function of a module, so the
+        /// next pass finds a function's tree several functions back.
+        const KEPT: usize = 8;
         thread_local! {
-            static LAST: std::cell::RefCell<Option<(Vec<u32>, std::sync::Arc<DominatorTree>)>> =
-                const { std::cell::RefCell::new(None) };
+            static RECENT: std::cell::RefCell<Vec<(Vec<u32>, std::sync::Arc<DominatorTree>)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
         }
         let shape = cfg_shape(func);
-        LAST.with(|last| {
-            let mut last = last.borrow_mut();
-            if let Some((key, tree)) = last.as_ref()
-                && *key == shape
-            {
-                return std::sync::Arc::clone(tree);
+        RECENT.with(|recent| {
+            let mut recent = recent.borrow_mut();
+            if let Some(at) = recent.iter().position(|(key, _)| *key == shape) {
+                let hit = recent.remove(at);
+                let tree = std::sync::Arc::clone(&hit.1);
+                recent.insert(0, hit);
+                return tree;
             }
             let tree = std::sync::Arc::new(Self::new(func));
-            *last = Some((shape, std::sync::Arc::clone(&tree)));
+            recent.insert(0, (shape, std::sync::Arc::clone(&tree)));
+            recent.truncate(KEPT);
             tree
         })
     }
