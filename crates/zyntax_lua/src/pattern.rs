@@ -142,6 +142,50 @@ fn match_class(c: u8, class: u8) -> bool {
     }
 }
 
+/// A set of bytes as four words.
+#[derive(Clone, Copy)]
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    #[inline]
+    fn add(&mut self, b: u8) {
+        self.0[(b >> 6) as usize] |= 1 << (b & 63);
+    }
+
+    #[inline]
+    fn add_all(&mut self, other: [u64; 4]) {
+        for (w, o) in self.0.iter_mut().zip(other) {
+            *w |= o;
+        }
+    }
+
+    #[inline]
+    fn invert(&mut self) {
+        for w in &mut self.0 {
+            *w = !*w;
+        }
+    }
+
+    #[inline]
+    fn contains(&self, b: u8) -> bool {
+        self.0[(b >> 6) as usize] >> (b & 63) & 1 != 0
+    }
+}
+
+/// The bytes `%c` matches, made the first time a class letter is used.
+fn class_set(class: u8) -> [u64; 4] {
+    static SETS: [std::sync::OnceLock<[u64; 4]>; 256] = [const { std::sync::OnceLock::new() }; 256];
+    *SETS[class as usize].get_or_init(|| {
+        let mut set = ByteSet([0; 4]);
+        for b in 0..=255u8 {
+            if match_class(b, class) {
+                set.add(b);
+            }
+        }
+        set.0
+    })
+}
+
 impl<'a> Matcher<'a> {
     pub fn new(src: &'a [u8], pat: &'a [u8]) -> Self {
         Matcher {
@@ -221,6 +265,40 @@ impl<'a> Matcher<'a> {
         !sig
     }
 
+    /// The bytes the set `[...]` at `p..=ec` matches, read as
+    /// [`Self::match_bracket_class`] reads it.
+    fn set_of(&self, c: usize, ec: usize) -> ByteSet {
+        let mut p = c + 1;
+        let mut set = ByteSet([0; 4]);
+        let mut sig = true;
+        if self.pat[p] == b'^' {
+            sig = false;
+            p += 1;
+        }
+        while p < ec {
+            if self.pat[p] == ESC {
+                p += 1;
+                set.add_all(class_set(self.pat[p]));
+                p += 1;
+            } else if p + 2 < ec && self.pat[p + 1] == b'-' {
+                let (lo, hi) = (self.pat[p], self.pat[p + 2]);
+                let mut b = lo as usize;
+                while b <= hi as usize {
+                    set.add(b as u8);
+                    b += 1;
+                }
+                p += 3;
+            } else {
+                set.add(self.pat[p]);
+                p += 1;
+            }
+        }
+        if !sig {
+            set.invert();
+        }
+        set
+    }
+
     /// Whether the byte at `s` matches the single item `p..ep`.
     fn single_match(&self, s: usize, p: usize, ep: usize) -> bool {
         if s >= self.src.len() {
@@ -262,8 +340,16 @@ impl<'a> Matcher<'a> {
 
     fn max_expand(&mut self, s: usize, p: usize, ep: usize) -> MatchResult {
         let mut i = 0;
-        while self.single_match(s + i, p, ep) {
-            i += 1;
+        if self.pat[p] == b'[' {
+            // A set is read once for the whole run, not once per byte.
+            let set = self.set_of(p, ep - 1);
+            while s + i < self.src.len() && set.contains(self.src[s + i]) {
+                i += 1;
+            }
+        } else {
+            while self.single_match(s + i, p, ep) {
+                i += 1;
+            }
         }
         // The longest run first, then shorter ones.
         loop {
@@ -529,6 +615,27 @@ pub fn match_here(src: &[u8], pat: &[u8], s: usize) -> i64 {
     }
 }
 
+/// The first match at or after byte `init` that does not end at `last`,
+/// as `gmatch` takes it (an empty match where the last one ended is
+/// passed over): its end, -1 when none is left, or -2 for an error. One
+/// matcher serves every start the scan tries.
+pub fn gmatch_next(src: &[u8], pat: &[u8], init: usize, last: i64) -> i64 {
+    let mut m = Matcher::new(src, pat);
+    let mut at = init;
+    while at <= src.len() {
+        match m.match_at(at) {
+            Ok(Some(e)) if e as i64 != last => {
+                record(&m, at, e);
+                return e as i64;
+            }
+            Ok(_) => {}
+            Err(e) => return record_error(e),
+        }
+        at += 1;
+    }
+    -1
+}
+
 /// `%0`..`%9` and `%%` in a `gsub` replacement string, with the last
 /// match's captures. An error names the misuse.
 pub fn expand(src: &[u8], repl: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
@@ -591,6 +698,35 @@ pub fn capture_text(i: usize) -> Result<CaptureValue, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set a bracket class is read as holds what the class matches.
+    #[test]
+    fn a_set_holds_what_its_class_matches() {
+        let classes: [&[u8]; 10] = [
+            b"[^ ]",
+            b"[abc]",
+            b"[a-z]",
+            b"[^a-z]",
+            b"[%w_]",
+            b"[%a%d-]",
+            b"[^%s]",
+            b"[%W]",
+            b"[a-c%.x]",
+            b"[z-a]",
+        ];
+        for pat in classes {
+            let m = Matcher::new(b"", pat);
+            let set = m.set_of(0, pat.len() - 1);
+            for b in 0..=255u8 {
+                assert_eq!(
+                    set.contains(b),
+                    m.match_bracket_class(b, 0, pat.len() - 1),
+                    "{} on {b}",
+                    String::from_utf8_lossy(pat)
+                );
+            }
+        }
+    }
 
     #[test]
     fn capture_kinds_follow_the_pattern() {

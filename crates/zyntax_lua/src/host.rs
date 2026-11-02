@@ -1373,6 +1373,18 @@ extern "C" fn host_pat_match_at(
     pattern::match_here(src, pat, pos as usize)
 }
 
+/// The end of the first match from 0-based `init` that does not end at
+/// `last`: its end, -1 or -2.
+extern "C" fn host_pat_gmatch_next(
+    s: zrtl::StringConstPtr,
+    pat: zrtl::StringConstPtr,
+    init: i64,
+    last: i64,
+) -> i64 {
+    let (src, pat) = unsafe { (bytes_of(s), bytes_of(pat)) };
+    pattern::gmatch_next(src, pat, init as usize, last)
+}
+
 extern "C" fn host_pat_end() -> i64 {
     pattern::STATE.with(|st| st.borrow().end as i64)
 }
@@ -2028,7 +2040,7 @@ fn table_error_text(err: *const DynamicBox) -> Result<Option<Vec<u8>>, String> {
 // ─── the plugin ─────────────────────────────────────────────────────
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"lua_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 105] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 106] = [
     zrtl::ZrtlSymbol::new(c"$Lua$cpath".as_ptr(), host_cpath as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$argv".as_ptr(), host_argv as *const u8),
@@ -2081,6 +2093,10 @@ static SYMBOLS: [zrtl::ZrtlSymbol; 105] = [
     zrtl::ZrtlSymbol::new(
         c"$Lua$pat_match_at".as_ptr(),
         host_pat_match_at as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Lua$pat_gmatch_next".as_ptr(),
+        host_pat_gmatch_next as *const u8,
     ),
     zrtl::ZrtlSymbol::new(c"$Lua$pat_end".as_ptr(), host_pat_end as *const u8),
     zrtl::ZrtlSymbol::new(c"$Lua$pat_level".as_ptr(), host_pat_level as *const u8),

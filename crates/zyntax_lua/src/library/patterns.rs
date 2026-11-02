@@ -62,6 +62,17 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
             i64(),
             "$Lua$pat_match_at",
         ),
+        (
+            "zl_pat_gmatch_next",
+            vec![
+                ("s", string()),
+                ("pat", string()),
+                ("init", i64()),
+                ("last", i64()),
+            ],
+            i64(),
+            "$Lua$pat_gmatch_next",
+        ),
         ("zl_pat_end", vec![], i64(), "$Lua$pat_end"),
         ("zl_pat_level", vec![], i64(), "$Lua$pat_level"),
         (
@@ -316,24 +327,13 @@ pub fn declarations(t: &Types) -> Vec<Decl> {
         &[&s, &pat, &init, &n, &last],
         i64(),
         vec![
-            src.decl(init.e()),
-            while_(
-                le(src.e(), n.e()),
-                vec![
-                    e.decl(call(
-                        "zl_pat_match_at",
-                        vec![s.e(), pat.e(), src.e()],
-                        i64(),
-                    )),
-                    when(eq(e.e(), int(-2)), vec![pattern_error(), ret(int(-1))]),
-                    when(
-                        and(ge(e.e(), int(0)), ne(e.e(), last.e())),
-                        vec![ret(e.e())],
-                    ),
-                    src.add_assign(int(1)),
-                ],
-            ),
-            ret(int(-1)),
+            e.decl(call(
+                "zl_pat_gmatch_next",
+                vec![s.e(), pat.e(), init.e(), last.e()],
+                i64(),
+            )),
+            when(eq(e.e(), int(-2)), vec![pattern_error(), ret(int(-1))]),
+            ret(e.e()),
         ],
     ));
     d.push(define(
