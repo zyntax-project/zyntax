@@ -2996,7 +2996,6 @@ pub fn held(ty: &HirType) -> Held {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProfileSample {
     pub call_count: u64,
-    pub instructions_executed: u64,
 }
 
 /// Where a module global lives in another execution tier, asked the
@@ -3188,7 +3187,7 @@ pub struct HirInterpreter {
     /// Per-HIR-function compiled bytecode cache. First call to a fn
     /// triggers compilation; subsequent calls reuse the same
     /// `CompiledFunction`. Keyed by `HirFunction::id`.
-    cache: IdMap<CompiledFunction>,
+    cache: IdMap<std::sync::Arc<CompiledFunction>>,
     /// Functions this interpreter has already refused, and why.
     ///
     /// A refusal is as stable as a success: a function that performs an
@@ -3421,6 +3420,11 @@ impl HirInterpreter {
     pub fn bind_global_slot(&mut self, id: HirId, ptr: *mut u8) {
         self.memory.bind_global_slot(id, ptr);
         for function in self.cache.values_mut() {
+            if !function.global_consts.iter().any(|&(g, _)| g == id) {
+                continue;
+            }
+            // A frame running the old bytecode keeps its own copy.
+            let function = std::sync::Arc::make_mut(function);
             for &(global_id, idx) in &function.global_consts {
                 if global_id == id {
                     function.const_pool[idx as usize] = ZyntaxValue::Pointer(ptr);
@@ -4253,7 +4257,7 @@ impl HirInterpreter {
                             held = Some(std::sync::Arc::clone(body));
                         }
                     }
-                    self.cache.insert(func_id, cf);
+                    self.cache.insert(func_id, std::sync::Arc::new(cf));
                 }
                 Err(InterpError::UnsupportedInstruction(why)) => {
                     if trace_enabled() {
@@ -4271,10 +4275,9 @@ impl HirInterpreter {
             }
         }
 
-        // Lift the compiled function out of the cache so we can mutate
-        // `self.memory` / `self.symbols` / `self.cache` during nested
-        // calls. The map ownership returns at the end.
-        let cf = self.cache.remove(&func_id).unwrap();
+        // The frame holds its own handle, so nested calls (recursion
+        // included) find the entry in the cache and share it.
+        let cf = std::sync::Arc::clone(self.cache.get(&func_id).unwrap());
         let result = self.run(module, &cf, args, func_id, dest);
         drop(held);
         let released = first
@@ -4284,9 +4287,7 @@ impl HirInterpreter {
                 .is_some_and(|hook| hook(func_id));
         if released {
             self.source_bodies.remove(&func_id);
-        } else {
-            // Put the (immutable) compiled function back.
-            self.cache.insert(func_id, cf);
+            self.cache.remove(&func_id);
         }
         result
     }
@@ -4513,9 +4514,6 @@ impl HirInterpreter {
         let code = &cf.code;
 
         while pc < code.len() {
-            if let Some(p) = self.profile.get_mut(&func_id) {
-                p.instructions_executed += 1;
-            }
             roots.at(pc);
             match &code[pc] {
                 Op::LoadConst { dst, c } => {
