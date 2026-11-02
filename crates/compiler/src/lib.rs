@@ -2251,6 +2251,9 @@ fn run_interp_safe_opts_with(
         //     Free synthesised.
         // Cranelift's mem2reg cannot promote heap allocations
         // (Call results are opaque); this is the HIR-only path.
+        // A box nothing reads holds the pointer it was made from in
+        // the open, which keeps its object from being scalar replaced.
+        let dead_boxes = boxes::remove_dead_makers(module);
         let sra = scalar_replace_alloc::run_module(module);
         checkpoint!("scalar_replace_alloc");
         check_hir_uses(module, "scalar_replace_alloc");
@@ -2315,6 +2318,7 @@ fn run_interp_safe_opts_with(
             || ags.round_trips_removed > 0
             || ags.field_reads_only > 0
             || agsc.webs > 0
+            || dead_boxes > 0
             || sra.mallocs_eliminated > 0
             || heap > 0
             || il.inlined > 0

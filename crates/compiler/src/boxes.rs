@@ -191,6 +191,69 @@ pub fn run_module(module: &mut HirModule) -> BoxStats {
     stats
 }
 
+/// Delete the box-making calls of `module` whose box nothing reads, so
+/// the pointer one was handed no longer looks as if it escaped. Returns
+/// how many went.
+pub fn remove_dead_makers(module: &mut HirModule) -> usize {
+    let externs = externs_of(module);
+    let mut removed = 0;
+    for func in module.functions_to_optimize() {
+        removed += remove_dead_makers_in(func, &externs);
+    }
+    removed
+}
+
+fn remove_dead_makers_in(func: &mut HirFunction, externs: &HashMap<HirId, String>) -> usize {
+    let makes = |inst: &HirInstruction| -> Option<HirId> {
+        let HirInstruction::Call {
+            result: Some(result),
+            callee,
+            ..
+        } = inst
+        else {
+            return None;
+        };
+        let symbol = match callee {
+            HirCallable::Symbol(name) => name.as_str(),
+            HirCallable::Function(id) => externs.get(id)?.as_str(),
+            _ => return None,
+        };
+        is_maker(symbol).then_some(*result)
+    };
+    if !func
+        .blocks
+        .values()
+        .any(|b| b.instructions.iter().any(|i| makes(i).is_some()))
+    {
+        return 0;
+    }
+    let mut used: HashSet<HirId> = HashSet::new();
+    for block in func.blocks.values() {
+        for inst in &block.instructions {
+            inst.for_each_operand(|id| {
+                used.insert(id);
+            });
+        }
+        block.terminator.for_each_operand(|id| {
+            used.insert(id);
+        });
+        for phi in &block.phis {
+            used.extend(phi.incoming.iter().map(|(v, _)| *v));
+        }
+    }
+    let mut removed = 0;
+    for block in func.blocks.values_mut() {
+        block.instructions.retain(|inst| match makes(inst) {
+            Some(result) if !used.contains(&result) => {
+                removed += 1;
+                false
+            }
+            _ => true,
+        });
+    }
+    removed
+}
+
 /// The symbol each extern declaration of `module` stands for, as
 /// [`run_function`] wants it.
 pub fn externs_of(module: &HirModule) -> HashMap<HirId, String> {
@@ -810,5 +873,66 @@ mod tests {
             DISPLAY_OFFSET
         );
         assert_eq!(std::mem::size_of::<DynamicBoxRepr>() as i64, HEADER_SIZE);
+    }
+
+    fn call_maker(result: HirId, args: Vec<HirId>) -> HirInstruction {
+        HirInstruction::Call {
+            result: Some(result),
+            callee: HirCallable::Symbol("zyntax_box_ptr".to_string()),
+            args,
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        }
+    }
+
+    #[test]
+    fn a_box_nothing_reads_is_removed_and_a_read_one_is_kept() {
+        use crate::hir::{
+            HirFunction, HirFunctionSignature, HirModule, HirTerminator, HirValueKind,
+        };
+        use zyntax_typed_ast::InternedString;
+        let box_ty = HirType::Ptr(std::sync::Arc::new(HirType::Opaque(
+            InternedString::new_global("DynamicBox"),
+        )));
+        let mut f = HirFunction::new(
+            InternedString::new_global("makes"),
+            HirFunctionSignature {
+                params: vec![],
+                returns: vec![box_ty.clone()],
+                type_params: vec![],
+                const_params: vec![],
+                lifetime_params: vec![],
+                is_variadic: false,
+                is_async: false,
+                is_fiber: false,
+                effects: vec![],
+                is_pure: false,
+            },
+        );
+        let p = f.create_value(
+            HirType::I64,
+            HirValueKind::Constant(crate::hir::HirConstant::I64(0)),
+        );
+        let tag = f.create_value(
+            HirType::I32,
+            HirValueKind::Constant(crate::hir::HirConstant::I32(1)),
+        );
+        let dead = f.create_value(box_ty.clone(), HirValueKind::Instruction);
+        let live = f.create_value(box_ty, HirValueKind::Instruction);
+        let entry = f.entry_block;
+        let block = f.blocks.get_mut(&entry).unwrap();
+        block.instructions = vec![
+            call_maker(dead, vec![p, tag]),
+            call_maker(live, vec![p, tag]),
+        ];
+        block.terminator = HirTerminator::Return { values: vec![live] };
+        let mut module = HirModule::new(InternedString::new_global("m"));
+        let id = f.id;
+        module.functions.insert(id, f);
+        assert_eq!(remove_dead_makers(&mut module), 1);
+        let calls = &module.functions[&id].blocks[&entry].instructions;
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], HirInstruction::Call { result: Some(r), .. } if *r == live));
     }
 }

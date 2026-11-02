@@ -608,3 +608,70 @@ fn an_object_read_past_its_block_becomes_its_stored_fields() {
         HirInstruction::ExtractValue { aggregate, .. } if *aggregate == stored
     )));
 }
+
+#[test]
+fn a_pointer_read_back_as_another_pointer_type_is_one_field() {
+    let stored_ty = HirType::Ptr(std::sync::Arc::new(HirType::I64));
+    let read_ty = HirType::Ptr(std::sync::Arc::new(HirType::U8));
+    let mut f = HirFunction::new(
+        InternedString::new_global("retyped"),
+        HirFunctionSignature {
+            params: vec![],
+            returns: vec![read_ty.clone()],
+            type_params: vec![],
+            const_params: vec![],
+            lifetime_params: vec![],
+            is_variadic: false,
+            is_async: false,
+            is_fiber: false,
+            effects: vec![],
+            is_pure: false,
+        },
+    );
+    let entry = f.entry_block;
+    let later = f.create_block();
+    let size = constant(&mut f, 16);
+    let eight = constant(&mut f, 8);
+    let stored = f.create_value(stored_ty, HirValueKind::Parameter(0));
+    let object = instruction(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+    let at = instruction(&mut f, HirType::Ptr(std::sync::Arc::new(HirType::U8)));
+    let read = instruction(&mut f, read_ty.clone());
+    let b = f.blocks.get_mut(&entry).unwrap();
+    b.instructions = vec![
+        call(Some(object), Intrinsic::Malloc, vec![size]),
+        HirInstruction::GetElementPtr {
+            result: at,
+            ty: HirType::U8,
+            ptr: object,
+            indices: vec![eight],
+        },
+        store(stored, at),
+    ];
+    b.terminator = HirTerminator::Branch { target: later };
+    let b = f.blocks.get_mut(&later).unwrap();
+    b.instructions = vec![
+        HirInstruction::Load {
+            result: read,
+            ty: read_ty,
+            ptr: at,
+            align: 8,
+            volatile: false,
+        },
+        call(None, Intrinsic::Free, vec![object]),
+    ];
+    b.terminator = HirTerminator::Return { values: vec![read] };
+    f.rebuild_cfg_edges();
+    assert_eq!(heap_scalarize::run_function(&mut f), 1);
+    assert!(
+        !f.blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(
+                i,
+                HirInstruction::Call {
+                    callee: HirCallable::Intrinsic(Intrinsic::Malloc | Intrinsic::Free),
+                    ..
+                }
+            ))
+    );
+}

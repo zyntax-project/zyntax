@@ -541,13 +541,38 @@ fn field_bytes(ty: &HirType) -> Option<u64> {
 
 fn field(fields: &mut BTreeMap<u64, HirType>, offset: u64, ty: &HirType) -> Option<()> {
     field_bytes(ty)?;
-    if let Some(old) = fields.get(&offset)
-        && old != ty
-    {
-        return None;
+    if let Some(old) = fields.get(&offset) {
+        if !same_slot(old, ty) {
+            return None;
+        }
+        return Some(());
     }
     fields.insert(offset, ty.clone());
     Some(())
+}
+
+/// Whether two accesses at one offset read and write the same slot:
+/// the same type, or two pointers (whatever they point to) or two
+/// integers of one width.
+fn same_slot(a: &HirType, b: &HirType) -> bool {
+    let int = |t: &HirType| {
+        matches!(
+            t,
+            HirType::I8
+                | HirType::I16
+                | HirType::I32
+                | HirType::I64
+                | HirType::U8
+                | HirType::U16
+                | HirType::U32
+                | HirType::U64
+                | HirType::ISize
+                | HirType::USize
+        )
+    };
+    a == b
+        || matches!((a, b), (HirType::Ptr(_), HirType::Ptr(_)))
+        || (int(a) && int(b) && bytes(a) == bytes(b))
 }
 
 fn apply(f: &mut HirFunction, p: Plan) {
