@@ -49,8 +49,10 @@ pub const BOXED_PREFIX: u32 = 1 << 4;
 /// Set in every header.
 pub const MAGIC: u32 = 1 << 31;
 
-/// Bytes of the box a [`BOXED_PREFIX`] string carries in front of it.
-pub const BOXED_PREFIX_SIZE: usize = 32;
+/// Bytes of the box a [`BOXED_PREFIX`] string carries in front of it: the
+/// box, the hash word a string box keeps after it, and the padding that
+/// leaves the string sixteen-aligned.
+pub const BOXED_PREFIX_SIZE: usize = 48;
 
 /// A TEXT string at least this long, with a character wider than a
 /// byte, is built with a character index.
@@ -223,11 +225,33 @@ pub unsafe fn string_build(
     text: bool,
     fill: impl FnOnce(*mut u8),
 ) -> StringPtr {
-    let (flags, total) = layout_of(byte_len, char_len, text);
-    let ptr = crate::heap::alloc(total, 16);
-    if ptr.is_null() {
+    string_build_in(0, byte_len, char_len, text, fill)
+}
+
+/// [`string_build`] with `prefix` bytes in front of the string in the
+/// same block, which a caller that boxes the string fills with the box.
+/// A prefix other than none marks the string BOXED_PREFIX, so releasing
+/// the string releases the block. Returns the string, which is `prefix`
+/// bytes into the block.
+///
+/// # Safety
+/// As [`string_build`]; `prefix` is zero or [`BOXED_PREFIX_SIZE`].
+unsafe fn string_build_in(
+    prefix: usize,
+    byte_len: usize,
+    char_len: usize,
+    text: bool,
+    fill: impl FnOnce(*mut u8),
+) -> StringPtr {
+    let (mut flags, total) = layout_of(byte_len, char_len, text);
+    if prefix != 0 {
+        flags |= BOXED_PREFIX;
+    }
+    let block = crate::heap::alloc(prefix + total, 16);
+    if block.is_null() {
         return std::ptr::null_mut();
     }
+    let ptr = block.add(prefix);
     write_header(ptr, byte_len, char_len as u32, flags, 0);
     fill(ptr.add(STRING_HEADER_SIZE));
     if flags & INDEXED != 0 {
@@ -278,24 +302,29 @@ pub const IMMORTAL_STRIDE: usize = 32;
 struct Slot([u8; IMMORTAL_STRIDE]);
 
 /// Every one-character string of U+0000..U+00FF as TEXT, every one-byte
-/// string without TEXT, and the empty string: static, never released,
-/// never written.
+/// string without TEXT, the empty string and the text of the integers
+/// below [`SMALL_INTS`]: static, never released, never written.
 #[repr(C, align(16))]
 pub struct ImmortalTable {
     char_text: [Slot; 256],
     byte_str: [Slot; 256],
     empty: Slot,
+    ints: [Slot; SMALL_INTS],
 }
 
+/// The integers `0..SMALL_INTS` whose text is a static string, so the text
+/// of a small count, index or code is no allocation.
+pub const SMALL_INTS: usize = 1000;
+
 const fn slot(bytes: &[u8], text: bool) -> Slot {
+    slot_chars(bytes, if bytes.is_empty() { 0 } else { 1 }, text)
+}
+
+/// A static string of `bytes`, `chars` characters long.
+const fn slot_chars(bytes: &[u8], chars: u32, text: bool) -> Slot {
     let mut s = [0u8; IMMORTAL_STRIDE];
     let flags = MAGIC | IMMORTAL | if text { TEXT } else { 0 };
-    let head = [
-        bytes.len() as u32,
-        if bytes.is_empty() { 0 } else { 1 },
-        hash32_of(bytes),
-        flags,
-    ];
+    let head = [bytes.len() as u32, chars, hash32_of(bytes), flags];
     let mut w = 0;
     while w < 4 {
         let b = head[w].to_ne_bytes();
@@ -314,12 +343,37 @@ const fn slot(bytes: &[u8], text: bool) -> Slot {
     Slot(s)
 }
 
+/// The static string of the decimal text of `n < SMALL_INTS`.
+const fn int_slot(n: usize) -> Slot {
+    let mut text = [0u8; 3];
+    let mut len = 1;
+    if n >= 100 {
+        len = 3;
+    } else if n >= 10 {
+        len = 2;
+    }
+    let mut k = n;
+    let mut at = len;
+    while at > 0 {
+        at -= 1;
+        text[at] = b'0' + (k % 10) as u8;
+        k /= 10;
+    }
+    slot_chars(text.split_at(len).0, len as u32, true)
+}
+
 const fn build_table() -> ImmortalTable {
     let mut t = ImmortalTable {
         char_text: [Slot([0; IMMORTAL_STRIDE]); 256],
         byte_str: [Slot([0; IMMORTAL_STRIDE]); 256],
         empty: slot(&[], true),
+        ints: [Slot([0; IMMORTAL_STRIDE]); SMALL_INTS],
     };
+    let mut n = 0;
+    while n < SMALL_INTS {
+        t.ints[n] = int_slot(n);
+        n += 1;
+    }
     let mut c = 0;
     while c < 256 {
         t.char_text[c] = if c < 0x80 {
@@ -387,6 +441,17 @@ pub fn char_text(c: u8) -> StringPtr {
 #[inline]
 pub fn byte_str(b: u8) -> StringPtr {
     &table().byte_str[b as usize] as *const Slot as StringPtr
+}
+
+/// The static string of the decimal text of `n`, when `0 <= n <
+/// SMALL_INTS`.
+#[inline]
+pub fn small_int_string(n: i64) -> Option<StringPtr> {
+    if (0..SMALL_INTS as i64).contains(&n) {
+        Some(&table().ints[n as usize] as *const Slot as StringPtr)
+    } else {
+        None
+    }
 }
 
 /// The empty string.
@@ -623,6 +688,56 @@ pub fn string_concat_n(parts: &[StringConstPtr]) -> StringPtr {
         }
         string_build(total, chars, true, fill)
     }
+}
+
+/// Two strings joined and boxed in one block: the box, the hash word a
+/// string box keeps after it and the string share an allocation, so a
+/// string made to be stored as a dynamic value costs one block, one
+/// release and one object for a collector to mark. Null when the join
+/// is not this call's to make (a binary piece, or a result short enough
+/// to be a shared constant): the caller joins and boxes it apart.
+///
+/// # Safety
+/// The pointers must be null or valid strings.
+pub unsafe fn string_concat_boxed(
+    a: StringConstPtr,
+    b: StringConstPtr,
+) -> *mut crate::dynamic_box::DynamicBox {
+    use crate::dynamic_box::{DynamicBox, STRING_HASH_SIZE};
+    let (pa, pb) = (string_as_bytes(a), string_as_bytes(b));
+    let total = pa.len() + pb.len();
+    if total <= 2 {
+        return std::ptr::null_mut();
+    }
+    let chars = |p: StringConstPtr, bytes: &[u8]| -> Option<usize> {
+        if p.is_null() || string_flags(p) & TEXT != 0 {
+            Some(string_char_count(p))
+        } else if bytes.is_ascii() {
+            Some(bytes.len())
+        } else {
+            None
+        }
+    };
+    let (Some(ca), Some(cb)) = (chars(a, pa), chars(b, pb)) else {
+        return std::ptr::null_mut();
+    };
+    let string = string_build_in(BOXED_PREFIX_SIZE, total, ca + cb, true, |at| {
+        copy_bytes(pa, at);
+        copy_bytes(pb, at.add(pa.len()));
+    });
+    if string.is_null() {
+        return std::ptr::null_mut();
+    }
+    let block = (string as *mut u8).sub(BOXED_PREFIX_SIZE);
+    (block as *mut DynamicBox).write(DynamicBox {
+        tag: crate::type_system::TypeTag::STRING,
+        size: std::mem::size_of::<*const u8>() as u32,
+        data: string as *mut u8,
+        dropper: None,
+        display_fn: None,
+    });
+    (block.add(std::mem::size_of::<DynamicBox>()) as *mut u8).write_bytes(0, STRING_HASH_SIZE);
+    block as *mut DynamicBox
 }
 
 /// Bytes `start..end` of a string as a string of its own, TEXT when the
@@ -875,7 +990,37 @@ pub unsafe fn string_equals(a: StringConstPtr, b: StringConstPtr) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
-    string_as_bytes(a) == string_as_bytes(b)
+    bytes_equal(string_as_bytes(a), string_as_bytes(b))
+}
+
+/// Whether two byte runs are equal. Runs up to sixteen bytes, the usual
+/// length of a key, are compared in two overlapping loads, not by a call
+/// to the library's compare.
+#[inline]
+fn bytes_equal(x: &[u8], y: &[u8]) -> bool {
+    let n = x.len();
+    if n != y.len() {
+        return false;
+    }
+    // SAFETY: each load lies inside both runs, of `n` bytes.
+    unsafe {
+        let (p, q) = (x.as_ptr(), y.as_ptr());
+        match n {
+            0 => true,
+            1..=3 => *p == *q && *p.add(n / 2) == *q.add(n / 2) && *p.add(n - 1) == *q.add(n - 1),
+            4..=7 => {
+                (p as *const u32).read_unaligned() == (q as *const u32).read_unaligned()
+                    && (p.add(n - 4) as *const u32).read_unaligned()
+                        == (q.add(n - 4) as *const u32).read_unaligned()
+            }
+            8..=16 => {
+                (p as *const u64).read_unaligned() == (q as *const u64).read_unaligned()
+                    && (p.add(n - 8) as *const u64).read_unaligned()
+                        == (q.add(n - 8) as *const u64).read_unaligned()
+            }
+            _ => x == y,
+        }
+    }
 }
 
 /// Get string as a Rust &str: a TEXT string always, another when its
@@ -1260,8 +1405,16 @@ mod tests {
             assert!(is_immortal_string(byte_str(255) as usize));
             assert!(is_immortal_string(empty_string() as usize));
             assert!(!is_immortal_string(
-                empty_string() as usize + IMMORTAL_STRIDE
+                immortal_table() as usize + std::mem::size_of::<ImmortalTable>()
             ));
+            for n in [0i64, 7, 10, 42, 99, 100, 999] {
+                let s = small_int_string(n).unwrap();
+                assert_eq!(string_as_str(s), Some(n.to_string().as_str()));
+                assert_eq!(string_char_count(s), n.to_string().len());
+                assert_eq!(string_hash32(s), hash32_of(n.to_string().as_bytes()));
+                assert!(is_immortal_string(s as usize));
+            }
+            assert!(small_int_string(-1).is_none() && small_int_string(1000).is_none());
             assert_eq!(
                 char_text_base() + IMMORTAL_STRIDE * 0x41,
                 char_text(0x41) as usize

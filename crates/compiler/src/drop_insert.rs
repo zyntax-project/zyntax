@@ -2087,6 +2087,9 @@ pub(crate) fn symbol_role(name: &str) -> Option<SymbolRole> {
         STRING_TO_BOX => Some(SymbolRole::COPIES_INTO_BOX),
         // A box that took the string itself.
         STRING_INTO_BOX => Some(SymbolRole::KEEPS_INTO_BOX),
+        // A box made of the strings it reads, in one block with the joined
+        // string: released with the box.
+        "$IO$string_concat_boxed" => Some(SymbolRole::COPIES_INTO_BOX),
         // A typed host constructor hands back an owned opaque word.
         _ if name.starts_with("$Foreign$construct") && name.contains("_word") => Some(SymbolRole {
             allocates: Some(FOREIGN_WORD_FREE),

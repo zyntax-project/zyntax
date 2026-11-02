@@ -666,6 +666,13 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         any(),
         Some("$IO$string_to_dynamic"),
     ));
+    // Two strings joined and boxed in one allocation.
+    d.push(extern_fn(
+        "zb_str_concat_boxed",
+        &[("a", string()), ("b", string())],
+        any(),
+        Some("$IO$string_concat_boxed"),
+    ));
     let s_in = local("v", string());
     d.push(define(
         "zb_box_str",

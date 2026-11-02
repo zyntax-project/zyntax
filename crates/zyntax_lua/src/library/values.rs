@@ -1304,10 +1304,14 @@ pub(super) fn declarations(_policy: &zyntax_builtins::Policy, t: &Types) -> Vec<
                     and(not(is_nil(a.e())), not(is_nil(b.e()))),
                     and(is_text_like(a.e()), is_text_like(b.e())),
                 ),
-                vec![ret(box_str(add(
-                    call("zl_concat_text", vec![a.e()], string()),
-                    call("zl_concat_text", vec![b.e()], string()),
-                )))],
+                vec![ret(call(
+                    "zb_str_concat_boxed",
+                    vec![
+                        call("zl_concat_text", vec![a.e()], string()),
+                        call("zl_concat_text", vec![b.e()], string()),
+                    ],
+                    any(),
+                ))],
             ),
             ret(call(
                 "zl_arith_meta",

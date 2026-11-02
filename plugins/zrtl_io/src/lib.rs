@@ -971,6 +971,23 @@ pub unsafe extern "C" fn io_string_adopt_dynamic(s: StringPtr) -> *mut zrtl::Dyn
     .into_raw()
 }
 
+/// Concatenate two strings into a box: the box and the joined string
+/// share one allocation, which the box's release frees.
+///
+/// # Safety
+/// The pointers must be null or valid strings.
+#[no_mangle]
+pub unsafe extern "C" fn io_string_concat_boxed(
+    a: StringConstPtr,
+    b: StringConstPtr,
+) -> *mut zrtl::DynamicBox {
+    let boxed = zrtl::string::string_concat_boxed(a, b);
+    if !boxed.is_null() {
+        return boxed;
+    }
+    io_string_adopt_dynamic(zrtl::string::string_concat(a, b))
+}
+
 /// Concatenate two ZRTL strings
 ///
 /// Returns a new ZRTL string, caller must free with `string_free`.
@@ -1102,6 +1119,7 @@ zrtl_plugin! {
         ("$IO$string_concat", io_string_concat, (i64, i64) -> opaque),
         ("$IO$string_adopt_dynamic", io_string_adopt_dynamic, (i64) -> i64),
         ("$IO$string_to_dynamic", io_string_to_dynamic, (i64) -> i64),
+        ("$IO$string_concat_boxed", io_string_concat_boxed, (i64, i64) -> i64),
         ("$IO$concat_dynamic", io_concat_dynamic, dynamic(2) -> dynamic),
     ]
 }
@@ -1211,6 +1229,38 @@ mod tests {
                 rendered
             );
             string_free(formatted);
+        }
+    }
+
+    #[test]
+    fn test_concat_boxed_shares_one_block() {
+        use zrtl::string::{
+            string_as_str, string_flags, string_free, string_new, BOXED_PREFIX, BOXED_PREFIX_SIZE,
+        };
+        unsafe {
+            let (a, b) = (string_new("alpha"), string_new("42"));
+            let boxed = io_string_concat_boxed(a, b);
+            assert_eq!((*boxed).tag.0, zrtl::TypeTag::STRING.0);
+            let joined = (*boxed).data as StringConstPtr;
+            assert_eq!(string_as_str(joined), Some("alpha42"));
+            assert_eq!(joined as usize, boxed as usize + BOXED_PREFIX_SIZE);
+            assert!(string_flags(joined) & BOXED_PREFIX != 0);
+            assert!((*boxed).dropper.is_none());
+            // Releasing the string releases the block it shares with the box.
+            string_free(joined as zrtl::StringPtr);
+
+            // Too short to be a block of its own: boxed apart, an adopted string.
+            let tiny = io_string_concat_boxed(string_new("a"), string_new("b"));
+            assert_eq!(string_as_str((*tiny).data as StringConstPtr), Some("ab"));
+            // A binary piece is joined the ordinary way.
+            let binary = io_string_concat_boxed(
+                zrtl::string::bytes_new(&[0xFF, 0xFE, 0x01]),
+                string_new("x"),
+            );
+            assert_eq!(
+                zrtl::string::string_as_bytes((*binary).data as StringConstPtr),
+                &[0xFF, 0xFE, 0x01, b'x']
+            );
         }
     }
 

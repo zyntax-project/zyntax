@@ -690,6 +690,9 @@ pub extern "C" fn string_parse_float(s: StringPtr) -> f64 {
 /// Convert integer to string
 #[no_mangle]
 pub extern "C" fn string_from_int(n: i64) -> StringPtr {
+    if let Some(small) = zrtl::string::small_int_string(n) {
+        return small;
+    }
     // Digits written into a stack buffer, then one allocation.
     let mut buf = [0u8; 20];
     let mut i = buf.len();
