@@ -1297,6 +1297,9 @@ pub struct TieredBackend {
     /// such a function is compiled ahead of that call, which runs its
     /// code, and asks for the optimizing tier as soon as it has some.
     static_hot: HashMap<HirId, bool>,
+    /// The functions the snapshot's machine code holds, by the ids they
+    /// have in this process; read for `ZYNTAX_TRACE_LAZY`, which fills it.
+    portable_ids: Arc<std::sync::OnceLock<HashSet<HirId>>>,
     /// The optimiser for a function that is not the module's: an
     /// outlined resume point of the bead it belongs to, and whether it
     /// was cut from a body through the pipeline already, which it then
@@ -1473,6 +1476,7 @@ impl TieredBackend {
             optimized_bodies: Arc::new(OptimizedBodies::default()),
             finished: HashSet::new(),
             static_hot: HashMap::new(),
+            portable_ids: Arc::new(std::sync::OnceLock::new()),
             optimize_extra: None,
             interp_bodies: Arc::new(Mutex::new(HashMap::new())),
             scratches: Arc::new(Scratches::default()),
@@ -1785,6 +1789,16 @@ impl TieredBackend {
                 .collect();
             Some((variants.to_vec(), source.id_base(), eligible))
         });
+        if let Some((variants, base, _)) = &portable
+            && std::env::var_os("ZYNTAX_TRACE_LAZY").is_some()
+        {
+            let ids: HashSet<HirId> = variants
+                .iter()
+                .flat_map(|image| image.function_ids())
+                .map(|raw| HirId::from_raw(raw.wrapping_add(*base)))
+                .collect();
+            let _ = self.portable_ids.set(ids);
+        }
         let placed = self.cranelift.with_lock(|be| {
             if !joining {
                 let compiled_later: HashSet<HirId> = match &portable {
@@ -3581,6 +3595,7 @@ impl TieredBackend {
                     .map(|source| (*id, Arc::clone(source)))
             })
             .collect();
+        let portable_ids = Arc::clone(&self.portable_ids);
         let reload_key = self.cranelift.with_lock(|be| be.reload_key());
         let lazy: HashSet<HirId> = lazy.difference(finished).copied().collect();
         let static_hot = self.static_hot_beads(&lazy);
@@ -4214,8 +4229,9 @@ impl TieredBackend {
             }
             // `ZYNTAX_TRACE_LAZY=1` names each first-call compile with
             // the time it took, the wait for the backend included, what
-            // kind of body it was, and the thread that did it; and each
-            // quick baseline replaced, with how long it served.
+            // kind of body it was, whether the snapshot's machine code
+            // held it, and the thread that did it; and each quick
+            // baseline replaced, with how long it served.
             if trace {
                 let name = body.name.resolve_global().unwrap_or_default();
                 if let Some(since) = quick_baseline.published_since(bead_id) {
@@ -4237,8 +4253,13 @@ impl TieredBackend {
                 } else {
                     "loops"
                 };
+                let image = match portable_ids.get() {
+                    Some(ids) if ids.contains(func_id) => ", in the image",
+                    Some(_) => ", not in the image",
+                    None => "",
+                };
                 eprintln!(
-                    "[lazy] compiled {name} in {:.2} ms (body {:.2}, compile {:.2}, {kind}) on {}",
+                    "[lazy] compiled {name} in {:.2} ms (body {:.2}, compile {:.2}, {kind}{image}) on {}",
                     lazy_started.elapsed().as_secs_f64() * 1e3,
                     body_at.as_secs_f64() * 1e3,
                     (compiled_at - body_at).as_secs_f64() * 1e3,

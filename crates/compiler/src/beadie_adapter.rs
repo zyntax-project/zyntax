@@ -492,7 +492,8 @@ mod llvm_impl {
             // asked at, and an outlined region's own header.
             let sites = crate::osr::wanted_resume_points(def.bead_id, &def.function);
             crate::opt_audit::note_llvm_body(def.id, &def.function);
-            self.with_lock(|backend| {
+            let started = web_time::Instant::now();
+            let compiled = self.with_lock(|backend| {
                 backend.set_compile_tier(tier);
                 backend.set_module_context(std::sync::Arc::clone(&def.module));
                 backend.set_osr_helper_sites(Some(sites));
@@ -507,7 +508,18 @@ mod llvm_impl {
                     .ok_or_else(|| {
                         CompileError::new(format!("llvm produced no fn ptr for {:?}", def.id))
                     })
-            })
+            });
+            // `ZYNTAX_TRACE_LAZY=1` names each optimizing-tier compile with
+            // its time, the wait for the backend included.
+            if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
+                eprintln!(
+                    "[llvm] compiled {} in {:.2} ms on {}",
+                    def.function.name.resolve_global().unwrap_or_default(),
+                    started.elapsed().as_secs_f64() * 1e3,
+                    std::thread::current().name().unwrap_or("?")
+                );
+            }
+            compiled
         }
     }
 
