@@ -12,8 +12,9 @@
 //! gains a marshalling layer; the `FiberCfg` contract itself doesn't
 //! change.
 //!
-//! Returned `*mut FiberRepr` handles are `Box<krio_fiber::Fiber>`
-//! pointers cast through `*mut FiberRepr`. The contract requires every
+//! Returned `*mut FiberRepr` handles point to a [`Shell`] naming a
+//! `Box<krio_fiber::Fiber>`: a `Box` for most fibers, and a small block
+//! of the collector's heap for a fiber that `make_fiber` allows. The contract requires every
 //! handle stays on the thread that created it (matches krio-fiber's
 //! `!Send` `Fiber`), and the caller owns the lifetime. `fiber_free`
 //! is the symmetric `Box::from_raw` drop (unmaps the stack + guard
@@ -22,15 +23,22 @@
 //! conditional/inner scopes, or received via a call return, aren't
 //! dropped yet (a later liveness-based pass) — they leak but never
 //! double-free.
+//!
+//! A collectable fiber is reclaimed by the collector once nothing
+//! refers to its handle: its stack, environment and error payload are
+//! read only while the handle is reached, and a fiber found unreached
+//! is dropped after the collection.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use zyntax_compiler::host_heap::Hold;
 
 use krio_fiber::{Fiber, FiberStep};
+use zyntax_compiler::collector::{self, Marking, WeakHooks};
 use zyntax_compiler::fiber_backend::{
     self, FIBER_STEP_DONE, FIBER_STEP_ERRORED, FIBER_STEP_YIELDED, FiberCfg,
 };
+use zyntax_compiler::pool_alloc::{zyntax_alloc, zyntax_free};
 use zyntax_compiler::zrtl::FiberRepr;
 
 /// `(variant_tag, payload)` stashed by [`Self::fiber_abort_with`].
@@ -72,6 +80,10 @@ thread_local! {
     /// collector on any thread, by handle, until the fiber is freed.
     static HELD: RefCell<HashMap<usize, Vec<Hold>>> = RefCell::new(HashMap::new());
 
+    /// Each fiber's body address, by handle, read when its first resume
+    /// starts it.
+    static BODIES: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+
     /// The fibers being resumed right now, innermost last, so a body
     /// can find its own handle.
     static RUNNING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -91,7 +103,50 @@ thread_local! {
     /// frees a live escapee.
     static TASK_FIBERS: RefCell<HashMap<i64, HashSet<usize>>> =
         RefCell::new(HashMap::new());
+
+    /// Fibers kept in the collector's heap, by handle; see `make_fiber`.
+    static COLLECTABLE: RefCell<HashMap<usize, Reachability>> = RefCell::new(HashMap::new());
+
+    /// Collectable fibers the collection in progress found unreached,
+    /// dropped once it ends. Capacity is reserved when a fiber is made,
+    /// because the hook that fills it may not allocate.
+    static DOOMED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
+    /// Which collection is running, so a fiber's stack is read once.
+    static GC_EPOCH: Cell<u64> = const { Cell::new(0) };
 }
+
+/// What the collector has found of a collectable fiber.
+#[derive(Clone, Copy, Default)]
+struct Reachability {
+    /// The collection whose marking last read this fiber's stack.
+    scanned: u64,
+    /// Found unreached; dropped when the collection ends.
+    doomed: bool,
+}
+
+/// What a handle points to. The fiber stays out of the collector's
+/// heap: a word left in it would hold other objects up, and fibers
+/// made one after another would hold each other up. Only these two
+/// words are in the heap, and both are written whole.
+#[repr(C)]
+struct Shell {
+    fiber: *mut Fiber,
+    _reserved: usize,
+}
+
+/// The fiber a handle names.
+///
+/// # Safety
+/// `handle` is a live handle from `make_fiber`.
+unsafe fn fiber_ptr(handle: usize) -> *mut Fiber {
+    // SAFETY: a handle points to its shell until released.
+    unsafe { (*(handle as *const Shell)).fiber }
+}
+
+/// Resident bytes a fiber's stack and bookkeeping hold outside the heap,
+/// spent against the collector's budget when one is made.
+const FIBER_PRESSURE: usize = 16 << 10;
 
 /// Stamp the task that owns fibers created from now on (see `TASK_FIBERS`).
 pub fn set_fiber_task_id(id: i64) {
@@ -133,6 +188,216 @@ impl KrioFiberBackend {
     pub fn new() -> Self {
         Self
     }
+
+    /// Make a fiber and hand its ownership to the caller as a handle.
+    /// With `may_collect`, a fiber nothing owns on the collector's own
+    /// thread lives in the collector's heap, to be reclaimed once
+    /// nothing refers to it; any other fiber is a `Box` the caller
+    /// frees.
+    ///
+    /// # Safety
+    /// `closure` must satisfy the contract of `fiber_new`.
+    unsafe fn make_fiber(
+        &self,
+        closure: *mut u8,
+        stack_size: i64,
+        may_collect: bool,
+    ) -> *mut FiberRepr {
+        let body = make_body();
+        let fiber = if stack_size > 0 {
+            Fiber::with_stack_size(stack_size as usize, body)
+        } else {
+            Fiber::new(body)
+        };
+        // Record the fiber under the task driving right now so a cancel of
+        // that task can free it.
+        let task = FIBER_TASK_ID.with(|c| c.get());
+        let in_heap = may_collect
+            && task == 0
+            && !zyntax_compiler::host_heap::is_installed()
+            && collector::collecting_here();
+        let shell = Shell {
+            fiber: Box::into_raw(Box::new(fiber)),
+            _reserved: 0,
+        };
+        let ptr = if in_heap {
+            // SAFETY: the block is sized for a `Shell`, written whole
+            // before anything reads it, and aligned to 16 by the pool.
+            unsafe {
+                let block = zyntax_alloc(std::mem::size_of::<Shell>()) as *mut Shell;
+                assert!(!block.is_null(), "fiber: the pool could not allocate");
+                block.write(shell);
+                block
+            }
+        } else {
+            Box::into_raw(Box::new(shell))
+        } as *mut FiberRepr;
+        BODIES.with(|b| b.borrow_mut().insert(ptr as usize, closure as usize));
+        if in_heap {
+            watch_for_collection();
+            COLLECTABLE.with(|c| {
+                let mut c = c.borrow_mut();
+                c.insert(ptr as usize, Reachability::default());
+                DOOMED.with(|d| {
+                    let mut d = d.borrow_mut();
+                    let want = c.len();
+                    if d.capacity() < want {
+                        let extra = want - d.len();
+                        d.reserve(extra);
+                    }
+                });
+            });
+            collector::note_external(FIBER_PRESSURE);
+        }
+        TASK_FIBERS.with(|m| {
+            m.borrow_mut().entry(task).or_default().insert(ptr as usize);
+        });
+        // A host's collector reads the stack from whatever thread it
+        // runs on; this one's own windows are read in `stack_windows`.
+        if zyntax_compiler::host_heap::is_installed() {
+            zyntax_compiler::collector::add_root_range_with(ptr as *const u8, 1, fiber_spans);
+        }
+        ptr
+    }
+
+    /// Drop a fiber and everything kept under its handle, and give its
+    /// storage back: to the pool for a fiber in the collector's heap, to
+    /// the allocator for a `Box`.
+    ///
+    /// # Safety
+    /// `fiber` is a live handle from `make_fiber`, released once.
+    unsafe fn release(&self, fiber: *mut FiberRepr) {
+        let key = fiber as usize;
+        // Clear any per-fiber error latched under this handle before
+        // the address is reclaimed — otherwise a future fiber reusing
+        // the same address could inherit a stale error.
+        ERROR_MAP.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+        ENV_MAP.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+        HELD.with(|m| m.borrow_mut().remove(&key));
+        BODIES.with(|m| m.borrow_mut().remove(&key));
+        if zyntax_compiler::host_heap::is_installed() {
+            zyntax_compiler::collector::remove_root_range(fiber as *const u8);
+        }
+        // Drop the fiber from its owning task's set so a later
+        // `free_task_fibers` can't double-free it.
+        TASK_FIBERS.with(|m| {
+            for set in m.borrow_mut().values_mut() {
+                set.remove(&key);
+            }
+        });
+        let in_heap = COLLECTABLE.with(|c| c.borrow_mut().remove(&key).is_some());
+        // Reclaim ownership handed out by `make_fiber`'s `Box::into_raw`.
+        // Dropping the fiber returns its stack.
+        // SAFETY: the task maps above ensure this handle is reclaimed once.
+        unsafe {
+            drop(Box::from_raw(fiber_ptr(key)));
+            if in_heap {
+                zyntax_free(fiber as *mut u8);
+            } else {
+                drop(Box::from_raw(fiber as *mut Shell));
+            }
+        }
+    }
+}
+
+/// Whether the collector reclaims this fiber once nothing refers to it.
+fn is_collectable(handle: usize) -> bool {
+    COLLECTABLE.with(|c| c.borrow().contains_key(&handle))
+}
+
+/// Register the collector hooks once, when the first collectable fiber is
+/// made.
+fn watch_for_collection() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        collector::add_weak_hooks(WeakHooks {
+            hold: begin_collection,
+            trace: read_reached_fibers,
+            settle: doom_unreached_fibers,
+        });
+        collector::add_after_collection(drop_doomed_fibers);
+    });
+}
+
+/// A collection starts: fibers' stacks are read afresh.
+fn begin_collection(_hold: &mut dyn FnMut(usize)) {
+    GC_EPOCH.with(|e| e.set(e.get() + 1));
+}
+
+/// Marking has drained: what a reached collectable fiber keeps alive is
+/// marked, which may reach more fibers, and this runs again until none
+/// does. A running fiber is reached by definition.
+fn read_reached_fibers(m: &mut dyn Marking) {
+    let epoch = GC_EPOCH.with(Cell::get);
+    RUNNING.with(|r| {
+        for &h in r.borrow().iter() {
+            if COLLECTABLE.with(|c| c.borrow().contains_key(&h)) {
+                m.mark(h);
+            }
+        }
+    });
+    COLLECTABLE.with(|c| {
+        for (&h, slot) in c.borrow_mut().iter_mut() {
+            if slot.doomed || slot.scanned == epoch || !m.is_marked(h) {
+                continue;
+            }
+            slot.scanned = epoch;
+            // SAFETY: a key of COLLECTABLE is a live handle until released.
+            let fiber = unsafe { &*fiber_ptr(h) };
+            if let Some(env) = ENV_MAP.with(|e| e.borrow().get(&h).copied()) {
+                m.mark(env);
+            }
+            if let Some((_, payload)) = ERROR_MAP.with(|e| e.borrow().get(&h).copied()) {
+                m.mark(payload as usize);
+            }
+            if matches!(fiber.state(), krio_fiber::FiberState::Suspended) {
+                let (start, len) = fiber.stack_range();
+                let top = start as usize + len;
+                // A suspended fiber's window starts at its saved stack
+                // pointer, below which the switch spilled the registers.
+                let mut at = fiber.saved_sp() as usize & !7;
+                while at + 8 <= top {
+                    // SAFETY: the window lies inside the fiber's stack.
+                    m.mark(unsafe { *(at as *const usize) });
+                    at += 8;
+                }
+            }
+        }
+    });
+}
+
+/// Tracing has settled: a collectable fiber still unreached is dead. It
+/// is marked once more so its storage outlives the collection, and
+/// queued to be dropped when the collection ends.
+fn doom_unreached_fibers(m: &mut dyn Marking) {
+    COLLECTABLE.with(|c| {
+        for (&h, slot) in c.borrow_mut().iter_mut() {
+            if slot.doomed || m.is_marked(h) {
+                continue;
+            }
+            slot.doomed = true;
+            m.mark(h);
+            DOOMED.with(|d| d.borrow_mut().push(h));
+        }
+    });
+}
+
+/// A collection has ended: drop the fibers it found unreached.
+fn drop_doomed_fibers() {
+    let doomed = DOOMED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    if std::env::var_os("ZYNTAX_TRACE_GC").is_some() {
+        let alive = COLLECTABLE.with(|c| c.borrow().len()) - doomed.len();
+        eprintln!("[gc]   fibers: {} dropped, {alive} kept", doomed.len());
+    }
+    let backend = KrioFiberBackend;
+    for h in doomed {
+        // SAFETY: each is a live collectable handle, queued once.
+        unsafe { backend.release(h as *mut FiberRepr) };
+    }
 }
 
 impl Default for KrioFiberBackend {
@@ -158,8 +423,7 @@ impl Default for KrioFiberBackend {
 ///   panic, not `abort_with`); payload 0; map gets a `(0, 0)`
 ///   placeholder so `f.error()` returns `None` (variant=0 is the
 ///   absent marker).
-fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
-    let key = fiber as *const Fiber as usize;
+fn encode_step(step: FiberStep, key: usize, fiber: &Fiber) -> i64 {
     if let Some(info) = ABORT_PAYLOAD.with(|cell| cell.take()) {
         // Drain whatever yield value the body pushed (the yield
         // we used to suspend the body — not the payload of record).
@@ -193,13 +457,19 @@ fn encode_step(step: FiberStep, fiber: &Fiber) -> i64 {
 /// pointer. Today's contract: the body takes no arguments and returns
 /// nothing — it interacts with the host via `krio_fiber_yield` /
 /// `take_input_u64` while running.
-fn make_body(closure: *mut u8) -> impl FnOnce() {
-    // Cast through usize so the closure captures Send-able state.
-    // The original pointer is just a function address; treating it
-    // as `extern "C" fn()` is sound when the caller honours the
+fn make_body() -> impl FnOnce() {
+    // The closure captures nothing, so its box is zero-sized and owns no
+    // allocation: a suspended fiber that is dropped never returns from
+    // the call that would free one. The body's address is looked up by
+    // the handle of the fiber that is running, which the first resume
+    // pushed. The address is a function pointer; treating it as
+    // `extern "C" fn()` is sound when the caller honours the
     // closure-handle contract.
-    let addr = closure as usize;
-    move || {
+    || {
+        let addr = RUNNING
+            .with(|r| r.borrow().last().copied())
+            .and_then(|h| BODIES.with(|b| b.borrow().get(&h).copied()))
+            .unwrap_or(0);
         if addr == 0 {
             // Empty body — yields nothing, returns immediately. Useful
             // for "smoke test that fiber lifecycle works at all"
@@ -212,7 +482,10 @@ fn make_body(closure: *mut u8) -> impl FnOnce() {
 }
 
 fn hold_for(fiber: usize, address: *const u8) {
-    if address.is_null() {
+    // A collectable fiber's are read by the hook while its handle is
+    // reached; holding one would keep the fiber alive through an
+    // environment that refers back to it.
+    if address.is_null() || is_collectable(fiber) {
         return;
     }
     HELD.with(|m| {
@@ -226,9 +499,9 @@ fn hold_for(fiber: usize, address: *const u8) {
 /// The stack a live fiber may hold pointers on, read from any thread: the
 /// whole of it, since whether it is running is known only on its own.
 fn fiber_spans(start: *const u8, _len: usize, visit: &mut dyn FnMut(usize, usize)) {
-    // SAFETY: registered by `fiber_new` for a live Box<Fiber> and removed
-    // by `fiber_free` before the box goes.
-    let fiber = unsafe { &*(start as *const Fiber) };
+    // SAFETY: registered by `make_fiber` for a live handle and removed
+    // by `fiber_free` before it goes.
+    let fiber = unsafe { &*fiber_ptr(start as usize) };
     if matches!(
         fiber.state(),
         krio_fiber::FiberState::New | krio_fiber::FiberState::Suspended
@@ -240,28 +513,8 @@ fn fiber_spans(start: *const u8, _len: usize, visit: &mut dyn FnMut(usize, usize
 
 impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_new(&self, closure: *mut u8, stack_size: i64) -> *mut FiberRepr {
-        let body = make_body(closure);
-        let fiber = if stack_size > 0 {
-            Fiber::with_stack_size(stack_size as usize, body)
-        } else {
-            Fiber::new(body)
-        };
-        // Hand ownership to the caller via raw pointer. Reclaimed by
-        // an eventual `krio_fiber_free`.
-        let boxed = Box::new(fiber);
-        let ptr = Box::into_raw(boxed) as *mut FiberRepr;
-        // Record the fiber under the task driving right now so a cancel of
-        // that task can free it.
-        let task = FIBER_TASK_ID.with(|c| c.get());
-        TASK_FIBERS.with(|m| {
-            m.borrow_mut().entry(task).or_default().insert(ptr as usize);
-        });
-        // A host's collector reads the stack from whatever thread it
-        // runs on; this one's own windows are read in `stack_windows`.
-        if zyntax_compiler::host_heap::is_installed() {
-            zyntax_compiler::collector::add_root_range_with(ptr as *const u8, 1, fiber_spans);
-        }
-        ptr
+        // SAFETY: forwards the caller's closure contract.
+        unsafe { self.make_fiber(closure, stack_size, false) }
     }
 
     unsafe fn fiber_new_with_env(
@@ -271,7 +524,7 @@ impl FiberCfg for KrioFiberBackend {
         stack_size: i64,
     ) -> *mut FiberRepr {
         // SAFETY: this method forwards the caller's valid closure contract.
-        let ptr = unsafe { self.fiber_new(closure, stack_size) };
+        let ptr = unsafe { self.make_fiber(closure, stack_size, true) };
         ENV_MAP.with(|m| {
             m.borrow_mut().insert(ptr as usize, env as usize);
         });
@@ -292,7 +545,7 @@ impl FiberCfg for KrioFiberBackend {
     unsafe fn fiber_resume(&self, fiber: *mut FiberRepr) -> i64 {
         let handle = fiber as usize;
         // SAFETY: callers pass a live handle returned by `fiber_new`.
-        let fiber = unsafe { &mut *(fiber as *mut Fiber) };
+        let fiber = unsafe { &mut *fiber_ptr(handle) };
         // Honour cooperative cancel at the resume boundary: an
         // auto-generated `fiber def` body has no chance to call
         // `is_cancelled()` itself between yields, so the cancel flag
@@ -317,13 +570,13 @@ impl FiberCfg for KrioFiberBackend {
         RUNNING.with(|r| {
             r.borrow_mut().pop();
         });
-        encode_step(step, fiber)
+        encode_step(step, handle, fiber)
     }
 
     unsafe fn fiber_resume_with(&self, fiber: *mut FiberRepr, value: i64) -> i64 {
         let handle = fiber as usize;
         // SAFETY: callers pass a live handle returned by `fiber_new`.
-        let fiber = unsafe { &mut *(fiber as *mut Fiber) };
+        let fiber = unsafe { &mut *fiber_ptr(handle) };
         if fiber.is_cancelled() {
             return fiber_backend::pack_fiber_step(FIBER_STEP_DONE, 0);
         }
@@ -338,7 +591,7 @@ impl FiberCfg for KrioFiberBackend {
         RUNNING.with(|r| {
             r.borrow_mut().pop();
         });
-        encode_step(step, fiber)
+        encode_step(step, handle, fiber)
     }
 
     fn fiber_yield(&self, value: i64) {
@@ -369,7 +622,7 @@ impl FiberCfg for KrioFiberBackend {
 
     unsafe fn fiber_cancel(&self, fiber: *mut FiberRepr) {
         // SAFETY: callers pass a live handle returned by `fiber_new`.
-        let fiber = unsafe { &*(fiber as *const Fiber) };
+        let fiber = unsafe { &*fiber_ptr(fiber as usize) };
         fiber.cancel();
     }
 
@@ -377,7 +630,7 @@ impl FiberCfg for KrioFiberBackend {
         let running: Vec<usize> = RUNNING.with(|r| r.borrow().clone());
         // SAFETY: every handle in RUNNING and TASK_FIBERS is a live
         // Box<Fiber> until fiber_free removes it.
-        let fiber = |h: usize| unsafe { &*(h as *const Fiber) };
+        let fiber = |h: usize| unsafe { &*fiber_ptr(h) };
         let top_of = |f: &Fiber| {
             let (start, len) = f.stack_range();
             start as usize + len
@@ -402,7 +655,7 @@ impl FiberCfg for KrioFiberBackend {
         TASK_FIBERS.with(|m| {
             for set in m.borrow().values() {
                 for &h in set {
-                    if running.contains(&h) {
+                    if running.contains(&h) || is_collectable(h) {
                         continue;
                     }
                     let f = fiber(h);
@@ -415,15 +668,20 @@ impl FiberCfg for KrioFiberBackend {
     }
 
     fn held_addresses(&self, out: &mut dyn FnMut(usize)) {
+        // A collectable fiber's are read by the hook while it is reached.
         ENV_MAP.with(|m| {
-            for &env in m.borrow().values() {
-                out(env);
+            for (&h, &env) in m.borrow().iter() {
+                if !is_collectable(h) {
+                    out(env);
+                }
             }
         });
         // An error payload waits here until the caller takes it.
         ERROR_MAP.with(|m| {
-            for &(_, payload) in m.borrow().values() {
-                out(payload as usize);
+            for (&h, &(_, payload)) in m.borrow().iter() {
+                if !is_collectable(h) {
+                    out(payload as usize);
+                }
             }
         });
     }
@@ -432,32 +690,8 @@ impl FiberCfg for KrioFiberBackend {
         if fiber.is_null() {
             return;
         }
-        // Clear any per-fiber error latched under this handle before
-        // the address is reclaimed — otherwise a future fiber reusing
-        // the same address could inherit a stale error.
-        let key = fiber as usize;
-        ERROR_MAP.with(|m| {
-            m.borrow_mut().remove(&key);
-        });
-        ENV_MAP.with(|m| {
-            m.borrow_mut().remove(&key);
-        });
-        HELD.with(|m| m.borrow_mut().remove(&key));
-        if zyntax_compiler::host_heap::is_installed() {
-            zyntax_compiler::collector::remove_root_range(fiber as *const u8);
-        }
-        // Drop the fiber from its owning task's set so a later
-        // `free_task_fibers` can't double-free it.
-        TASK_FIBERS.with(|m| {
-            for set in m.borrow_mut().values_mut() {
-                set.remove(&key);
-            }
-        });
-        // Reclaim ownership handed out by `fiber_new`'s `Box::into_raw`.
-        // Dropping the box unmaps the fiber's stack + guard page.
-        // SAFETY: `fiber_new` created this allocation with `Box::into_raw`,
-        // and the task maps above ensure this handle is reclaimed once.
-        drop(unsafe { Box::from_raw(fiber as *mut Fiber) });
+        // SAFETY: the caller passes a live handle, freed once.
+        unsafe { self.release(fiber) };
     }
 
     fn fiber_abort_with(&self, variant: i64, payload: i64) {
@@ -591,6 +825,60 @@ mod tests {
             assert_eq!((t2, p2), (FIBER_STEP_YIELDED, 20));
             assert_eq!((t3, p3), (FIBER_STEP_DONE, 0));
         }
+    }
+
+    /// Make `n` fibers, run each to its first yield, and keep no handle.
+    #[inline(never)]
+    fn abandon(n: usize) {
+        for _ in 0..n {
+            // SAFETY: the body is a plain `extern "C" fn()`.
+            unsafe {
+                let f =
+                    zrtl::krio_fiber_new_with_env(yields_twice as *mut u8, std::ptr::null_mut(), 0);
+                zrtl::krio_fiber_resume(f);
+            }
+        }
+    }
+
+    /// Where the test keeps a handle the collector can find.
+    static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn a_collection_reclaims_abandoned_fibers_and_keeps_referenced_ones() {
+        ensure_installed();
+        collector::enable();
+        // SAFETY: `KEPT` is a static of one word.
+        collector::add_root_range(&KEPT as *const _ as *const u8, 8);
+        let count = || COLLECTABLE.with(|c| c.borrow().len());
+        let before = count();
+
+        // SAFETY: the body is a plain `extern "C" fn()`.
+        let kept = unsafe {
+            let f = zrtl::krio_fiber_new_with_env(yields_twice as *mut u8, std::ptr::null_mut(), 0);
+            zrtl::krio_fiber_resume(f);
+            f
+        };
+        KEPT.store(kept as usize, std::sync::atomic::Ordering::SeqCst);
+        abandon(64);
+        assert_eq!(count() - before, 65, "each fiber is made in the heap");
+
+        collector::collect();
+        // A handle can linger in a stale stack slot and keep a fiber or
+        // two alive; the rest must be gone.
+        let left = count() - before;
+        assert!(
+            (1..=4).contains(&left),
+            "the kept fiber stays and the abandoned ones go, {left} left"
+        );
+
+        // The kept fiber still runs from where it suspended.
+        let kept = KEPT.load(std::sync::atomic::Ordering::SeqCst) as *mut FiberRepr;
+        // SAFETY: a live handle from `krio_fiber_new_with_env`.
+        let (tag, payload) = unsafe { unpack_fiber_step(zrtl::krio_fiber_resume(kept)) };
+        assert_eq!((tag, payload), (FIBER_STEP_YIELDED, 20));
+        // SAFETY: freed once.
+        unsafe { zrtl::krio_fiber_free(kept) };
+        KEPT.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[test]

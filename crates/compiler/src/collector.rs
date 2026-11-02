@@ -418,6 +418,21 @@ pub(crate) fn note_spent(bytes: usize) {
     update(|l| l.spent += bytes);
 }
 
+/// Whether this collector runs and the calling thread is the one it
+/// belongs to.
+pub fn collecting_here() -> bool {
+    is_enabled() && on_owner_thread()
+}
+
+/// Memory held outside the heap on the collector's behalf (a fiber's
+/// stack), spent against the budget so a program that makes much of it
+/// and allocates little in the pool still collects.
+pub fn note_external(bytes: usize) {
+    if is_enabled() && on_owner_thread() {
+        update(|l| l.spent += bytes);
+    }
+}
+
 /// Fresh bytes the heap has grown by.
 pub(crate) fn note_grown(bytes: usize) {
     if !is_enabled() || !on_owner_thread() {
