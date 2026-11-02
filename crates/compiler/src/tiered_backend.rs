@@ -2965,6 +2965,16 @@ impl TieredBackend {
     /// "nothing reachable this way needs a frame" rather than a promise
     /// that the call is safe.
     pub fn stateful_effects_reached_by(&self, function: &str) -> Vec<(u64, String)> {
+        // With no handler that keeps state in any loaded module there is
+        // nothing to find, and the walk below decodes every function it
+        // reaches.
+        if !self
+            .loaded_modules()
+            .iter()
+            .any(|m| m.handlers.values().any(|h| !h.state_fields.is_empty()))
+        {
+            return Vec::new();
+        }
         let Some(module) = self.module_holding(function) else {
             return Vec::new();
         };
@@ -3598,6 +3608,25 @@ impl TieredBackend {
             encoded: body_sources.clone(),
             ..Facts::default()
         });
+        // The first body to be optimised asks for them: built beside the
+        // rest of this module's compile, that asker finds them done, or
+        // waits on the build under way rather than making its own.
+        {
+            let mut modules: Vec<Arc<HirModule>> = Vec::new();
+            for (_, _, module) in by_bead.values() {
+                if !modules.iter().any(|m| Arc::ptr_eq(m, module)) {
+                    modules.push(Arc::clone(module));
+                }
+            }
+            let facts = Arc::clone(&facts);
+            let _ = std::thread::Builder::new()
+                .name("zyntax-facts".into())
+                .spawn(move || {
+                    for module in &modules {
+                        facts.of(module);
+                    }
+                });
+        }
         let optimized: Arc<Scratches> = Arc::new(Scratches::default());
         self.scratches = Arc::clone(&optimized);
         let scratch_shared = Arc::clone(&optimized);

@@ -78,7 +78,19 @@ pub(crate) fn lower_typed_program(
     mut program: TypedProgram,
     inputs: Inputs<'_>,
 ) -> RuntimeResult<Lowered> {
-    lower_typed_program_in_place(&mut program, inputs)
+    let lowered = lower_typed_program_in_place(&mut program, inputs);
+    release_off_thread(program);
+    lowered
+}
+
+/// Drop a lowered program on a thread of its own: its tree is large and
+/// nothing reads it again, so the caller does not wait for it to be freed.
+fn release_off_thread(program: TypedProgram) {
+    let spawned = std::thread::Builder::new()
+        .name("zyntax-release".into())
+        .spawn(move || drop(program));
+    // Without a thread the program was dropped with the closure.
+    let _ = spawned;
 }
 
 /// Retain the resolved declarations when packaging their executable HIR.

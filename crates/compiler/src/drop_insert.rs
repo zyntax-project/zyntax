@@ -458,11 +458,16 @@ impl ModuleFacts {
             })
             .map(|(key, _)| *key)
             .collect();
-        let names = module
-            .functions
-            .iter()
-            .map(|(key, f)| (*key, f.name.resolve_global().unwrap_or_default()))
-            .collect();
+        // Read only by the trace.
+        let names = if trace_enabled() {
+            module
+                .functions
+                .iter()
+                .map(|(key, f)| (*key, f.name.resolve_global().unwrap_or_default()))
+                .collect()
+        } else {
+            HashMap::default()
+        };
         let mut facts = Self {
             automatic_release,
             returns_owned: IdSet::default(),
