@@ -16,7 +16,7 @@ cc = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
-krio-fiber = { git = "https://github.com/darmie/krio.git", package = "krio-fiber", rev = "286f5e0710e20772179fc2ca96f6fda8d13e3a70" }
+krio-fiber = { git = "https://github.com/darmie/krio.git", package = "krio-fiber", rev = "ecf740f8de98965d3c0f238b4d22636318821836" }
 
 [lints]
 workspace = true

@@ -285,6 +285,21 @@ impl<'f> CoroCfg for HirCoroCfg<'f> {
             .collect()
     }
 
+    fn successors(&self, bb: Self::BlockId) -> Vec<Self::BlockId> {
+        let hir = self.block_seq_to_hir[bb.0 as usize];
+        self.function
+            .blocks
+            .get(&hir)
+            .map(|b| {
+                b.terminator
+                    .targets()
+                    .into_iter()
+                    .filter_map(|t| self.hir_to_block_id(t))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // ── Construction ─────────────────────────────────────────────────
 
     fn new_block(&mut self) -> Self::BlockId {
