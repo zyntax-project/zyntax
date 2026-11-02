@@ -30,20 +30,9 @@ use zyntax_compiler::{
 /// Return pages held by glibc after lowering and code generation. Large
 /// programs leave most of their temporary SSA and optimiser allocations free,
 /// but glibc otherwise keeps those arenas mapped for the rest of the process.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn release_unused_compile_pages() {
-    unsafe extern "C" {
-        fn malloc_trim(pad: usize) -> i32;
-    }
-    // SAFETY: `malloc_trim` takes no pointers and only asks glibc to release
-    // wholly unused heap pages. Live allocations keep their backing pages.
-    unsafe {
-        malloc_trim(0);
-    }
+    zyntax_compiler::tiered_backend::release_unused_pages();
 }
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_unused_compile_pages() {}
 
 /// Decode now the deferred library bodies the module's release facts
 /// are computed from: those whose recorded facts do not serve this

@@ -593,12 +593,51 @@ struct Scratches {
     pending: std::sync::atomic::AtomicUsize,
 }
 
-/// Return wholly unused glibc heap pages after a batch of background
-/// optimisations releases its scratch modules.
+/// Free bytes in glibc's arenas below which a trim is not worth its cost:
+/// it visits every arena under its lock and releases page by page, which
+/// stalls the thread that allocates meanwhile, and what it returns is a
+/// few pages of a process this small.
+const TRIM_MIN_FREE: usize = 16 << 20;
+
+/// Return wholly unused glibc heap pages once the arenas hold
+/// [`TRIM_MIN_FREE`] bytes of them, after a burst of compiles or
+/// optimisations has dropped its temporaries.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_unused_scratch_pages() {
+pub fn release_unused_pages() {
+    #[repr(C)]
+    struct Mallinfo2 {
+        arena: usize,
+        ordblks: usize,
+        smblks: usize,
+        hblks: usize,
+        hblkhd: usize,
+        usmblks: usize,
+        fsmblks: usize,
+        uordblks: usize,
+        fordblks: usize,
+        keepcost: usize,
+    }
     unsafe extern "C" {
         fn malloc_trim(pad: usize) -> i32;
+        fn dlsym(
+            handle: *mut std::ffi::c_void,
+            name: *const std::ffi::c_char,
+        ) -> *mut std::ffi::c_void;
+    }
+    // `mallinfo2` came with glibc 2.33; an older one trims as it always did.
+    static INFO: std::sync::OnceLock<Option<unsafe extern "C" fn() -> Mallinfo2>> =
+        std::sync::OnceLock::new();
+    let info = *INFO.get_or_init(|| {
+        // SAFETY: a null handle is RTLD_DEFAULT on Linux; the name is
+        // NUL-terminated; the symbol, when found, has this signature.
+        let found = unsafe { dlsym(std::ptr::null_mut(), c"mallinfo2".as_ptr()) };
+        (!found.is_null()).then(|| unsafe { std::mem::transmute(found) })
+    });
+    if let Some(info) = info {
+        // SAFETY: `mallinfo2` takes no arguments and reads the arenas.
+        if unsafe { info() }.fordblks < TRIM_MIN_FREE {
+            return;
+        }
     }
     // SAFETY: `malloc_trim` takes no pointers and preserves every live
     // allocation; it only releases wholly unused pages from glibc arenas.
@@ -608,7 +647,11 @@ fn release_unused_scratch_pages() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_unused_scratch_pages() {}
+pub fn release_unused_pages() {}
+
+fn release_unused_scratch_pages() {
+    release_unused_pages();
+}
 
 impl Scratches {
     /// Note an optimisation about to use a scratch, until the returned
