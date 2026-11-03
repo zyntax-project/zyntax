@@ -50,6 +50,16 @@ The Lua and Python pages keep one tab for each machine CI has measured. A run me
 - One tab is the latest run on that machine, so run-to-run variation on the same CPU model is not visible in it.
 - The ZynML kernel page (`/benchmark`) has not been split by machine. Its kernels run as separate jobs that can each land on a different CPU, so one result file may mix machines; each partial carries its own `meta.cpu`.
 
+## Diagnosing a machine
+
+The `Diagnose benchmark machines` workflow (`.github/workflows/diagnose-machines.yml`, started by hand) runs `.github/scripts/diag_machine.py` on six runners. Each job reports:
+
+- the topology the kernel shows: thread siblings, caches, hypervisor, instruction-set flags, whether performance counters are usable;
+- how much parallel work the vCPUs do: the slowdown of each of k busy processes started together against one alone (1.0 is a core each), and a pair on thread siblings against a pair on separate cores;
+- for the kernels that vary most, zypy under several settings of the tiered runtime (the default, no wait before the optimizing compile, two compile workers, one vCPU per core) and PyPy, with each run's wall time, CPU time, hypervisor steal time, and when each LLVM compile finished.
+
+Run it several times to sample more of the pool. Results are in each job's summary and in the `diagnose-<n>` artifacts.
+
 ## Getting the data
 
 Each run uploads its result files as artifacts:

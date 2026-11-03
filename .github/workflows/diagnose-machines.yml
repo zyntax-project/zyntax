@@ -1,0 +1,83 @@
+name: Diagnose benchmark machines
+
+# Started by hand. The hosted runner pool mixes CPU models and GitHub
+# documents neither them nor how the vCPUs map to cores, so each job here
+# describes the machine it was given, measures how much parallel work its
+# vCPUs do, and reruns the unstable zypy kernels under several settings of
+# the tiered runtime. The jobs are independent samples of the pool: run it
+# a few times to see more models. Results are in each job's summary and in
+# the diagnose-<n> artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Runs of each kernel and setting
+        default: "6"
+      kernels:
+        description: Kernels, comma separated
+        default: crypto_pyaes,telco,spectral-norm,ai,richards,deltablue
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: diagnose (${{ matrix.n }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: diagnose-machines
+          save-if: ${{ matrix.n == 1 }}
+
+      - name: Install LLVM 21
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21 all
+          echo "LLVM_SYS_211_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Install PyPy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pypy3 linux-tools-common
+          echo "PYPY=$(command -v pypy3)" >> "$GITHUB_ENV"
+
+      - name: Build zypy
+        run: cargo build --release -p zyntax_python --features llvm-backend --bin zypy
+
+      - name: Diagnose this machine
+        env:
+          RUST_MIN_STACK: 134217728
+        run: |
+          mkdir -p diag-out
+          python3 .github/scripts/diag_machine.py \
+            --zypy "$PWD/target/release/zypy" --pypy "$PYPY" \
+            --repeats "${{ inputs.repeats }}" --kernels "${{ inputs.kernels }}" \
+            --out diag-out/diagnose-${{ matrix.n }}.json | tee diag-out/summary.txt
+          {
+            echo '### '"$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
+            echo '```'
+            cat diag-out/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnose-${{ matrix.n }}
+          path: diag-out/
+          retention-days: 30
