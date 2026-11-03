@@ -12,9 +12,8 @@ use std::path::PathBuf;
 use zyntax_embed::{SnapshotBuilder, lower_for_snapshot_releasing};
 use zyntax_typed_ast::{InternedString, Span, TypedProgram};
 
-// What the runtime alone uses of the library (the C API's bridge) is
-// dead here.
-#[allow(dead_code)]
+// Runtime-only declarations and public reexports are unused in the snapshot builder.
+#[allow(dead_code, unused_imports)]
 #[path = "src/library/mod.rs"]
 mod library;
 #[path = "src/policy.rs"]
