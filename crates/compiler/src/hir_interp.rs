@@ -20,8 +20,8 @@
 //!   phi nodes.
 //! * **Constant / type / args / switch-table pools** are owned by the
 //!   `CompiledFunction` and indexed by `u32`. Keeping these out of the
-//!   `Op` enum keeps each opcode small (≤16 bytes) so the bytecode
-//!   stream stays cache-friendly.
+//!   `Op` enum keeps variable-length payloads out of the bytecode
+//!   stream.
 //! * **Tagged values on the bus**. `InterpValue` carries width and
 //!   signedness so we don't lose precision crossing call boundaries,
 //!   load/store layouts, or extern symbol invocations. Integer ops
@@ -865,6 +865,8 @@ pub enum Op {
     },
 }
 
+type CachedSymbol = std::cell::Cell<Option<(u64, SymbolEntry)>>;
+
 /// One compiled function: bytecode stream + side pools.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledFunction {
@@ -888,6 +890,8 @@ pub struct CompiledFunction {
     /// at compile time because symbols are registered at the
     /// interpreter level, not the compiler level.
     pub symbol_pool: Vec<String>,
+    /// Resolved call sites, valid for the interpreter's symbol generation.
+    pub symbol_entries: std::cell::OnceCell<Box<[CachedSymbol]>>,
     /// Per-`Op::Gep` steps, one per index: `(stride, offset)`. At
     /// runtime `Gep` computes `ptr + sum(stride[i] * regs[index[i]] +
     /// offset[i])`; a struct field is a fixed offset with stride 0.
@@ -3108,7 +3112,7 @@ impl Memory {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SymbolEntry {
     pub ptr: *const u8,
     pub param_count: u8,
@@ -3179,6 +3183,7 @@ struct SourceBody {
 
 pub struct HirInterpreter {
     symbols: HashMap<String, SymbolEntry>,
+    symbol_generation: u64,
     /// Looked up before `symbols`, which then holds only what this
     /// interpreter registered or resolved itself.
     shared_symbols: Option<std::sync::Arc<SharedSymbols>>,
@@ -3374,6 +3379,7 @@ impl HirInterpreter {
     pub fn new() -> Self {
         Self {
             symbols: HashMap::new(),
+            symbol_generation: 0,
             shared_symbols: None,
             profile: IdMap::default(),
             memory: Memory::new(),
@@ -3456,6 +3462,7 @@ impl HirInterpreter {
     }
 
     pub fn register_symbol(&mut self, name: impl Into<String>, ptr: *const u8, param_count: u8) {
+        self.invalidate_symbol_entries();
         self.symbols.insert(
             name.into(),
             SymbolEntry {
@@ -3477,6 +3484,7 @@ impl HirInterpreter {
         sig: crate::zrtl::ZrtlSymbolSig,
     ) {
         let param_count = sig.param_count;
+        self.invalidate_symbol_entries();
         self.symbols.insert(
             name.into(),
             SymbolEntry {
@@ -3512,7 +3520,28 @@ impl HirInterpreter {
 
     /// Look symbols up in `shared` ahead of those registered here.
     pub fn share_symbols(&mut self, shared: std::sync::Arc<SharedSymbols>) {
+        if self
+            .shared_symbols
+            .as_ref()
+            .is_some_and(|old| std::sync::Arc::ptr_eq(old, &shared))
+        {
+            return;
+        }
+        self.invalidate_symbol_entries();
         self.shared_symbols = Some(shared);
+    }
+
+    fn invalidate_symbol_entries(&mut self) {
+        self.symbol_generation = self.symbol_generation.wrapping_add(1);
+        if self.symbol_generation == 0 {
+            for cf in self.cache.values() {
+                if let Some(entries) = cf.symbol_entries.get() {
+                    for entry in entries {
+                        entry.set(None);
+                    }
+                }
+            }
+        }
     }
 
     /// The symbol `name`, shared or registered here.
@@ -4496,19 +4525,6 @@ impl HirInterpreter {
             unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
             regs[*reg as usize] = ZyntaxValue::Pointer(p);
         }
-
-        // Pre-resolve `cf.symbol_pool` (Vec<String>) into a parallel
-        // `Vec<Option<SymbolEntry>>` once at the top of dispatch. The
-        // Op::CallSym hot path then indexes this Vec directly instead
-        // of cloning the name, hashing it, and probing
-        // `self.symbols: HashMap<String, _>` per call. Unresolved
-        // entries (rare — registration race or wasm dispatcher path)
-        // fall back to the HashMap at the dispatch site.
-        let resolved_symbols: Vec<Option<SymbolEntry>> = cf
-            .symbol_pool
-            .iter()
-            .map(|name| self.symbol(name))
-            .collect();
 
         let mut pc: usize = 0;
         let code = &cf.code;
@@ -5508,15 +5524,21 @@ impl HirInterpreter {
                     let result_val = if let Some(v) = dispatched {
                         v
                     } else {
-                        // Fast path: pre-resolved entry from `run()`
-                        // entry. Slow path: re-probe `self.symbols`
-                        // for symbols registered after this `run` started
-                        // (rare).
-                        let entry = match resolved_symbols.get(sym_idx).and_then(|e| *e) {
-                            Some(e) => e,
-                            None => {
+                        // Resolve only executed sites. A registration change
+                        // invalidates entries without rebuilding bytecode.
+                        let entries = cf.symbol_entries.get_or_init(|| {
+                            (0..cf.symbol_pool.len())
+                                .map(|_| Default::default())
+                                .collect()
+                        });
+                        let cached = &entries[sym_idx];
+                        let entry = match cached.get() {
+                            Some((generation, entry)) if generation == self.symbol_generation => {
+                                entry
+                            }
+                            _ => {
                                 let name = &cf.symbol_pool[sym_idx];
-                                match self.symbol(name) {
+                                let entry = match self.symbol(name) {
                                     Some(e) => e,
                                     None => {
                                         let ptr = crate::late_symbols::lookup(name)
@@ -5532,7 +5554,9 @@ impl HirInterpreter {
                                         self.symbols.insert(name.clone(), e);
                                         e
                                     }
-                                }
+                                };
+                                cached.set(Some((self.symbol_generation, entry)));
+                                entry
                             }
                         };
                         if self.thunk_source.is_some() {
