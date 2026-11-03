@@ -3101,11 +3101,21 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             chars.decl(list(Vec::new(), strs.clone())),
             n.decl(call("zb_str_len", vec![text_in.e()], i64())),
             pos.decl(int(0)),
+            // The next `\n` and `\r` at or after `pos`, or -1 for none;
+            // each is searched for again only once `pos` has passed it.
+            nl.decl(find("\n", int(0))),
+            cr.decl(find("\r", int(0))),
             while_(
                 lt(pos.e(), n.e()),
                 vec![
-                    nl.decl(find("\n", pos.e())),
-                    cr.decl(find("\r", pos.e())),
+                    when(
+                        and(ge(nl.e(), int(0)), lt(nl.e(), pos.e())),
+                        vec![nl.set(find("\n", pos.e()))],
+                    ),
+                    when(
+                        and(ge(cr.e(), int(0)), lt(cr.e(), pos.e())),
+                        vec![cr.set(find("\r", pos.e()))],
+                    ),
                     cut.decl(nl.e()),
                     when(
                         and(
