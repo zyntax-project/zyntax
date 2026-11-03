@@ -42,6 +42,8 @@ use std::collections::HashMap;
 
 mod frame_storage;
 use frame_storage::{FramePool, FrameStorage};
+mod numeric;
+use numeric::ireg_i64;
 
 /// A map keyed by `HirId`, hashed cheaply: these are probed on every
 /// call the interpreter makes.
@@ -5763,13 +5765,6 @@ fn ibin(
     let li = ireg_i64(l)?;
     let ri = ireg_i64(r)?;
     Ok(ZyntaxValue::Int(f(li, ri)))
-}
-
-fn ireg_i64(v: &ZyntaxValue) -> Result<i64, InterpError> {
-    value_to_i64(v).ok_or_else(|| InterpError::TypeMismatch {
-        expected: "integer".to_string(),
-        got: format!("{:?}", v),
-    })
 }
 
 fn freg_f64(v: &ZyntaxValue) -> Result<f64, InterpError> {

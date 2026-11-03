@@ -21,7 +21,7 @@ pub(super) struct FrameStorage {
 impl FrameStorage {
     pub fn prepare(&mut self, registers: usize, unions: usize, sites: usize) {
         debug_assert!(self.regs.is_empty() && self.call_args.is_empty());
-        self.regs.resize(registers, ZyntaxValue::Undef);
+        self.regs.resize_with(registers, || ZyntaxValue::Undef);
         self.union_blocks.resize(unions, std::ptr::null_mut());
         self.visits.resize(sites, 0);
         self.slots.resize(sites, std::ptr::null());
