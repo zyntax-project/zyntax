@@ -2416,6 +2416,22 @@ impl<'a> Round<'a> {
         }
     }
 
+    /// A call that may reach any of `targets` yields the join of what
+    /// they return, as the call's type says. A result the join does not
+    /// keep as it was is lost to the types, and escapes: the tables it
+    /// names reach code that does not know their shape.
+    fn join_target_returns(&mut self, targets: &[Ty]) {
+        let mut out = Returns::Unknown;
+        for target in targets {
+            if let Ty::Func(f) = target
+                && let Some(sig) = self.known.sig(*f)
+            {
+                let returns = sig.returns.clone();
+                out = self.join_returns(out, returns);
+            }
+        }
+    }
+
     fn escape_returns(&mut self, r: &Returns) {
         if let Returns::Fixed(types) = r {
             for t in types {
@@ -3132,6 +3148,7 @@ impl<'a> Round<'a> {
                     }
                     match (targets, field) {
                         (Some(targets), _) => {
+                            self.join_target_returns(&targets);
                             for target in targets {
                                 if let Ty::Func(f) = target {
                                     self.record_call(f, None, args);
@@ -3153,6 +3170,7 @@ impl<'a> Round<'a> {
                     match targets {
                         Some(targets) => {
                             self.args(m.args(), true);
+                            self.join_target_returns(&targets);
                             for target in targets {
                                 if let Ty::Func(f) = target {
                                     self.record_call(f, Some(receiver), m.args());
