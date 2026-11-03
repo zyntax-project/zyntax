@@ -18,6 +18,9 @@ This directory contains architectural and educational documentation for the Zynt
 - **[PATTERN_MATCHING.md](PATTERN_MATCHING.md)** - Pattern matching implementation and architecture
 - **[REFERENCE_TYPES.md](REFERENCE_TYPES.md)** - Value-type vs `@reference` class semantics, the bi-modal memory model, and lowering
 
+### Benchmarks
+- **[ci-benchmark-machines.md](ci-benchmark-machines.md)** - The GitHub-hosted runners the benchmark pages run on, what GitHub documents about them, what each result records, and how to read the per-machine tabs
+
 ### Language Integrations
 Located in [language-integrations/](language-integrations/) directory:
 - **Zyn Parser** - Zig language parser implementation

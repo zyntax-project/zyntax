@@ -480,6 +480,13 @@
       if (m.cpu) chips.push(`<span>cpu <code>${escape(m.cpu)}</code></span>`);
       if (m.cpu_cores) chips.push(`<span>cores <code>${escape(m.cpu_cores)}</code></span>`);
       if (m.ram_gb) chips.push(`<span>ram <code>${escape(m.ram_gb)} GiB</code></span>`);
+      const hw = m.hardware || {};
+      const hosted = [hw.vendor, hw.product].filter(Boolean).join(' · ');
+      if (hosted) chips.push(`<span>host <code>${escape(hosted)}</code></span>`);
+      if (hw.hypervisor) chips.push(`<span>hypervisor <code>${escape(hw.hypervisor)}</code></span>`);
+      if (hw.threads_per_core) chips.push(`<span>threads per core <code>${escape(hw.threads_per_core)}</code></span>`);
+      if (hw.l2) chips.push(`<span>L2 <code>${escape(hw.l2)}</code></span>`);
+      if (hw.l3) chips.push(`<span>L3 <code>${escape(hw.l3)}</code></span>`);
       for (const [name, version] of Object.entries(m.versions || {})) {
         chips.push(`<span>${escape(name)} <code>${escape(version)}</code></span>`);
       }

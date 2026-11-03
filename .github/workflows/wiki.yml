@@ -300,10 +300,30 @@ jobs:
             cpu="$(sysctl -n machdep.cpu.brand_string)"
             ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))
             os=macos
+            l2=$(( $(sysctl -n hw.l2cachesize 2>/dev/null || echo 0) / 1048576 ))
+            hw=$(jq -n --arg product "$(sysctl -n hw.model)" --arg l2 "${l2} MiB" \
+              '{vendor: "Apple", product: $product, hypervisor: "", threads_per_core: 1,
+                cores_per_socket: null, l2: $l2, l3: ""}')
           else
             cpu="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
             ram=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1048576 ))
             os=linux
+            # GitHub documents neither the CPU model nor the topology of a
+            # runner, and the pool mixes clouds, so each result records
+            # what the machine reports: who hosts it, how its vCPUs map to
+            # cores, and its caches.
+            lscpu_field() { LC_ALL=C lscpu | awk -F: -v k="$1" '$1==k {sub(/^ +/,"",$2); print $2; exit}'; }
+            hw=$(jq -n \
+              --arg vendor "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)" \
+              --arg product "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" \
+              --arg hypervisor "$(lscpu_field 'Hypervisor vendor')" \
+              --arg threads "$(lscpu_field 'Thread(s) per core')" \
+              --arg cores "$(lscpu_field 'Core(s) per socket')" \
+              --arg l2 "$(lscpu_field 'L2 cache')" \
+              --arg l3 "$(lscpu_field 'L3 cache')" \
+              '{vendor: $vendor, product: $product, hypervisor: $hypervisor,
+                threads_per_core: ($threads | tonumber? // null),
+                cores_per_socket: ($cores | tonumber? // null), l2: $l2, l3: $l3}')
           fi
           case "${{ matrix.suite }}" in
             zylua)
@@ -324,9 +344,11 @@ jobs:
              --argjson cores "$(getconf _NPROCESSORS_ONLN)" \
              --argjson ram "$ram" \
              --arg host "$(hostname)" \
+             --argjson hardware "$hw" \
              --argjson versions "$versions" \
              '. + {meta: {date: $date, commit: $commit, os: $os, arch: $arch, cpu: $cpu,
-                          cpu_cores: $cores, ram_gb: $ram, host: $host, versions: $versions}}' \
+                          cpu_cores: $cores, ram_gb: $ram, host: $host, hardware: $hardware,
+                          versions: $versions}}' \
              bench-out/raw.json > bench-out/${{ matrix.suite }}.json
 
       - name: Upload ${{ matrix.suite }} results
