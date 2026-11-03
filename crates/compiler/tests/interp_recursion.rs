@@ -10,6 +10,11 @@ use zyntax_compiler::hir_interp::HirInterpreter;
 use zyntax_compiler::value::ZyntaxValue;
 use zyntax_typed_ast::InternedString;
 
+#[cfg(feature = "allocation-audit")]
+#[global_allocator]
+static ALLOCATOR: zyntax_compiler::allocation_audit::CountingAllocator =
+    zyntax_compiler::allocation_audit::CountingAllocator;
+
 fn value(func: &mut HirFunction, kind: HirValueKind) -> HirId {
     let id = HirId::new();
     func.values.insert(
@@ -114,4 +119,64 @@ fn recursive_calls_share_one_compiled_function() {
         .call(&module, "fib", vec![ZyntaxValue::Int(1)])
         .expect("run");
     assert_eq!(got, ZyntaxValue::Int(1));
+}
+
+#[test]
+#[ignore = "isolated release interpreter frame and argument measurement"]
+fn measure_recursive_frames() {
+    let repeats: usize = std::env::var("INTERP_BENCH_REPEATS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000);
+    for roots in [false, true] {
+        if roots {
+            zyntax_compiler::collector::enable();
+        }
+        let module = fib_module();
+        let mut interp = HirInterpreter::new();
+        let mut run = || {
+            let got = interp
+                .call(
+                    &module,
+                    "fib",
+                    vec![ZyntaxValue::Int(std::hint::black_box(12))],
+                )
+                .unwrap();
+            assert_eq!(std::hint::black_box(got), ZyntaxValue::Int(144));
+        };
+        run();
+        #[cfg(feature = "allocation-audit")]
+        let before = zyntax_compiler::allocation_audit::for_phase(
+            zyntax_compiler::allocation_audit::Phase::Execute,
+        );
+        #[cfg(feature = "allocation-audit")]
+        let scope = zyntax_compiler::allocation_audit::Scope::enter(
+            zyntax_compiler::allocation_audit::Phase::Execute,
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            run();
+        }
+        let elapsed = start.elapsed();
+        #[cfg(feature = "allocation-audit")]
+        {
+            drop(scope);
+            let after = zyntax_compiler::allocation_audit::for_phase(
+                zyntax_compiler::allocation_audit::Phase::Execute,
+            );
+            println!(
+                "roots={roots} allocations={} reallocations={} requested_bytes={} repeats={repeats}",
+                after.allocations - before.allocations,
+                after.reallocations - before.reallocations,
+                after.requested_bytes - before.requested_bytes,
+            );
+        }
+        println!(
+            "roots={roots} recursive_frames=465 repeats={repeats} ns_per_frame={:.2}",
+            elapsed.as_nanos() as f64 / (repeats * 465) as f64
+        );
+        if roots {
+            zyntax_compiler::collector::disable();
+        }
+    }
 }

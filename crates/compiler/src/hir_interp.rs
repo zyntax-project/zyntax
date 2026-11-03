@@ -40,6 +40,9 @@
 
 use std::collections::HashMap;
 
+mod frame_storage;
+use frame_storage::{FramePool, FrameStorage};
+
 /// A map keyed by `HirId`, hashed cheaply: these are probed on every
 /// call the interpreter makes.
 type IdMap<V> = HashMap<HirId, V, std::hash::BuildHasherDefault<fnv::FnvHasher>>;
@@ -3254,6 +3257,7 @@ pub struct HirInterpreter {
     /// Where each running interpreted frame's storage ends above: the
     /// stack pointer of `run` as it calls `run_frame`, innermost last.
     frame_tops: Vec<usize>,
+    frames: FramePool,
     /// Thunks already made, by shape.
     thunks: HashMap<NativeSig, usize>,
     /// The call shape of each function called so far, with the thunk
@@ -3401,6 +3405,7 @@ impl HirInterpreter {
             run_top: 0,
             frame_extent: 0,
             frame_tops: Vec::new(),
+            frames: FramePool::default(),
             thunks: HashMap::new(),
             shapes: IdMap::default(),
             address_taken: HashMap::new(),
@@ -4053,7 +4058,7 @@ impl HirInterpreter {
         &mut self,
         module: &HirModule,
         name: &str,
-        args: Vec<ZyntaxValue>,
+        mut args: Vec<ZyntaxValue>,
     ) -> Result<ZyntaxValue, InterpError> {
         let func = module
             .functions
@@ -4069,7 +4074,7 @@ impl HirInterpreter {
             }
             _ => core::ptr::null_mut(),
         };
-        self.call_by_id(module, func_id, args, dest)
+        self.call_by_id(module, func_id, &mut args, dest)
     }
 
     /// Run `func_id` for a native caller: `words` holds one word per
@@ -4092,13 +4097,13 @@ impl HirInterpreter {
         if sig.destination || sig.params.len() != words.len() {
             return Ok(false);
         }
-        let args = sig
+        let mut args = sig
             .params
             .iter()
             .zip(words)
             .map(|(ty, w)| value_from_word(ty, *w))
             .collect();
-        let result = self.call_by_id(module, func_id, args, core::ptr::null_mut())?;
+        let result = self.call_by_id(module, func_id, &mut args, core::ptr::null_mut())?;
         if !matches!(sig.ret, HirType::Void) {
             // SAFETY: the caller gives room for one word.
             unsafe { (out as *mut u64).write_unaligned(word_of(&result)) };
@@ -4113,7 +4118,7 @@ impl HirInterpreter {
         &mut self,
         module: &HirModule,
         func_id: HirId,
-        args: Vec<ZyntaxValue>,
+        args: &mut Vec<ZyntaxValue>,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
         if let Some(func) = module.functions.get(&func_id) {
@@ -4142,12 +4147,12 @@ impl HirInterpreter {
                 };
                 let result = if self.thunk_source.is_some() {
                     let sig = NativeSig::of_function(func, true);
-                    self.call_native(entry.ptr, &sig, &args, dest)
+                    self.call_native(entry.ptr, &sig, args, dest)
                 } else {
                     match entry.sig {
-                        Some(sig) => call_extern_symbol_typed(entry.ptr, &args, &sig),
+                        Some(sig) => call_extern_symbol_typed(entry.ptr, args, &sig),
                         None => {
-                            let raw = call_extern_symbol(entry.ptr, &args);
+                            let raw = call_extern_symbol(entry.ptr, args);
                             let ret_ty = func.signature.returns.first().unwrap_or(&HirType::Void);
                             Ok(value_from_i64_as(ret_ty, raw))
                         }
@@ -4182,7 +4187,7 @@ impl HirInterpreter {
         // because wasm32 doesn't have addressable function ptrs.
         if let Some(handle) = self.wasm_jit_handles.get(&func_id).copied() {
             if let Some(cb) = self.wasm_dispatch_hook.as_mut() {
-                return cb(handle, &args);
+                return cb(handle, args);
             }
             // Dispatch hook was uninstalled after compile fired —
             // stale handle, drop it and fall back to BC.
@@ -4198,7 +4203,7 @@ impl HirInterpreter {
             None => self.first_tick(func_id),
         };
         if let Some(entry) = native {
-            return self.call_function_natively(module, func_id, entry, &args, dest);
+            return self.call_function_natively(module, func_id, entry, args, dest);
         }
 
         // Wasm-JIT hot detection. Once `call_count` crosses the
@@ -4327,12 +4332,12 @@ impl HirInterpreter {
         &mut self,
         module: &HirModule,
         func_id: HirId,
-        args: Vec<ZyntaxValue>,
+        args: &mut Vec<ZyntaxValue>,
         dest: *mut u8,
         why: String,
     ) -> Result<ZyntaxValue, InterpError> {
         match self.native_entry(func_id) {
-            Some(entry) => self.call_function_natively(module, func_id, entry, &args, dest),
+            Some(entry) => self.call_function_natively(module, func_id, entry, args, dest),
             None => Err(InterpError::UnsupportedInstruction(why)),
         }
     }
@@ -4344,7 +4349,7 @@ impl HirInterpreter {
         &mut self,
         module: &HirModule,
         cf: &CompiledFunction,
-        args: Vec<ZyntaxValue>,
+        args: &mut Vec<ZyntaxValue>,
         func_id: HirId,
         dest: *mut u8,
     ) -> Result<ZyntaxValue, InterpError> {
@@ -4360,7 +4365,10 @@ impl HirInterpreter {
             self.run_top = crate::collector::stack_mark();
         }
         self.frame_tops.push(stack_pointer());
-        let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch);
+        let mut storage = self.frames.take();
+        let result = self.run_frame(module, cf, args, func_id, dest, &mut scratch, &mut storage);
+        // run_frame has removed its precise roots before any storage is recycled.
+        self.frames.recycle(storage);
         self.frame_tops.pop();
         if let Err(e) = &result
             && trace_enabled()
@@ -4471,10 +4479,11 @@ impl HirInterpreter {
         &mut self,
         module: &HirModule,
         cf: &CompiledFunction,
-        args: Vec<ZyntaxValue>,
+        args: &mut Vec<ZyntaxValue>,
         func_id: HirId,
         dest: *mut u8,
         scratch: &mut Scratch,
+        storage: &mut FrameStorage,
     ) -> Result<ZyntaxValue, InterpError> {
         if crate::collector::clears_dead_frames() {
             crate::collector::note_frame_depth();
@@ -4484,15 +4493,26 @@ impl HirInterpreter {
                 self.frame_extent = self.frame_extent.max(taken);
             }
         }
-        let mut regs: Vec<ZyntaxValue> = vec![ZyntaxValue::Undef; cf.n_regs as usize];
+        storage.prepare(
+            cf.n_regs as usize,
+            cf.union_slots as usize,
+            cf.osr_sites.len(),
+        );
+        let FrameStorage {
+            regs,
+            union_blocks,
+            visits,
+            slots,
+            deferred,
+            wanted,
+            call_args,
+        } = storage;
         // The registers hold pointers the collector cannot see on any
         // stack; they are a root for as long as the frame runs here.
-        let mut roots = FrameRoots::new(&regs, cf);
-        // The storage each slotted `MakeUnion` rewrites, taken at its first run.
-        let mut union_blocks = vec![std::ptr::null_mut::<u8>(); cf.union_slots as usize];
+        let mut roots = FrameRoots::new(regs, cf);
 
         // Bind params into regs[0..n_params].
-        for (i, a) in args.into_iter().enumerate() {
+        for (i, a) in args.drain(..).enumerate() {
             if i < cf.n_params as usize {
                 regs[i] = a;
             }
@@ -4503,15 +4523,10 @@ impl HirInterpreter {
         } else {
             self.bead_source.as_ref().and_then(|f| f(func_id))
         };
-        let mut visits: Vec<u32> = vec![0; cf.osr_sites.len()];
-        let mut slots: Vec<*const std::sync::atomic::AtomicU64> =
-            vec![core::ptr::null(); cf.osr_sites.len()];
         // Header visits at every site; for a site that left its ask to
         // its enclosing loop's, that count and the enclosing site's visits
         // when it did; and the sites an inner loop left its ask to.
         let mut header_visits: u32 = 0;
-        let mut deferred: Vec<Option<(u32, u32)>> = vec![None; cf.osr_sites.len()];
-        let mut wanted: Vec<bool> = vec![false; cf.osr_sites.len()];
         // Whether this frame has asked for resume points; it is counted
         // as waiting until `run` sees it leave.
         let mut waits = false;
@@ -5438,7 +5453,7 @@ impl HirInterpreter {
                         return self.transfer(
                             helper as *const u8,
                             osr_site,
-                            &regs,
+                            regs,
                             &mut roots,
                             scratch,
                             dest,
@@ -5460,8 +5475,7 @@ impl HirInterpreter {
                     args,
                 } => {
                     let arg_regs = &cf.args_pool[*args as usize];
-                    let mut arg_vals: Vec<ZyntaxValue> =
-                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    call_args.extend(arg_regs.iter().map(|r| regs[*r as usize].clone()));
                     let callee = module.functions.get(fn_id);
                     // An extern declared over dynamic boxes receives its
                     // arguments boxed, as compiled call sites box them.
@@ -5473,7 +5487,7 @@ impl HirInterpreter {
                                 .iter()
                                 .map(|r| cf.reg_types[*r as usize].clone())
                                 .collect();
-                            boxes = self.box_dynamic_args(&sig, &arg_types, &mut arg_vals);
+                            boxes = self.box_dynamic_args(&sig, &arg_types, call_args);
                         }
                     }
                     // Storage for a struct the callee hands back through
@@ -5485,12 +5499,13 @@ impl HirInterpreter {
                         _ => core::ptr::null_mut(),
                     };
                     let away = self.away();
-                    let ret = self.call_by_id(module, *fn_id, arg_vals, callee_dest);
+                    let ret = self.call_by_id(module, *fn_id, call_args, callee_dest);
                     drop(away);
                     crate::collector::clear_dead_frames();
                     for b in boxes {
                         self.memory.free(b);
                     }
+                    call_args.clear();
                     let ret = ret?;
                     if *has_dst {
                         regs[*dst as usize] = ret;
@@ -5505,8 +5520,7 @@ impl HirInterpreter {
                     sig,
                 } => {
                     let arg_regs = &cf.args_pool[*args as usize];
-                    let mut arg_vals: Vec<ZyntaxValue> =
-                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    call_args.extend(arg_regs.iter().map(|r| regs[*r as usize].clone()));
                     let sym_idx = *sym as usize;
                     let shape = &cf.sig_pool[*sig as usize];
 
@@ -5516,7 +5530,7 @@ impl HirInterpreter {
                     // falls through to the native transmute below.
                     let dispatched = if let Some(disp) = self.symbol_call_dispatcher.as_mut() {
                         let name = &cf.symbol_pool[sym_idx];
-                        disp(name, arg_vals.clone())?
+                        disp(name, call_args.clone())?
                     } else {
                         None
                     };
@@ -5548,7 +5562,7 @@ impl HirInterpreter {
                                             })?;
                                         let e = SymbolEntry {
                                             ptr,
-                                            param_count: arg_vals.len().min(255) as u8,
+                                            param_count: call_args.len().min(255) as u8,
                                             sig: None,
                                         };
                                         self.symbols.insert(name.clone(), e);
@@ -5565,7 +5579,7 @@ impl HirInterpreter {
                             // sites box them.
                             let boxes = match entry.sig {
                                 Some(zsig) => {
-                                    self.box_dynamic_args(&zsig, &shape.params, &mut arg_vals)
+                                    self.box_dynamic_args(&zsig, &shape.params, call_args)
                                 }
                                 None => Vec::new(),
                             };
@@ -5574,7 +5588,7 @@ impl HirInterpreter {
                                 entry.ptr,
                                 shape,
                                 thunk,
-                                &arg_vals,
+                                call_args,
                                 core::ptr::null_mut(),
                             );
                             for b in boxes {
@@ -5584,12 +5598,13 @@ impl HirInterpreter {
                         } else if let Some(zsig) = entry.sig {
                             // Typed marshalling path: the ZRTL signature
                             // supplies the register classes.
-                            call_extern_symbol_typed(entry.ptr, &arg_vals, &zsig)?
+                            call_extern_symbol_typed(entry.ptr, call_args, &zsig)?
                         } else {
-                            let raw = call_extern_symbol(entry.ptr, &arg_vals);
+                            let raw = call_extern_symbol(entry.ptr, call_args);
                             value_from_i64_as(&shape.ret, raw)
                         }
                     };
+                    call_args.clear();
                     crate::collector::clear_dead_frames();
 
                     if *has_dst {
@@ -5671,8 +5686,7 @@ impl HirInterpreter {
                         }
                     };
                     let arg_regs = &cf.args_pool[*args as usize];
-                    let arg_vals: Vec<ZyntaxValue> =
-                        arg_regs.iter().map(|r| regs[*r as usize].clone()).collect();
+                    call_args.extend(arg_regs.iter().map(|r| regs[*r as usize].clone()));
                     let shape = &cf.sig_pool[*sig as usize];
                     // A pointer to one of the module's functions is called
                     // by id, which runs it here while it has no code. A
@@ -5691,11 +5705,11 @@ impl HirInterpreter {
                     // otherwise the handle is native code.
                     let result = if let Some(target) = own {
                         let away = self.away();
-                        let ret = self.call_by_id(module, target, arg_vals, core::ptr::null_mut());
+                        let ret = self.call_by_id(module, target, call_args, core::ptr::null_mut());
                         drop(away);
                         ret?
                     } else if let Some(dispatcher) = self.indirect_call_dispatcher.as_mut() {
-                        dispatcher(handle, arg_vals)?
+                        dispatcher(handle, std::mem::take(call_args))?
                     } else {
                         if self.thunk_source.is_none() {
                             return Err(InterpError::UnsupportedInstruction(
@@ -5712,10 +5726,11 @@ impl HirInterpreter {
                             handle as usize as *const u8,
                             shape,
                             thunk,
-                            &arg_vals,
+                            call_args,
                             core::ptr::null_mut(),
                         )?
                     };
+                    call_args.clear();
                     crate::collector::clear_dead_frames();
                     if *has_dst {
                         let v = match result {
