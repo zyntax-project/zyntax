@@ -487,7 +487,21 @@ jobs:
           ls -la site/benchmark/ site/zylua/ site/zypy/
 
       - name: Configure Pages
+        id: pages
         uses: actions/configure-pages@v5
+
+      # A run measures only the machines the host handed it, so each
+      # language page keeps every machine's last result under
+      # machines/, carried forward from the site published before.
+      - name: Keep every machine's results
+        run: |
+          for suite in zylua zypy; do
+            python3 .github/scripts/carry_machines.py \
+              --base-url "${{ steps.pages.outputs.base_url }}" \
+              --suite "$suite" --site "site/$suite" \
+              $(ls bench-out/$suite/results.json bench-out/$suite/results-macos.json 2>/dev/null)
+          done
+          ls site/zylua/machines site/zypy/machines
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
