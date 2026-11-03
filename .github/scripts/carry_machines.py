@@ -7,9 +7,13 @@ last result of each machine from earlier deploys and adds this run's:
 
     carry_machines.py --base-url URL --suite zylua --site site/zylua RESULTS.json...
 
-Under `<site>/machines/` it writes one `<key>.json` per machine and an
-`index.json` that lists them, newest measurement last in each entry's
-`date`. Earlier machines are read from `<base-url>/<suite>/machines/`,
+Under `<site>/machines/` it writes one `<key>.json` per machine, an
+`index.json` that lists them, and a `history.json` with one line of
+summary for every run each machine has ever had (how many rows, the
+geometric-mean speedup over the baseline interpreter, and the rows won,
+by benchmark time and by full process time), which the pages average
+into an all-time figure per machine. Earlier machines are read from
+`<base-url>/<suite>/machines/`,
 where the previous deploy put them. A missing index (the first deploy)
 starts the history; any other failure to read it stops the script, so a
 network error cannot publish a page that has lost every machine but this
@@ -17,6 +21,7 @@ run's.
 """
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -61,6 +66,50 @@ def machine_key(meta):
     return re.sub(r"[^a-z0-9]+", "-", key).strip("-")
 
 
+# What a suite's result file holds: the rows, our interpreter, the baseline
+# it is judged against, and the warm and cold time of each.
+SUITES = {
+    "zylua": {"rows": "results", "ours": "zylua", "base": "luajit", "warm": "elapsed", "cold": "wall"},
+    "zypy": {"rows": "kernels", "ours": "zypy", "base": "pypy", "warm": "mean_ms", "cold": "wall_ms"},
+}
+
+
+def time_of(suite, row, field):
+    """Milliseconds for one interpreter's row, or None when it has none."""
+    if not row or row.get("error") or (suite == "zypy" and row.get("status") != "ok"):
+        return None
+    value = row.get(field)
+    if isinstance(value, dict):
+        value = value.get("median")
+        value = value * 1000 if isinstance(value, (int, float)) else None
+    return value if isinstance(value, (int, float)) and value > 0 else None
+
+
+def summarize(suite, data, key, meta):
+    """One run's standing against the baseline: the geometric mean of
+    baseline time over our time across the rows both finished (above 1
+    is faster), and how many rows we won, by warm and by cold time."""
+    spec = SUITES[suite]
+    out = {
+        "key": key,
+        "os": meta.get("os"),
+        "cpu": meta.get("cpu"),
+        "date": meta.get("date"),
+        "commit": meta.get("commit"),
+    }
+    for name in ("warm", "cold"):
+        ratios = []
+        for row in (data.get(spec["rows"]) or {}).values():
+            ours = time_of(suite, row.get(spec["ours"]), spec[name])
+            base = time_of(suite, row.get(spec["base"]), spec[name])
+            if ours and base:
+                ratios.append(base / ours)
+        out[name] = math.exp(sum(map(math.log, ratios)) / len(ratios)) if ratios else None
+        out["wins_" + name] = sum(1 for r in ratios if r >= 1)
+        out["n"] = len(ratios)
+    return out
+
+
 def entry_for(key, meta):
     return {
         "key": key,
@@ -80,6 +129,7 @@ def main():
     ap.add_argument("--base-url", required=True, help="where the site is published")
     ap.add_argument("--suite", required=True, help="the language page's directory")
     ap.add_argument("--site", required=True, help="the suite's directory in the site being built")
+    ap.add_argument("--seed", help="history to start from when none is published yet")
     ap.add_argument("results", nargs="*", help="this run's result files")
     args = ap.parse_args()
 
@@ -103,19 +153,34 @@ def main():
             kept[entry["key"]] = entry
         print(f"{args.suite}: kept {len(kept)} earlier machines")
 
+    body = fetch(f"{base}/history.json")
+    if body is None and args.seed:
+        with open(args.seed, "rb") as f:
+            body = f.read()
+        print(f"{args.suite}: no history published; starting from {args.seed}")
+    runs = json.loads(body).get("runs", []) if body else []
+    seen = {(r["key"], r["date"]) for r in runs}
+
     for path in args.results:
         with open(path, "rb") as f:
             raw = f.read()
-        meta = json.loads(raw).get("meta") or {}
+        data = json.loads(raw)
+        meta = data.get("meta") or {}
         key = machine_key(meta)
         with open(os.path.join(out, f"{key}.json"), "wb") as f:
             f.write(raw)
         kept[key] = entry_for(key, meta)
+        if (key, meta.get("date")) not in seen:
+            runs.append(summarize(args.suite, data, key, meta))
         print(f"{args.suite}: {key} from {meta.get('commit')} on {meta.get('date')}")
 
     machines = sorted(kept.values(), key=lambda e: (e["os"] != "linux", e["os"] or "", e["cpu"] or ""))
     with open(os.path.join(out, "index.json"), "w") as f:
         json.dump({"machines": machines}, f, indent=1)
+        f.write("\n")
+    runs.sort(key=lambda r: (r["date"] or "", r["key"]))
+    with open(os.path.join(out, "history.json"), "w") as f:
+        json.dump({"runs": runs}, f, separators=(",", ":"))
         f.write("\n")
 
 

@@ -521,6 +521,7 @@ jobs:
             python3 .github/scripts/carry_machines.py \
               --base-url "${{ steps.pages.outputs.base_url }}" \
               --suite "$suite" --site "site/$suite" \
+              --seed ".github/scripts/history-seed/$suite.json" \
               $(ls bench-out/$suite/results.json bench-out/$suite/results-macos.json 2>/dev/null)
           done
           ls site/zylua/machines site/zypy/machines

@@ -224,6 +224,11 @@
       white-space: nowrap;
       font-variant-numeric: tabular-nums;
     }
+    .machines-title { font-size: 1.15rem; margin: 2.4rem 0 0.4rem; color: var(--text-primary); }
+    table.narrow { min-width: 0; }
+    table.narrow td.ratio { text-align: right; }
+    table.narrow thead th:last-child { text-align: right; }
+    table.narrow tr.all td { border-bottom: 1px dashed var(--rule); font-weight: 700; }
     td.ratio.faster { color: var(--text-primary); font-weight: 700; }
     td.ratio.slower { color: var(--text-secondary); }
     /* A phone keeps the ratio in view: the third interpreter, the
@@ -346,6 +351,9 @@
     <div class="table-card" id="table">
       <p class="loading">Loading benchmark results…</p>
     </div>
+    <h2 class="machines-title" id="machines-title" hidden>Every machine, last five runs</h2>
+    <p class="summary" id="machines-note" hidden></p>
+    <div class="table-card" id="machines" hidden></div>
   </main>
 
   <section class="container">
@@ -437,7 +445,65 @@
       return { text: `${(1 / r).toFixed(2)}× slower`, cls: 'slower' };
     }
 
+    // What CI has recorded of every run on every machine, and the
+    // machines' descriptions, both read once from machines/.
+    let HISTORY = null;
+    let ENTRIES = {};
+
+    // A vendor string in capitals is set in the case the others use.
+    const cleanCpu = (cpu) => {
+      const t = String(cpu).replace(/\(R\)/g, '').replace(/\b\d+-Core\b|\bProcessor\b/gi, '').replace(/\s+/g, ' ').trim();
+      if (t !== t.toUpperCase()) return t;
+      return t.toLowerCase().replace(/\b[a-z]+\b/g, (w) => (w === 'amd' || w === 'epyc' ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1))).replace(/\b\w*\d\w*\b/g, (w) => w.toUpperCase());
+    };
+
+    function speedText(x) {
+      return x >= 1 ? { text: `${x.toFixed(2)}× faster`, cls: 'faster' }
+                    : { text: `${(1 / x).toFixed(2)}× slower`, cls: 'slower' };
+    }
+
+    // Runs of a machine that count: the code changes between runs, so an
+    // old one no longer describes it.
+    const RECENT = 5;
+
+    // One row per machine: the geometric mean, over its last RECENT runs,
+    // of how much faster ours is than the baseline across the benchmarks.
+    function renderMachines(metric) {
+      const title = document.getElementById('machines-title');
+      const note = document.getElementById('machines-note');
+      const card = document.getElementById('machines');
+      const field = metric === 'wall' || metric === 'wall_ms' ? 'cold' : 'warm';
+      const every = ((HISTORY && HISTORY.runs) || []).filter((r) => r[field] > 0)
+        .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+      if (!every.length) { title.hidden = note.hidden = card.hidden = true; return; }
+      const geo = (xs) => Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length);
+      const by = {};
+      const named = {};
+      for (const r of every) { (by[r.key] ||= []).push(r[field]); named[r.key] = r; }
+      for (const key of Object.keys(by)) by[key] = by[key].slice(-RECENT);
+      const counted = Object.values(by).flat();
+      const base = COLUMNS.find((c) => c.key === BASELINE).label;
+      const rows = Object.entries(by).map(([key, xs]) => ({ key, n: xs.length, x: geo(xs) }))
+        .sort((a, b) => b.x - a.x);
+      const line = (name, small, x, cls) => {
+        const t = speedText(x);
+        return `<tr${cls}><td class="name">${escape(name)}<small>${escape(small)}</small></td>` +
+          `<td class="ratio ${t.cls}">${t.text}</td></tr>`;
+      };
+      const all = line('All machines', `${counted.length} runs, each counted once`, geo(counted), ' class="all"');
+      const body = rows.map((r) => {
+        const e = ENTRIES[r.key] || named[r.key] || {};
+        return line(e.cpu ? cleanCpu(e.cpu) : r.key, `${e.os || ''}${e.os ? ' · ' : ''}${r.n} run${r.n === 1 ? '' : 's'}`, r.x, '');
+      }).join('');
+      title.hidden = note.hidden = card.hidden = false;
+      note.textContent = `Average of ${OURS} against ${base} over all the benchmarks, then over the last ${RECENT} runs of the machine` +
+        ` (geometric means, ${field === 'cold' ? 'full process time' : 'benchmark time'}). Older runs are left out because the code has changed since.`;
+      card.innerHTML = `<table class="narrow"><thead><tr><th>Machine</th><th>${escape(OURS)} vs ${escape(base)}</th></tr></thead>` +
+        `<tbody>${all}${body}</tbody></table>`;
+    }
+
     function render(data, metric) {
+      renderMachines(metric);
       const results = data.kernels || {};
       const known = Object.keys(BENCHES).filter((b) => results[b]);
       const extra = Object.keys(results).filter((b) => !BENCHES[b]);
@@ -517,6 +583,8 @@
       // not hide the others. The two files beside the page are the
       // latest run's, kept for a deploy that has no index yet.
       const index = await load('machines/index.json');
+      HISTORY = await load('machines/history.json');
+      ENTRIES = Object.fromEntries(((index && index.machines) || []).map((e) => [e.key, e]));
       const files = index && index.machines && index.machines.length
         ? index.machines.map((e) => 'machines/' + e.file)
         : ['results.json', 'results-macos.json'];
@@ -536,7 +604,7 @@
 
       const label = (d) => {
         const m = d.data.meta || {};
-        if (m.cpu) return m.cpu.replace(/\(R\)/g, '').replace(/\b\d+-Core\b|\bProcessor\b/gi, '').replace(/\s+/g, ' ').trim();
+        if (m.cpu) return cleanCpu(m.cpu);
         if (m.arch && m.os) return `${m.arch} · ${m.os}`;
         return d.file;
       };
