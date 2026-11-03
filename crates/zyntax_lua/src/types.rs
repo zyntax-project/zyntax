@@ -176,6 +176,14 @@ pub struct Sig {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ShapeId(pub u32);
 
+/// The receiver at a tracked metatable write.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MetaReceiver {
+    Built,
+    Local(VarId),
+    Other,
+}
+
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct ShapeInfo {
     /// The fields in slot order: the constructor's keys, then those
@@ -192,6 +200,8 @@ pub struct ShapeInfo {
     /// The shapes of the metatables `setmetatable` gives tables of
     /// this shape.
     pub classes: BTreeSet<ShapeId>,
+    /// Receiver provenance of every tracked metatable write.
+    pub meta_receivers: BTreeSet<MetaReceiver>,
     /// Whether a table of this shape may get a metatable the types do
     /// not follow.
     pub unknown_meta: bool,
@@ -3023,7 +3033,16 @@ impl<'a> Round<'a> {
                 if let Ty::Shape(k) = receiver {
                     let kept = args.get(1).is_some_and(|m| self.typer().non_nil(m));
                     let built = args.first().and_then(|a| constructor_in(a));
+                    let receiver = match args.first() {
+                        _ if built.is_some() => MetaReceiver::Built,
+                        Some(Expression::Var(Var::Name(t))) => match self.scopes.binding(t) {
+                            Some(Binding::Local(v)) => MetaReceiver::Local(*v),
+                            _ => MetaReceiver::Other,
+                        },
+                        _ => MetaReceiver::Other,
+                    };
                     let info = &mut self.out.shapes[k.0 as usize];
+                    info.meta_receivers.insert(receiver);
                     match built {
                         Some(t) if kept => {
                             info.born_meta.insert(constructor_site(t));

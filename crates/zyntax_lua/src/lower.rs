@@ -38,6 +38,8 @@ use crate::types::{self, Hop, Inferred, Returns, ShapeId, Ty, Typer, ident};
 use crate::{ENTRY, Error, Library, Result, intern, prim};
 use zyntax_typed_ast::TypeId;
 
+mod exact;
+
 type Node = TypedNode<TypedExpression>;
 type St = TypedNode<TypedStatement>;
 
@@ -156,6 +158,10 @@ struct Module<'a> {
     module_vars: RefCell<Vec<(InternedString, Ty)>>,
     /// What each function's lowering found about its raising.
     facts: RefCell<HashMap<FuncId, RaiseFact>>,
+    /// Constructor facts proved with the field presence at their declaration.
+    fresh_classes: RefCell<HashMap<FuncId, ShapeId>>,
+    /// Locals initialized by distinct fresh calls, for metatable-write isolation.
+    fresh_locals: RefCell<HashSet<VarId>>,
     /// How each shape's tables are laid out, by shape; none for a shape
     /// whose tables are plain.
     layouts: Vec<Option<ShapeLayout>>,
@@ -784,6 +790,7 @@ struct Lowerer<'m, 'a> {
     /// to this point a store of a value that is never nil put them
     /// there, and they are never taken away.
     present: BTreeSet<(ShapeId, String)>,
+    exact_classes: HashMap<VarId, ShapeId>,
 }
 
 /// A local in scope, as `debug.getlocal` numbers them: a variable, or
@@ -1672,6 +1679,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             tail_span: None,
             end_span: None,
             present: BTreeSet::new(),
+            exact_classes: HashMap::new(),
         }
     }
 
@@ -6773,7 +6781,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let mut multi = None;
             let head = self.read_global(&name, span)?;
             let desc = self.describe_chain(prefix, &suffixes[..1]);
-            return self.suffixes_from(head, desc, suffixes, 1, &mut multi, span);
+            return self.suffixes_from(head, desc, suffixes, 1, &mut multi, None, span);
         }
         // A direct call to a known function or a builtin, possibly
         // followed by more suffixes on its result: only the last call
@@ -6792,7 +6800,8 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 _ => return unsupported("this prefix", span),
             },
         };
-        self.suffixes_from(current, desc, suffixes, first, &mut multi, span)
+        let exact = (first == 0).then(|| self.exact_prefix(prefix)).flatten();
+        self.suffixes_from(current, desc, suffixes, first, &mut multi, exact, span)
     }
 
     /// The first suffix of a chain applied as a direct call to a known
@@ -6892,6 +6901,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
 
     /// The suffixes from `first` on, applied to `current`, which `desc`
     /// names.
+    #[allow(clippy::too_many_arguments)]
     fn suffixes_from(
         &mut self,
         mut current: Val,
@@ -6899,10 +6909,12 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         suffixes: &[&Suffix],
         first: usize,
         multi: &mut Option<Multi>,
+        mut exact: Option<ShapeId>,
         span: Span,
     ) -> Result<Multi> {
         let mut called = false;
         for (i, s) in suffixes.iter().enumerate().skip(first) {
+            let receiver_class = exact.take();
             // The call a field call's lookup made already.
             if std::mem::take(&mut called) {
                 if i + 1 == suffixes.len() {
@@ -6917,8 +6929,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             let last = i + 1 == suffixes.len();
             if let Suffix::Index(ast::Index::Dot { name, .. }) = s
                 && let Some(next) = suffixes.get(i + 1)
-                && let Some(m) =
-                    self.field_call(&current, &ident(name), next, desc.clone(), span)?
+                && let Some(m) = self.field_call(
+                    &current,
+                    &ident(name),
+                    next,
+                    desc.clone(),
+                    receiver_class,
+                    span,
+                )?
             {
                 *multi = Some(m);
                 called = true;
@@ -6955,7 +6973,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 }
                 Suffix::Call(ast::Call::MethodCall(mc)) => {
                     let tail = self.tail_span.take_if(|_| !last);
-                    let m = self.method_call(current.clone(), mc, desc, span);
+                    let m = self.method_call(current.clone(), mc, desc, receiver_class, span);
                     self.tail_span = self.tail_span.or(tail);
                     let m = m?;
                     if last {
@@ -6980,6 +6998,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         name: &str,
         call_suffix: &Suffix,
         desc: Desc,
+        exact: Option<ShapeId>,
         span: Span,
     ) -> Result<Option<Multi>> {
         let (Ty::Shape(k), Suffix::Call(ast::Call::AnonymousCall(args))) = (obj.ty, call_suffix)
@@ -7018,6 +7037,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             k,
             name,
             CallKind::Field,
+            exact,
             returns,
             args,
             desc,
@@ -7523,6 +7543,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         obj: Val,
         mc: &ast::MethodCall,
         desc: Desc,
+        exact: Option<ShapeId>,
         span: Span,
     ) -> Result<Multi> {
         let name = ident(mc.name());
@@ -7561,6 +7582,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     k,
                     &name,
                     CallKind::Method,
+                    exact,
                     returns.clone(),
                     mc.args(),
                     desc.clone(),
@@ -7683,13 +7705,27 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// here, decided without asking the tables on the way: none when
     /// one of them may lack what the lookup goes through.
     fn folded_lookups(&self, k: ShapeId, name: &str) -> Option<Folded> {
+        self.folded_class_lookups(k, name, None)
+    }
+
+    fn folded_class_lookups(
+        &self,
+        k: ShapeId,
+        name: &str,
+        exact: Option<ShapeId>,
+    ) -> Option<Folded> {
         let inferred = self.m.inferred;
         let lookups = inferred.lookups(k, name)?;
         if let Some(own) = lookups.first().filter(|l| l.hops.is_empty()) {
             return (own.sure || self.known_present(k, name)).then_some(Folded::Own(own.ty));
         }
         let mut out = Vec::new();
-        for class in &inferred.shape(k).classes {
+        for class in inferred
+            .shape(k)
+            .classes
+            .iter()
+            .filter(|c| exact.is_none_or(|e| e == **c))
+        {
             // The first lookup through this metatable that may fail
             // leaves the rest to run time.
             let first = lookups
@@ -7789,6 +7825,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         k: ShapeId,
         name: &str,
         kind: CallKind,
+        exact: Option<ShapeId>,
         returns: Returns,
         args: &ast::FunctionArgs,
         desc: Desc,
@@ -7796,7 +7833,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     ) -> Result<Option<Multi>> {
         // A lookup decided here needs no finder.
         let folded = self
-            .folded_lookups(k, name)
+            .folded_class_lookups(k, name, exact)
             .and_then(|folded| self.fold_plan(k, name, folded));
         let (ends, dispatch) = match folded {
             Some((ends, plan)) => (ends, Dispatch::Folded(plan)),
@@ -9636,6 +9673,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let span = span_of(s);
         match s {
             Stmt::LocalAssignment(l) => {
+                self.note_fresh_locals(l);
                 let names: Vec<&TokenReference> = l.names().iter().collect();
                 let exprs: Vec<&Expression> = l.expressions().iter().collect();
                 let (pre, vals) = if exprs.is_empty() {
@@ -11451,6 +11489,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         _is_method: bool,
     ) -> Result<()> {
         let span = span_of(body);
+        let fresh = self.fresh_body(body);
         let info = self.scopes().func(id).clone();
         let sig = self.m.sig(id);
         let has_env = self.m.takes_env(id);
@@ -11551,6 +11590,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
         );
         self.m.functions.borrow_mut().push(function);
+        if let Some(class) = fresh {
+            self.m.fresh_classes.borrow_mut().insert(id, class);
+        }
         // The record code, whether or not anything takes the function
         // as a value: unreached, it costs nothing.
         self.record_code(id, &sig, span);
@@ -12060,6 +12102,8 @@ fn chunk_module(
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
+        fresh_classes: RefCell::new(HashMap::new()),
+        fresh_locals: RefCell::new(HashSet::new()),
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
@@ -12118,6 +12162,8 @@ fn chunk_module(
     module.functions.borrow_mut().clear();
     module.module_vars.borrow_mut().clear();
     module.facts.borrow_mut().clear();
+    module.fresh_classes.borrow_mut().clear();
+    module.fresh_locals.borrow_mut().clear();
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
@@ -13114,6 +13160,8 @@ pub(crate) fn program(
         functions: RefCell::new(Vec::new()),
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
+        fresh_classes: RefCell::new(HashMap::new()),
+        fresh_locals: RefCell::new(HashSet::new()),
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
@@ -13237,6 +13285,8 @@ pub(crate) fn program(
     module.functions.borrow_mut().clear();
     module.module_vars.borrow_mut().clear();
     module.facts.borrow_mut().clear();
+    module.fresh_classes.borrow_mut().clear();
+    module.fresh_locals.borrow_mut().clear();
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
