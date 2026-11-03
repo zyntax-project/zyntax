@@ -4,6 +4,67 @@ use super::*;
 use full_moon::visitors::{Visit, Visitor};
 
 impl Lowerer<'_, '_> {
+    /// Every normal return preserves the unchanged first argument.
+    pub(super) fn returns_first_param(&self, id: FuncId, body: &ast::FunctionBody) -> bool {
+        let Some(&param) = self.scopes().func(id).params.first() else {
+            return false;
+        };
+        if !self.fixed_receiver(param) || types::falls_through(body.block()) {
+            return false;
+        }
+        struct Returns<'a> {
+            scopes: &'a Scopes,
+            param: VarId,
+            seen: bool,
+            same: bool,
+        }
+        impl Visitor for Returns<'_> {
+            fn visit_return(&mut self, r: &ast::Return) {
+                self.seen = true;
+                self.same &= r
+                    .returns()
+                    .iter()
+                    .next()
+                    .is_some_and(|e| local(self.scopes, unparen(e)) == Some(self.param));
+            }
+        }
+        let mut returns = Returns {
+            scopes: self.scopes(),
+            param,
+            seen: false,
+            same: true,
+        };
+        body.block().visit(&mut returns);
+        returns.seen && returns.same
+    }
+
+    /// A colon call supplies the receiver as its first argument. Its
+    /// identity survives only when every resolved target returns it.
+    pub(super) fn returned_receiver(
+        &self,
+        ty: Ty,
+        name: &str,
+        exact: Option<ShapeId>,
+    ) -> Option<ShapeId> {
+        let class = exact?;
+        let Ty::Shape(k) = ty else {
+            return None;
+        };
+        let folded = self.folded_class_lookups(k, name, exact)?;
+        let returns_first = self.m.returns_first.borrow();
+        let same = |ty| matches!(ty, Ty::Func(f) if returns_first.contains(&f));
+        let preserved = match folded {
+            Folded::Own(ty) => same(ty),
+            Folded::Classes(classes) => {
+                !classes.is_empty()
+                    && classes
+                        .iter()
+                        .all(|(_, end)| end.is_some_and(|(_, ty)| same(ty)))
+            }
+        };
+        preserved.then_some(class)
+    }
+
     fn fixed_receiver(&self, v: VarId) -> bool {
         let info = self.scopes().var(v);
         !info.assigned

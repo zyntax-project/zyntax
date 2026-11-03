@@ -162,6 +162,8 @@ struct Module<'a> {
     fresh_classes: RefCell<HashMap<FuncId, ShapeId>>,
     /// Locals initialized by distinct fresh calls, for metatable-write isolation.
     fresh_locals: RefCell<HashSet<VarId>>,
+    /// Functions whose first result is their unchanged first argument.
+    returns_first: RefCell<HashSet<FuncId>>,
     /// How each shape's tables are laid out, by shape; none for a shape
     /// whose tables are plain.
     layouts: Vec<Option<ShapeLayout>>,
@@ -6972,6 +6974,11 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     desc = None;
                 }
                 Suffix::Call(ast::Call::MethodCall(mc)) => {
+                    let returned = (!last)
+                        .then(|| {
+                            self.returned_receiver(current.ty, &ident(mc.name()), receiver_class)
+                        })
+                        .flatten();
                     let tail = self.tail_span.take_if(|_| !last);
                     let m = self.method_call(current.clone(), mc, desc, receiver_class, span);
                     self.tail_span = self.tail_span.or(tail);
@@ -6980,6 +6987,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         return Ok(m);
                     }
                     *multi = Some(m);
+                    exact = returned;
                     desc = None;
                 }
                 _ => return unsupported("this suffix", span),
@@ -7870,24 +7878,27 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let bool_t = prim(PrimitiveType::Bool);
         let mut head = Vec::new();
         let obj = self.hold(obj, &mut head);
-        // Indexing a nil receiver raises before anything is looked up.
-        let mut raise = vec![
-            self.set_line(span),
-            expr_stmt(call("zl_index_nil", vec![], Type::Any, span)),
-        ];
-        raise.extend(self.leave_described(span, &Described::operand(desc)));
-        head.push(if_(
-            binary(
-                BinaryOp::Eq,
-                obj.node.clone(),
-                null(table_t.clone(), span),
-                bool_t.clone(),
+        // Exact receivers originate in successful fresh constructor calls.
+        if exact.is_none() {
+            // Indexing a nil receiver raises before anything is looked up.
+            let mut raise = vec![
+                self.set_line(span),
+                expr_stmt(call("zl_index_nil", vec![], Type::Any, span)),
+            ];
+            raise.extend(self.leave_described(span, &Described::operand(desc)));
+            head.push(if_(
+                binary(
+                    BinaryOp::Eq,
+                    obj.node.clone(),
+                    null(table_t.clone(), span),
+                    bool_t.clone(),
+                    span,
+                ),
+                raise,
+                None,
                 span,
-            ),
-            raise,
-            None,
-            span,
-        ));
+            ));
+        }
         // Every table takes the one end: nothing is picked at run time.
         let sure = matches!(&dispatch, Dispatch::Folded(plan) if plan.arms.is_none());
         let (w, place) = match dispatch {
@@ -11490,6 +11501,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     ) -> Result<()> {
         let span = span_of(body);
         let fresh = self.fresh_body(body);
+        let returns_first = self.returns_first_param(id, body);
         let info = self.scopes().func(id).clone();
         let sig = self.m.sig(id);
         let has_env = self.m.takes_env(id);
@@ -11592,6 +11604,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.m.functions.borrow_mut().push(function);
         if let Some(class) = fresh {
             self.m.fresh_classes.borrow_mut().insert(id, class);
+        }
+        if returns_first {
+            self.m.returns_first.borrow_mut().insert(id);
         }
         // The record code, whether or not anything takes the function
         // as a value: unreached, it costs nothing.
@@ -12104,6 +12119,7 @@ fn chunk_module(
         facts: RefCell::new(HashMap::new()),
         fresh_classes: RefCell::new(HashMap::new()),
         fresh_locals: RefCell::new(HashSet::new()),
+        returns_first: RefCell::new(HashSet::new()),
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
@@ -12164,6 +12180,7 @@ fn chunk_module(
     module.facts.borrow_mut().clear();
     module.fresh_classes.borrow_mut().clear();
     module.fresh_locals.borrow_mut().clear();
+    module.returns_first.borrow_mut().clear();
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
@@ -13162,6 +13179,7 @@ pub(crate) fn program(
         facts: RefCell::new(HashMap::new()),
         fresh_classes: RefCell::new(HashMap::new()),
         fresh_locals: RefCell::new(HashSet::new()),
+        returns_first: RefCell::new(HashSet::new()),
         finders: RefCell::new(HashMap::new()),
         reentrant_helpers: RefCell::new(HashSet::new()),
         sorts: RefCell::new(HashMap::new()),
@@ -13287,6 +13305,7 @@ pub(crate) fn program(
     module.facts.borrow_mut().clear();
     module.fresh_classes.borrow_mut().clear();
     module.fresh_locals.borrow_mut().clear();
+    module.returns_first.borrow_mut().clear();
     module.finders.borrow_mut().clear();
     module.reentrant_helpers.borrow_mut().clear();
     module.sorts.borrow_mut().clear();
