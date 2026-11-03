@@ -57,6 +57,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     .map(|s| (layout, s))
             });
             if let Some((layout, slot)) = found {
+                let present = self
+                    .value_fields(&obj)
+                    .is_some_and(|fields| fields.contains(&name));
                 let bool_t = prim(PrimitiveType::Bool);
                 let mut pre = Vec::new();
                 let t = self.hold(obj, &mut pre);
@@ -104,8 +107,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 // A field every table of the shape is born with, that
                 // nothing stores nil in and no store under a computed
                 // key reaches, keeps its bit set.
-                let settled = info.always_present(&name) && !info.dynamic_keys;
+                let settled = present || (info.always_present(&name) && !info.dynamic_keys);
                 let then = self.slot_store(&t.node, layout, slot, stored.clone(), settled, span);
+                if present {
+                    pre.extend(then);
+                    return stmt(
+                        TypedStatement::Block(TypedBlock {
+                            statements: pre,
+                            span,
+                        }),
+                        span,
+                    );
+                }
                 let els = if no_newindex {
                     // Only a nil receiver gets here: it raises, on the
                     // cold path a read takes.

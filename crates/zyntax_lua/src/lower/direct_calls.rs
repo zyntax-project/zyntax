@@ -99,6 +99,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         desc: &Desc,
         span: Span,
     ) -> Multi {
+        self.note_argument_fields(f, vals.first());
         let info = self.scopes().func(f);
         let sig = self.m.sig(f);
         let n = info.params.len();

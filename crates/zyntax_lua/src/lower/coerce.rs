@@ -445,6 +445,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let span = v.node.span;
         let name = self.temp();
         let ty = self.ir(v.ty);
+        if let Some(fields) = self.value_fields(&v) {
+            self.field_values.insert(name, fields);
+        }
         pre.push(let_(name, ty.clone(), v.node, span));
         Val {
             node: var(name, ty, span),
@@ -461,6 +464,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let span = v.node.span;
         let name = self.temp();
         let ty = self.ir(v.ty);
+        if let Some(fields) = self.value_fields(&v) {
+            self.field_values.insert(name, fields);
+        }
         pre.push(let_(name, ty.clone(), v.node, span));
         Val {
             node: var(name, ty, span),

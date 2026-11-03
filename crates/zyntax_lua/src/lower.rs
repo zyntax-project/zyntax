@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use full_moon::ast::{self, BinOp, Block, Expression, Prefix, Stmt, Suffix, UnOp, Var};
 use full_moon::tokenizer::TokenReference;
@@ -54,6 +55,7 @@ mod dynamic_for;
 mod errors;
 mod exact;
 mod expressions;
+mod field_presence;
 mod field_read;
 mod field_write;
 mod finders;
@@ -212,6 +214,10 @@ struct Module<'a> {
     facts: RefCell<HashMap<FuncId, RaiseFact>>,
     /// Constructor facts proved with the field presence at their declaration.
     fresh_classes: RefCell<HashMap<FuncId, ShapeId>>,
+    /// Fields present on every successful fresh constructor result.
+    fresh_fields: RefCell<HashMap<FuncId, Rc<BTreeSet<String>>>>,
+    /// First-argument fields intersected across all direct calls in pass one.
+    argument_fields: RefCell<HashMap<FuncId, Option<Rc<BTreeSet<String>>>>>,
     /// Locals initialized by distinct fresh calls, for metatable-write isolation.
     fresh_locals: RefCell<HashSet<VarId>>,
     /// Functions whose first result is their unchanged first argument.
@@ -494,6 +500,8 @@ struct Lowerer<'m, 'a> {
     /// there, and they are never taken away.
     present: BTreeSet<(ShapeId, String)>,
     exact_classes: HashMap<VarId, ShapeId>,
+    /// Immutable receiver values with fields that cannot subsequently disappear.
+    field_values: HashMap<InternedString, Rc<BTreeSet<String>>>,
 }
 
 /// A local in scope, as `debug.getlocal` numbers them: a variable, or

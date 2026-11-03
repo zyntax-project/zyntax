@@ -39,6 +39,22 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let Ty::Shape(k) = obj.ty else {
             return self.index_read(obj, key, desc, span);
         };
+        if self
+            .value_fields(&obj)
+            .is_some_and(|fields| fields.contains(name))
+            && let Some((layout, slot)) = self.slot_of(k, name)
+            && let Some((_, ty)) = self.m.inferred.shape(k).field(name)
+        {
+            let mut pre = Vec::new();
+            let obj = self.hold(obj, &mut pre);
+            let ty = ty.settled();
+            let value = self.slot_read_as(&obj.node, layout, &slot, ty, span);
+            let value = self.coerce(value, ty);
+            return Val {
+                node: block_value(pre, value, span),
+                ty,
+            };
+        }
         let ty = self.typer().field_ty(Ty::Shape(k), name).settled();
         let table_t = self.ir(Ty::Table);
         let bool_t = prim(PrimitiveType::Bool);

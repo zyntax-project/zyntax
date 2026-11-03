@@ -92,6 +92,8 @@ pub(crate) fn program(
         module_vars: RefCell::new(Vec::new()),
         facts: RefCell::new(HashMap::new()),
         fresh_classes: RefCell::new(HashMap::new()),
+        fresh_fields: RefCell::new(HashMap::new()),
+        argument_fields: RefCell::new(HashMap::new()),
         fresh_locals: RefCell::new(HashSet::new()),
         returns_first: RefCell::new(HashSet::new()),
         finders: RefCell::new(HashMap::new()),
@@ -218,6 +220,7 @@ pub(crate) fn program(
     module.module_vars.borrow_mut().clear();
     module.facts.borrow_mut().clear();
     module.fresh_classes.borrow_mut().clear();
+    module.fresh_fields.borrow_mut().clear();
     module.fresh_locals.borrow_mut().clear();
     module.returns_first.borrow_mut().clear();
     module.finders.borrow_mut().clear();

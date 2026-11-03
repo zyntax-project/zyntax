@@ -14,6 +14,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     ) -> Result<()> {
         let span = span_of(body);
         let fresh = self.fresh_body(body);
+        let fields = fresh.and_then(|_| self.constructor_fields(body));
         let returns_first = self.returns_first_param(id, body);
         let info = self.scopes().func(id).clone();
         let sig = self.m.sig(id);
@@ -54,6 +55,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 statements.push(let_(symbol, child.ir(local_ty), value, span));
             }
         }
+        child.seed_argument_fields(id);
         if info.is_vararg {
             let name = intern("$varargs");
             params.push(parameter(name, self.m.anys(), span));
@@ -117,6 +119,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         self.m.functions.borrow_mut().push(function);
         if let Some(class) = fresh {
             self.m.fresh_classes.borrow_mut().insert(id, class);
+        }
+        if let Some(fields) = fields {
+            self.m.fresh_fields.borrow_mut().insert(id, fields);
         }
         if returns_first {
             self.m.returns_first.borrow_mut().insert(id);

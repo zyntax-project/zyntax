@@ -76,6 +76,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         self.tbc.push((self.depth, Closable::Var(id)));
                     }
                 }
+                self.note_initialized_locals(l);
             }
             Stmt::Assignment(a) => {
                 let targets: Vec<&Var> = a.variables().iter().collect();

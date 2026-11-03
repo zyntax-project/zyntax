@@ -65,7 +65,7 @@ impl Lowerer<'_, '_> {
         preserved.then_some(class)
     }
 
-    fn fixed_receiver(&self, v: VarId) -> bool {
+    pub(super) fn fixed_receiver(&self, v: VarId) -> bool {
         let info = self.scopes().var(v);
         !info.assigned
             && !info.captured
@@ -74,9 +74,8 @@ impl Lowerer<'_, '_> {
             && !self.scopes().debug_rebinds
     }
 
-    /// The class returned by this call, when its callee is present here
-    /// and every successful call to it creates a fresh table.
-    fn fresh_call(&self, e: &Expression) -> Option<ShapeId> {
+    /// Resolve a constructor candidate only when its callee is present here.
+    pub(super) fn fresh_callee(&self, e: &Expression) -> Option<FuncId> {
         let Expression::FunctionCall(c) = unparen(e) else {
             return None;
         };
@@ -97,6 +96,11 @@ impl Lowerer<'_, '_> {
             }
             _ => return None,
         };
+        Some(f)
+    }
+
+    fn fresh_call(&self, e: &Expression) -> Option<ShapeId> {
+        let f = self.fresh_callee(e)?;
         self.m.fresh_classes.borrow().get(&f).copied()
     }
 

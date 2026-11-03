@@ -384,6 +384,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             end_span: None,
             present: BTreeSet::new(),
             exact_classes: HashMap::new(),
+            field_values: HashMap::new(),
         }
     }
 
