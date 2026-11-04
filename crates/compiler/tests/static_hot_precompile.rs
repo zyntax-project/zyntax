@@ -1,13 +1,16 @@
-//! A function whose loop runs a constant number of times, enough to be
-//! hot, is compiled before its first call: the interpreter's first call
-//! gets native code from the tick, waiting for a compile still under
-//! way rather than running the body itself.
+//! Static hotness can schedule background compilation, but an entry
+//! without native code starts on the lowered interpreter body.
 
 #![cfg(feature = "cranelift-backend")]
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use zyntax_compiler::hir_interp::HirInterpreter;
+use zyntax_compiler::opt_audit;
+use zyntax_compiler::value::ZyntaxValue;
 
 use zyntax_compiler::hir::{
     HirConstant, HirFunction, HirId, HirInstruction, HirModule, HirType, HirValue, HirValueKind,
@@ -37,7 +40,7 @@ fn constant_bound_loop() -> (HirFunction, HirId) {
             *right = bound;
         }
     }
-    function.attributes.optimized = true;
+    function.attributes.optimized = false;
     function.attributes.deferred = true;
     (function, header)
 }
@@ -60,61 +63,54 @@ fn run(entry: *const u8) -> i32 {
     f(0)
 }
 
-/// One test: the lazy compiler a backend installs is the process's, so
-/// two backends made side by side would answer each other's calls.
+/// One test: the lazy compiler and warm-up configuration are process-wide.
 #[test]
-fn a_hot_static_loop_is_compiled_before_its_first_call() {
-    let sum: i32 = (0..TRIPS).sum();
-
-    // Asked at once, so the compile the worker was given at load is
-    // still under way, or not yet begun: the tick waits for it or makes
-    // it, and the call never starts interpreted.
+fn a_hot_static_loop_starts_on_lowered_ir_without_waiting_for_compilation() {
+    // No worker can win the race and publish native code before the first call.
+    // SAFETY: the only test in this binary; set before starting any workers.
+    unsafe { std::env::set_var("ZYNTAX_DISABLE_WARM_UP", "1") };
+    opt_audit::enable();
     let (function, _) = constant_bound_loop();
-    let (backend, id) = backend_for(function, TieredConfig::default());
+    assert!(zyntax_compiler::loop_facts::hot_static_loop(&function));
+    let config = TieredConfig {
+        enable_osr: false,
+        ..TieredConfig::default()
+    };
+    let (backend, id) = backend_for(function, config);
     let mut tick = backend.interpreter_tick_callback(id).expect("a tick");
-    let entry = tick().expect("native code at the first call");
-    assert_eq!(run(entry), sum);
-    // The second call finds the code installed.
+    assert_eq!(
+        tick(),
+        None,
+        "static hotness must not compile on first entry"
+    );
+    assert_eq!(opt_audit::pipeline_runs(id), 0);
+
+    let body = backend.interpreter_body_source()(id).expect("a lowered body");
+    assert!(!body.attributes.optimized);
+    assert_eq!(
+        opt_audit::pipeline_runs(id),
+        0,
+        "body preparation must not optimize"
+    );
+    backend.set_ticked_functions([id], []);
+    let binding = backend.interpreter_binding(Arc::new(HashMap::new()));
+    let mut interpreter = HirInterpreter::new();
+    binding.bind(&mut interpreter);
+    let module = backend.interpreter_module(id).expect("module");
+    let result = interpreter
+        .call(&module, "count_to", vec![ZyntaxValue::Int(0)])
+        .unwrap();
+    assert!(matches!(result, ZyntaxValue::Int(n) if n == i64::from((0..TRIPS).sum::<i32>())));
+    assert_eq!(
+        opt_audit::pipeline_runs(id),
+        0,
+        "the short call finishes interpreted"
+    );
+
+    // Actual call hotness still compiles a baseline when no worker is available.
+    let entry = (0..20)
+        .find_map(|_| tick())
+        .expect("baseline after hot calls");
+    assert_eq!(run(entry), (0..TRIPS).sum::<i32>());
     assert_eq!(tick(), Some(entry));
-    drop(tick);
-    drop(backend);
-
-    // A bound the loop reads from its parameter leaves the first call
-    // to the interpreter.
-    let (mut function, _) = common::counted_loop();
-    function.attributes.optimized = true;
-    function.attributes.deferred = true;
-    let (backend, id) = backend_for(function, TieredConfig::default());
-    let mut tick = backend.interpreter_tick_callback(id).expect("a tick");
-    assert_eq!(tick(), None);
-    drop(tick);
-    drop(backend);
-
-    // Once the baseline is in, the optimizing tier is asked for at once
-    // and installs without the loop being run.
-    #[cfg(feature = "llvm-backend")]
-    {
-        use zyntax_compiler::tiered_backend::Tier2Backend;
-
-        let (function, _) = constant_bound_loop();
-        let config = TieredConfig {
-            tier2_backend: Tier2Backend::LLVM,
-            ..TieredConfig::default()
-        };
-        let (backend, id) = backend_for(function, config);
-        let mut tick = backend.interpreter_tick_callback(id).expect("a tick");
-        let baseline = tick().expect("native code at the first call");
-        let mut promoted = None;
-        for _ in 0..600 {
-            match backend.promoted_function_pointer(id) {
-                Some(p) if p != baseline => {
-                    promoted = Some(p);
-                    break;
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        let promoted = promoted.expect("the optimizing tier installs");
-        assert_eq!(run(promoted), sum);
-    }
 }

@@ -1,6 +1,35 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Static trip counts must not make first entry wait for compilation.
+/// The lowered frame starts, asks at its loop, and resumes in Cranelift.
+#[test]
+fn a_static_hot_chunk_starts_interpreted_and_transfers_its_running_frame() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_hot_entry.lua");
+    let output = Command::new(env!("CARGO_BIN_EXE_zylua"))
+        .arg("run")
+        .arg(script)
+        .env_remove("ZYLUA_LLVM")
+        .env("ZYNTAX_DISABLE_WARM_UP", "1")
+        .env("ZYNTAX_TRACE_INTERP", "1")
+        .output()
+        .expect("zylua starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stdout.trim(), "45", "{stderr}");
+    let entered = stderr
+        .find("[interp] call lua$chunk(")
+        .expect("chunk is interpreted");
+    let asked = stderr
+        .find("[interp] asks at site=")
+        .expect("running loop asks for code");
+    let transferred = stderr
+        .find("[interp] transfer site=")
+        .expect("frame transfers to native code");
+    assert!(entered < asked && asked < transferred, "{stderr}");
+}
+
 /// The function returns the table its loop fills. The frame leaves
 /// through a resume point that hands the table back, and the call after
 /// runs the compiled body.

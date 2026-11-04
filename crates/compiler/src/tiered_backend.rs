@@ -3511,7 +3511,6 @@ impl TieredBackend {
             .collect();
         view.lazy = self.lazy.clone();
         view.finished = self.finished.clone();
-        view.static_hot = self.static_hot.clone();
         drop(view);
         self.binding_generation += 1;
     }
@@ -4455,7 +4454,6 @@ impl TieredBackend {
     fn static_hot_beads(&mut self, lazy: &HashSet<HirId>) -> HashSet<u64> {
         let off = std::env::var_os("ZYNTAX_DISABLE_STATIC_HOT").is_some();
         let mut beads = HashSet::new();
-        let mut view = self.binding_view.write().unwrap_or_else(|e| e.into_inner());
         for id in lazy {
             let Some(entry) = self.functions.get(id) else {
                 continue;
@@ -4468,7 +4466,6 @@ impl TieredBackend {
                             !f.attributes.cold && crate::loop_facts::hot_static_loop(f)
                         });
                     self.static_hot.insert(*id, hot);
-                    view.static_hot.insert(*id, hot);
                     hot
                 }
             };
@@ -4482,8 +4479,8 @@ impl TieredBackend {
     /// Asks the compile worker for each function of `lazy` that holds a
     /// loop hot before its first call and has no code yet, so the code
     /// is there, or on its way, when the call comes. After the promotion
-    /// requester, which the compile asks for the optimizing tier. With
-    /// no worker the first call compiles it.
+    /// requester, which the compile asks for the optimizing tier. The
+    /// first call interprets while compilation is pending.
     fn precompile_static_hot(&self, lazy: &HashSet<HirId>) {
         let Some(queue) = &self.compile_queue else {
             return;
@@ -5918,7 +5915,6 @@ struct BindingView {
     ticked: HashSet<HirId>,
     lazy: HashSet<HirId>,
     finished: HashSet<HirId>,
-    static_hot: HashMap<HirId, bool>,
 }
 
 /// The loaded functions and the backend pieces an interpreter's
@@ -5997,20 +5993,9 @@ impl BindingParts {
         let optimized_bodies = Arc::clone(&self.optimized_bodies);
         let queue = self.compile_queue.clone();
         let counter = queue.as_ref().map(|q| q.count_of(entry.bead_id));
-        let mut compile_first = view.static_hot.get(&func_id).copied().unwrap_or(false);
         drop(view);
         Some(Box::new(move || {
             if lazy && bound.bead().compiled().is_none() {
-                // A loop hot before the first call: that call waits for
-                // the code the worker is making, or makes it, and runs
-                // it. Once: a compile that failed leaves the function to
-                // the interpreter.
-                if std::mem::take(&mut compile_first) {
-                    let code = osr::try_lazy_compile(ctx.bead_id);
-                    if !code.is_null() {
-                        return Some(code);
-                    }
-                }
                 // Counted here until the first-call compiler has made
                 // the baseline and installed it in the bead; beadie's
                 // own ladder takes over from there.
