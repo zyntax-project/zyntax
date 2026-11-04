@@ -1,4 +1,4 @@
-//! Redundant-load elimination within single-entry regions.
+//! Load reuse and scalar store forwarding within single-entry regions.
 //!
 //! Plain `cse::eliminate` skips `Load` because Loads can alias with
 //! `Store`s through a memory layer we don't model — two Loads with
@@ -17,7 +17,7 @@
 //!     non-overlapping byte ranges relative to the same SSA pointer.
 //!   * On a redundant `Load` (its pointer is already in the map),
 //!     record a substitution from the new load result to the
-//!     previously-seen load result.
+//!     previously-seen load or same-typed scalar store value.
 //!
 //! Carry available loads through edges whose successor has one predecessor.
 //! Joins, loop entries and effectful terminators start with an empty map.
@@ -27,6 +27,8 @@
 //! After collecting substitutions we sweep the function with the
 //! same machinery `cse::apply_substitutions` uses (rewrite operand
 //! references, drop the now-orphaned defining Loads).
+
+mod stores;
 
 use crate::cse;
 use crate::hir::IdHashMap as HashMap;
@@ -53,6 +55,32 @@ struct Addresses<'a> {
 }
 
 impl Addresses<'_> {
+    fn new(function: &HirFunction) -> Addresses<'_> {
+        Addresses {
+            function,
+            defs: function
+                .blocks
+                .values()
+                .flat_map(|b| &b.instructions)
+                .filter_map(|i| match i {
+                    HirInstruction::Cast { result, .. }
+                    | HirInstruction::GetElementPtr { result, .. }
+                    | HirInstruction::Load { result, .. }
+                    | HirInstruction::ExtractValue { result, .. }
+                    | HirInstruction::InsertValue { result, .. }
+                    | HirInstruction::Alloca { result, .. }
+                    | HirInstruction::Call {
+                        result: Some(result),
+                        callee: crate::hir::HirCallable::Intrinsic(crate::hir::Intrinsic::Malloc),
+                        ..
+                    } => Some((*result, i)),
+                    _ => None,
+                })
+                .collect(),
+            cache: HashMap::default(),
+        }
+    }
+
     fn stored_size(&self, value: HirId) -> u32 {
         let size = value_byte_size(self.function, value);
         match self.defs.get(&value) {
@@ -71,6 +99,33 @@ impl Addresses<'_> {
             }
             _ => size,
         }
+    }
+
+    fn fresh_against_global(&mut self, a: HirId, b: HirId) -> bool {
+        let (Some(a), Some(b)) = (self.get(a, 32), self.get(b, 32)) else {
+            return false;
+        };
+        let global = |id| {
+            matches!(
+                self.function.values.get(&id).map(|v| &v.kind),
+                Some(HirValueKind::Global(_))
+            )
+        };
+        let fresh = |id| {
+            matches!(
+                self.defs.get(&id),
+                Some(
+                    HirInstruction::Alloca { .. }
+                        | HirInstruction::Call {
+                            callee: crate::hir::HirCallable::Intrinsic(
+                                crate::hir::Intrinsic::Malloc
+                            ),
+                            ..
+                        }
+                )
+            )
+        };
+        (global(a.root) && fresh(b.root)) || (fresh(a.root) && global(b.root))
     }
 
     fn get(&mut self, ptr: HirId, depth: u32) -> Option<Address> {
@@ -188,7 +243,27 @@ pub struct LoadCseStats {
     pub eliminated: usize,
 }
 
-type Available<'a> = HashMap<HirId, (HirId, &'a HirType, MemLoc, u32)>;
+// Aggregate values may carry an address rather than their stored bytes.
+fn scalar_store_type(func: &HirFunction, value: HirId) -> Option<&HirType> {
+    let ty = &func.values.get(&value)?.ty;
+    matches!(
+        ty,
+        HirType::Bool
+            | HirType::I8
+            | HirType::U8
+            | HirType::I16
+            | HirType::U16
+            | HirType::I32
+            | HirType::U32
+            | HirType::I64
+            | HirType::U64
+            | HirType::F32
+            | HirType::F64
+    )
+    .then_some(ty)
+}
+
+type Available<'a> = HashMap<HirId, (HirId, &'a HirType, MemLoc, u32, bool)>;
 
 /// A forest of single-predecessor edges. Cycles with no root are unreachable
 /// and are processed locally. Edges come from terminators, not cached CFGs.
@@ -239,7 +314,7 @@ pub fn run(func: &mut HirFunction) -> LoadCseStats {
     run_with(func, &crate::licm::AliasNames::default(), false)
 }
 
-/// Reuse loads through single-entry successors after structural optimization.
+/// Reuse loads and forward scalar stores after inlining and structural optimization.
 pub fn run_regions(func: &mut HirFunction) -> LoadCseStats {
     run_with(func, &crate::licm::AliasNames::default(), true)
 }
@@ -248,6 +323,8 @@ pub fn run_regions(func: &mut HirFunction) -> LoadCseStats {
 /// (`licm::alias_names`).
 fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: bool) -> LoadCseStats {
     let mut substitutions: HashMap<HirId, HirId> = HashMap::default();
+    let forward_stores = across;
+    let mut forwarded_store = false;
     let addr_index = crate::licm::build_addr_index(func, exact);
     let no_subst = indexmap::IndexMap::new();
     let loc = |ptr: HirId, size: u32| -> MemLoc {
@@ -287,13 +364,16 @@ fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: boo
                     } => {
                         let canonical_ptr = chase(*ptr, &substitutions);
                         match available.get(&canonical_ptr) {
-                            Some(&(prev_result, previous_ty, _, _)) if previous_ty == ty => {
+                            Some(&(prev_result, previous_ty, _, _, stored))
+                                if previous_ty == ty =>
+                            {
+                                forwarded_store |= stored;
                                 substitutions.insert(*result, prev_result);
                             }
                             _ => {
                                 let size = hir_ty_byte_size(ty);
                                 let at = loc(*ptr, size);
-                                available.insert(canonical_ptr, (*result, ty, at, size));
+                                available.insert(canonical_ptr, (*result, ty, at, size, false));
                             }
                         }
                     }
@@ -301,7 +381,7 @@ fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: boo
                         let size = value_byte_size(func, *value);
                         let at = loc(*ptr, size);
                         let canonical_ptr = chase(*ptr, &substitutions);
-                        available.retain(|loaded_ptr, (_, _, loaded, loaded_size)| {
+                        available.retain(|loaded_ptr, (_, _, loaded, loaded_size, _)| {
                             if at.provably_disjoint(loaded) {
                                 return true;
                             }
@@ -309,34 +389,23 @@ fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: boo
                                 return false;
                             }
                             // Build the address index only when a store could kill a load.
-                            let addresses = addresses.get_or_insert_with(|| Addresses {
-                                function: func,
-                                defs: func
-                                    .blocks
-                                    .values()
-                                    .flat_map(|b| &b.instructions)
-                                    .filter_map(|i| match i {
-                                        HirInstruction::Cast { result, .. }
-                                        | HirInstruction::GetElementPtr { result, .. }
-                                        | HirInstruction::Load { result, .. }
-                                        | HirInstruction::ExtractValue { result, .. }
-                                        | HirInstruction::InsertValue { result, .. } => {
-                                            Some((*result, i))
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect(),
-                                cache: HashMap::default(),
-                            });
+                            let addresses = addresses.get_or_insert_with(|| Addresses::new(func));
                             let size = addresses.stored_size(*value);
                             let address = addresses.get(canonical_ptr, 32);
-                            separate_bytes(
-                                address,
-                                size,
-                                addresses.get(*loaded_ptr, 32),
-                                *loaded_size,
-                            )
+                            (forward_stores
+                                && addresses.fresh_against_global(canonical_ptr, *loaded_ptr))
+                                || separate_bytes(
+                                    address,
+                                    size,
+                                    addresses.get(*loaded_ptr, 32),
+                                    *loaded_size,
+                                )
                         });
+                        let value = chase(*value, &substitutions);
+                        if forward_stores && let Some(ty) = scalar_store_type(func, value) {
+                            available
+                                .insert(canonical_ptr, (value, ty, at, hir_ty_byte_size(ty), true));
+                        }
                     }
                     // Memory-killing ops invalidate everything we
                     // believe about memory contents. Conservative
@@ -397,6 +466,9 @@ fn run_with(func: &mut HirFunction, exact: &crate::licm::AliasNames, across: boo
 
     let _rewrites = cse::apply_substitutions_public(func, &substitutions);
     let eliminated = cse::remove_redundant_instructions_public(func, &substitutions);
+    if forwarded_store {
+        stores::eliminate(func);
+    }
     LoadCseStats { eliminated }
 }
 
@@ -828,3 +900,7 @@ mod tests {
         assert_eq!(typed_store_between_loads("A", "A", &["A"]), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "load_cse/forward_tests.rs"]
+mod forward_tests;

@@ -128,7 +128,7 @@ fn one_arm_writes_and_aliased_parameters_execute_in_every_tier() {
             let (mut module, id, _, _) = success_path(write, distinct);
             assert_eq!(
                 load_cse::run_regions(module.functions.get_mut(&id).unwrap()).eliminated,
-                usize::from(!write)
+                usize::from(!write || !distinct)
             );
             let mut interp = HirInterpreter::new();
             check(
@@ -323,4 +323,110 @@ fn unchanged_join_still_starts_a_new_region() {
         load_cse::run_regions(m.functions.get_mut(&id).unwrap()).eliminated,
         0
     );
+}
+
+#[test]
+fn forwarding_and_dead_stores_preserve_old_values_and_aliases_in_every_tier() {
+    for separate_parameter in [false, true] {
+        let (mut module, id, _, _) = diamond(false, separate_parameter);
+        let f = module.functions.get_mut(&id).unwrap();
+        let entry_id = f.entry_block;
+        f.blocks.retain(|bid, _| *bid == entry_id);
+        let p = f.signature.params[0].id;
+        let q = f.signature.params[usize::from(separate_parameter)].id;
+        let one = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(1)));
+        let two = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(2)));
+        let first = f.create_value(HirType::I64, HirValueKind::Instruction);
+        let second = f.create_value(HirType::I64, HirValueKind::Instruction);
+        let result = f.create_value(HirType::I64, HirValueKind::Instruction);
+        let block = f.blocks.get_mut(&entry_id).unwrap();
+        block.instructions = vec![
+            HirInstruction::Store {
+                value: one,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            },
+            HirInstruction::Load {
+                result: first,
+                ty: HirType::I64,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            },
+            HirInstruction::Store {
+                value: two,
+                ptr: q,
+                align: 8,
+                volatile: false,
+            },
+            HirInstruction::Load {
+                result: second,
+                ty: HirType::I64,
+                ptr: p,
+                align: 8,
+                volatile: false,
+            },
+            HirInstruction::Binary {
+                result,
+                op: BinaryOp::Add,
+                ty: HirType::I64,
+                left: first,
+                right: second,
+            },
+        ];
+        block.terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        assert_eq!(
+            load_cse::run_regions(f).eliminated,
+            if separate_parameter { 1 } else { 2 }
+        );
+        let execute = |call: &mut dyn FnMut(*mut i64, *mut i64) -> i64| {
+            for alias in [false, true] {
+                let mut a = 11i64;
+                let mut b = 29i64;
+                let p = &mut a as *mut i64;
+                let q = if alias { p } else { &mut b };
+                let same = alias || !separate_parameter;
+                assert_eq!(call(p, q), if same { 3 } else { 2 });
+                assert_eq!(a, if same { 2 } else { 1 });
+                assert_eq!(b, if separate_parameter && !alias { 2 } else { 29 });
+            }
+        };
+        let mut interpreter = HirInterpreter::new();
+        execute(&mut |p, q| match interpreter
+            .call(
+                &module,
+                "diamond",
+                vec![
+                    ZyntaxValue::Pointer(p.cast()),
+                    ZyntaxValue::Pointer(q.cast()),
+                    ZyntaxValue::Int(0),
+                ],
+            )
+            .unwrap()
+        {
+            ZyntaxValue::Int(n) => n,
+            other => panic!("{other:?}"),
+        });
+        let mut clif = zyntax_compiler::cranelift_backend::CraneliftBackend::new().unwrap();
+        clif.compile_module(&module).unwrap();
+        clif.finalize_definitions().unwrap();
+        // SAFETY: the fixture's C signature matches and the backend remains alive.
+        let call: unsafe extern "C" fn(*mut i64, *mut i64, i64) -> i64 =
+            unsafe { std::mem::transmute(clif.get_function_ptr(id).unwrap()) };
+        execute(&mut |p, q| unsafe { call(p, q, 0) });
+        #[cfg(feature = "llvm-backend")]
+        {
+            let context = inkwell::context::Context::create();
+            let mut llvm =
+                zyntax_compiler::llvm_jit_backend::LLVMJitBackend::new(&context).unwrap();
+            llvm.compile_module(&module).unwrap();
+            // SAFETY: same fixture signature; the backend outlives the calls.
+            let call: unsafe extern "C" fn(*mut i64, *mut i64, i64) -> i64 =
+                unsafe { std::mem::transmute(llvm.get_function_pointer(id).unwrap()) };
+            execute(&mut |p, q| unsafe { call(p, q, 0) });
+        }
+    }
 }
