@@ -258,6 +258,10 @@ fn check(mut a: Fixture, expected: i64) {
         partial_escape::run_function(a.m.functions.get_mut(&a.main).unwrap()),
         0
     );
+    check_other_backends(&a, expected);
+}
+
+fn check_other_backends(a: &Fixture, expected: i64) {
     use zyntax_compiler::hir_interp::{HirInterpreter, value_to_i64};
     assert_eq!(
         value_to_i64(&HirInterpreter::new().call(&a.m, "main", vec![]).unwrap()).unwrap(),
@@ -681,4 +685,64 @@ fn grouped_reads_observe_mutated_fields_of_opaque_inputs() {
             store(field, thirteen),
         ]);
     check(a, 72);
+}
+
+#[test]
+fn one_loop_allocation_with_an_opaque_initial_object_needs_no_escape() {
+    for n in [0, 1, 20] {
+        let mut a = fixture(n, false);
+        let f = a.m.functions.get_mut(&a.main).unwrap();
+        let entry = f.entry_block;
+        let made = f.blocks[&entry].instructions[0].result_id().unwrap();
+        // A stack-backed input stands for the object supplied by an OSR frame.
+        f.blocks.get_mut(&entry).unwrap().instructions[0] = HirInstruction::Alloca {
+            result: made,
+            ty: HirType::I64,
+            count: None,
+            align: 8,
+        };
+        let result = val(f, HirType::I64);
+        f.blocks.get_mut(&a.exit).unwrap().instructions = vec![load(result, a.current)];
+        f.blocks.get_mut(&a.exit).unwrap().terminator = HirTerminator::Return {
+            values: vec![result],
+        };
+        // Remove the unused observer path so there are no materializing calls.
+        let HirTerminator::CondBranch {
+            true_target: dispatch,
+            ..
+        } = f.blocks[&a.head].terminator
+        else {
+            panic!("loop header")
+        };
+        let HirTerminator::CondBranch {
+            true_target: hot, ..
+        } = f.blocks[&dispatch].terminator
+        else {
+            panic!("dispatch")
+        };
+        f.blocks.get_mut(&dispatch).unwrap().terminator = HirTerminator::Branch { target: hot };
+        zyntax_compiler::cfg_simplify::prune_unreachable(f);
+        for _ in 0..2 {
+            zyntax_compiler::const_fold::fold_function(f);
+            zyntax_compiler::branch_fold::run(f);
+            zyntax_compiler::cfg_simplify::run(f);
+        }
+        assert_eq!(execute(&a), 7 + 3 * n);
+        let f = a.m.functions.get_mut(&a.main).unwrap();
+        assert_eq!(partial_escape::run_function(f), 1);
+        assert!(
+            !f.blocks
+                .values()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i,
+                    HirInstruction::Call {
+                        callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                        ..
+                    }
+                ))
+        );
+        assert_eq!(execute(&a), 7 + 3 * n);
+        check_other_backends(&a, 7 + 3 * n);
+    }
 }

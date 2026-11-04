@@ -63,12 +63,25 @@ fn returns_nonnull(f: &HirFunction) -> bool {
 /// read, through a shell too. Grows from the functions already known,
 /// so a cycle of such calls proves nothing.
 pub fn record_nonnull_returns(module: &mut HirModule) {
+    for id in infer_nonnull_callees(module, false) {
+        if let Some(f) = module.functions.get_mut(&id) {
+            f.attributes.returns_nonnull = true;
+        }
+    }
+}
+
+/// Infer return facts without optimizing or modifying the lowered bodies.
+pub(crate) fn inferred_nonnull_callees(module: &HirModule) -> HashSet<HirId> {
+    infer_nonnull_callees(module, true)
+}
+
+fn infer_nonnull_callees(module: &HirModule, include_optimized: bool) -> HashSet<HirId> {
     let candidates: Vec<HirId> = module
         .functions
         .iter()
         .filter(|(_, f)| {
             !f.is_external
-                && !f.attributes.optimized
+                && (include_optimized || !f.attributes.optimized)
                 && !f.blocks.is_empty()
                 && !returns_nonnull(f)
                 && matches!(
@@ -104,11 +117,7 @@ pub fn record_nonnull_returns(module: &mut HirModule) {
         }
         known.extend(found);
     }
-    for id in known {
-        if let Some(f) = module.functions.get_mut(&id) {
-            f.attributes.returns_nonnull = true;
-        }
-    }
+    known
 }
 
 /// Rounds of [`record_nonnull_returns`]: each lets a body count calls to
@@ -229,6 +238,9 @@ pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<
         .filter(|(id, _)| constant(id))
         .map(|(id, _)| *id)
         .collect();
+    set.extend(func.signature.params.iter().filter_map(|p| {
+        (p.attributes.nonnull && matches!(p.ty, crate::hir::HirType::Ptr(_))).then_some(p.id)
+    }));
     let mut defs: HashMap<HirId, &HirInstruction> = HashMap::default();
     for block in func.blocks.values() {
         for inst in &block.instructions {
@@ -814,6 +826,21 @@ mod tests {
         let mut module = HirModule::new(InternedString::new_global("m"));
         module.functions.insert(ctor_id, ctor);
         module.functions.insert(caller_id, caller);
+        // A retained body may be marked finished without a saved return fact.
+        module
+            .functions
+            .get_mut(&ctor_id)
+            .unwrap()
+            .attributes
+            .optimized = true;
+        assert!(inferred_nonnull_callees(&module).contains(&ctor_id));
+        assert!(!module.functions[&ctor_id].attributes.returns_nonnull);
+        module
+            .functions
+            .get_mut(&ctor_id)
+            .unwrap()
+            .attributes
+            .optimized = false;
         record_nonnull_returns(&mut module);
         assert!(module.functions[&ctor_id].attributes.returns_nonnull);
         assert!(!module.functions[&caller_id].attributes.returns_nonnull);

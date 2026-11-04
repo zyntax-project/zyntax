@@ -197,7 +197,9 @@ impl ZyntaxCraneliftBackend {
             def.function.name.resolve_global().unwrap_or_default(),
             layout.loop_ordinal
         ));
-        let Some(mut outlined) = crate::osr::outline(&def.function, &layout, region_id, name)
+        let nonnull = crate::sign_fold::inferred_nonnull_callees(&def.module);
+        let Some(mut outlined) =
+            crate::osr::outline_with_nonnull(&def.function, &layout, region_id, name, &nonnull)
         else {
             return None;
         };

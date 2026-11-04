@@ -104,7 +104,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
             _ => None,
         })
         .collect();
-    if original.len() < 2 {
+    if original.is_empty() {
         return 0;
     }
     let mut count = 0;
@@ -221,7 +221,7 @@ pub fn run_function(f: &mut HirFunction) -> usize {
                 .collect();
             // Do not resink the materialization diamonds this pass creates.
             if selected.keys().any(|r| !original.contains(r))
-                || selected.len() < 2
+                || selected.is_empty()
                 || roots.len() > 32
                 || roots.len() == selected.len()
             {
@@ -441,7 +441,7 @@ fn plan(
             }
         }
     }
-    if p.escapes.is_empty() || p.fields.is_empty() || p.fields.len() > 12 {
+    if p.fields.is_empty() || p.fields.len() > 12 {
         return None;
     }
     let mut end = 0;
