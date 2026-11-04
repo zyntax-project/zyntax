@@ -25,12 +25,15 @@
 //! raiser, the raiser's arm threads to the exit and the normal path's
 //! check folds, so the load and branch leave the hot path.
 
+mod rollback;
+
 use crate::analysis::DominatorTree;
 use crate::hir::{
     BinaryOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
     HirTerminator, HirType, HirValueKind, Intrinsic,
 };
 use crate::hir::{IdHashMap as HashMap, IdHashSet as HashSet};
+use rollback::EdgeBackup;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorFlagStats {
@@ -951,7 +954,7 @@ fn thread(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
         return 0;
     }
 
-    let saved = func.blocks.clone();
+    let saved = EdgeBackup::new(func, plan.iter().flat_map(|&(p, c, arm)| [p, c, arm]));
     let mut threaded = 0;
     for (p, c, arm) in plan {
         // The arm's phis take from `p` what they took from `c`, through
@@ -1013,11 +1016,13 @@ fn thread(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
             _ => unreachable!("planned only for branches"),
         }
         threaded += 1;
-        func.rebuild_cfg_edges();
     }
-    if threaded > 0 && !dominance_holds(func) {
-        func.blocks = saved;
-        return 0;
+    if threaded > 0 {
+        func.rebuild_cfg_edges();
+        if !dominance_holds(func) {
+            saved.restore(func);
+            return 0;
+        }
     }
     threaded
 }
@@ -1076,7 +1081,7 @@ fn bypass_merges(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
     if plan.is_empty() {
         return 0;
     }
-    let saved = func.blocks.clone();
+    let saved = EdgeBackup::new(func, plan.iter().flat_map(|&(p, c, arm)| [p, c, arm]));
     for &(p, m, c) in &plan {
         let from_p: HashMap<HirId, HirId> = func.blocks[&m]
             .phis
@@ -1117,7 +1122,7 @@ fn bypass_merges(func: &mut HirFunction, flow: &Flow, sol: &Solution) -> usize {
     }
     func.rebuild_cfg_edges();
     if !dominance_holds(func) {
-        func.blocks = saved;
+        saved.restore(func);
         return 0;
     }
     plan.len()
@@ -1923,6 +1928,126 @@ mod tests {
         assert_eq!(func.blocks[&check].phis[0].incoming, vec![(two, other)]);
         assert_eq!(branch_constant(func, check, raise), Some(false));
         assert!(dominance_holds(func));
+    }
+
+    #[test]
+    fn edge_rollback_restores_phi_inputs_and_rebuilt_edges() {
+        let m = Module::new(true);
+        let mut b = Body::new(&m);
+        let entry = b.block();
+        let left = b.block();
+        let right = b.block();
+        let join = b.block();
+        let cond = b.param(0, HirType::Bool);
+        b.term(
+            entry,
+            HirTerminator::CondBranch {
+                condition: cond,
+                true_target: left,
+                false_target: right,
+            },
+        );
+        b.term(left, HirTerminator::Branch { target: join });
+        b.term(right, HirTerminator::Branch { target: join });
+        let (one, two) = (b.int(1), b.int(2));
+        let value = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.f.blocks[&join].phis.push(HirPhi {
+            result: value,
+            ty: HirType::I64,
+            incoming: vec![(one, left), (two, right)],
+        });
+        let sum = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+        b.push(
+            join,
+            HirInstruction::Binary {
+                result: sum,
+                op: BinaryOp::Add,
+                left: value,
+                right: one,
+                ty: HirType::I64,
+            },
+        );
+        b.term(join, HirTerminator::Return { values: vec![sum] });
+        b.f.rebuild_cfg_edges();
+        let before = format!("{:?}", b.f.blocks);
+        let instructions = b.f.blocks[&join].instructions.as_ptr();
+        let saved = EdgeBackup::new(&b.f, [left, join, left]);
+        b.f.blocks[&left].terminator = HirTerminator::Return { values: vec![one] };
+        b.f.blocks[&join].phis[0]
+            .incoming
+            .retain(|(_, from)| *from != left);
+        b.f.rebuild_cfg_edges();
+        assert_eq!(b.f.blocks[&join].predecessors, vec![right]);
+        saved.restore(&mut b.f);
+        assert_eq!(format!("{:?}", b.f.blocks), before);
+        assert_eq!(b.f.blocks[&join].instructions.as_ptr(), instructions);
+        assert!(dominance_holds(&b.f));
+    }
+
+    #[test]
+    fn many_raising_edges_keep_phi_inputs_and_cfg_consistent() {
+        let mut m = Module::new(true);
+        let raiser = m.callee(
+            "raiser",
+            FunctionAttributes {
+                sets_error_flag: true,
+                ..Default::default()
+            },
+        );
+        let mut b = Body::new(&m);
+        let cond = b.param(0, HirType::Bool);
+        let mut entry = b.block();
+        let mut expected = Vec::new();
+        for i in 0..64 {
+            let set = b.block();
+            let clear = b.block();
+            let check = b.block();
+            let raise = b.block();
+            let next = b.block();
+            b.term(
+                entry,
+                HirTerminator::CondBranch {
+                    condition: cond,
+                    true_target: set,
+                    false_target: clear,
+                },
+            );
+            b.call(set, raiser);
+            b.term(set, HirTerminator::Branch { target: check });
+            b.term(clear, HirTerminator::Branch { target: check });
+            let value = b.int(i);
+            let other = b.int(-1);
+            let merged = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+            b.f.blocks[&check].phis.push(HirPhi {
+                result: merged,
+                ty: HirType::I64,
+                incoming: vec![(value, set), (other, clear)],
+            });
+            b.check(check, raise, next);
+            let out = b.f.create_value(HirType::I64, HirValueKind::Instruction);
+            b.f.blocks[&raise].phis.push(HirPhi {
+                result: out,
+                ty: HirType::I64,
+                incoming: vec![(merged, check)],
+            });
+            b.term(raise, HirTerminator::Return { values: vec![out] });
+            expected.push((set, clear, check, raise, value, other));
+            entry = next;
+        }
+        b.ret(entry, 0);
+        let id = b.finish(&mut m);
+        let stats = run_all(&mut m.module);
+        assert_eq!(stats.threaded, expected.len());
+        let f = body(&m, id);
+        for (set, clear, check, raise, value, other) in expected {
+            assert!(matches!(f.blocks[&set].terminator,
+                HirTerminator::Branch { target } if target == raise));
+            assert_eq!(f.blocks[&check].predecessors, vec![clear]);
+            assert_eq!(f.blocks[&check].phis[0].incoming, vec![(other, clear)]);
+            assert!(f.blocks[&raise].phis[0].incoming.contains(&(value, set)));
+            assert!(f.blocks[&raise].predecessors.contains(&set));
+        }
+        assert!(dominance_holds(f));
     }
 
     /// `e = malloc` at the end of `block`; returns `e`.
