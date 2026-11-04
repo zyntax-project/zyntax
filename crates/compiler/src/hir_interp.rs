@@ -94,7 +94,7 @@ pub fn unsupported_constructs(module: &HirModule) -> Vec<(String, &'static str)>
 
 use crate::hir::{
     BinaryOp, CastOp, HirCallable, HirConstant, HirFunction, HirId, HirInstruction, HirModule,
-    HirTerminator, HirType, HirValueKind, UnaryOp, VectorMinMaxKind, VectorUnaryKind,
+    HirTerminator, HirType, HirValueKind, IdHashMap, UnaryOp, VectorMinMaxKind, VectorUnaryKind,
 };
 use crate::value::ZyntaxValue;
 
@@ -1260,13 +1260,13 @@ pub fn compile_function_with(
         ));
     }
     let mut cf = CompiledFunction::default();
-    let mut reg_of: HashMap<HirId, Reg> = HashMap::new();
+    let mut reg_of: IdHashMap<HirId, Reg> = IdHashMap::default();
     let abi = crate::abi::function_abi(func, address_taken);
     cf.returns_through_destination = abi.destination.is_some();
     cf.destination_size = abi.destination.as_ref().map(size_of_hir_ty).unwrap_or(0);
     // Struct field indices in a GEP are constants; the walk needs their
     // values.
-    let const_ints: HashMap<HirId, i64> = func
+    let const_ints: IdHashMap<HirId, i64> = func
         .values
         .iter()
         .filter_map(|(id, v)| match &v.kind {
@@ -1280,7 +1280,7 @@ pub fn compile_function_with(
     let mut next_reg: Reg = 0;
     let mut alloc = |id: HirId,
                      ty: &HirType,
-                     reg_of: &mut HashMap<HirId, Reg>,
+                     reg_of: &mut IdHashMap<HirId, Reg>,
                      reg_types: &mut Vec<HirType>,
                      next: &mut Reg|
      -> Reg {
@@ -1313,13 +1313,13 @@ pub fn compile_function_with(
     cf.n_params = func.signature.params.len() as u16;
 
     // Allocate regs for every remaining value (constants, instruction
-    // results, phi results). For constants, also push to const_pool.
-    let mut const_idx_for: HashMap<HirId, u32> = HashMap::new();
+    // results, phi results). Emit constants before any block so branches and
+    // call-site read sets use their final PCs from the outset.
     for (val_id, val_def) in func.values.iter() {
         if reg_of.contains_key(val_id) {
             continue;
         }
-        let _ = alloc(
+        let r = alloc(
             *val_id,
             &val_def.ty,
             &mut reg_of,
@@ -1332,7 +1332,7 @@ pub fn compile_function_with(
                 // time the function runs, as a stack slot would.
                 let mut bytes = vec![0u8; size_of_hir_ty(&val_def.ty).max(8)];
                 write_constant(c, &val_def.ty, &mut bytes);
-                cf.entry_storage.push((reg_of[val_id], bytes));
+                cf.entry_storage.push((r, bytes));
                 continue;
             }
             let value = match c {
@@ -1350,13 +1350,13 @@ pub fn compile_function_with(
             };
             let idx = cf.const_pool.len() as u32;
             cf.const_pool.push(value);
-            const_idx_for.insert(*val_id, idx);
+            cf.code.push(Op::LoadConst { dst: r, c: idx });
         } else if matches!(val_def.kind, HirValueKind::Undef)
             && held(&val_def.ty) == Held::ByReference
         {
             // An undef aggregate is storage the function fills in.
             let size = size_of_hir_ty(&val_def.ty).max(8);
-            cf.entry_storage.push((reg_of[val_id], vec![0u8; size]));
+            cf.entry_storage.push((r, vec![0u8; size]));
         } else if let HirValueKind::Global(global_id) = &val_def.kind {
             // Resolve the global to a ZRTL string image in `memory`,
             // then pre-load the pointer into the value's register via
@@ -1372,21 +1372,21 @@ pub fn compile_function_with(
                 if let Some(ptr) = memory.bound_global(*global_id) {
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
-                    const_idx_for.insert(*val_id, idx);
+                    cf.code.push(Op::LoadConst { dst: r, c: idx });
                     cf.global_consts.push((*global_id, idx));
                 } else if let Some(HirConstant::String(interned)) = &global.initializer {
                     let s = interned.resolve_global().unwrap_or_default();
                     let ptr = memory.string_constant(s.as_bytes());
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
-                    const_idx_for.insert(*val_id, idx);
+                    cf.code.push(Op::LoadConst { dst: r, c: idx });
                     cf.global_consts.push((*global_id, idx));
                 } else {
                     // A variable: one zeroed slot for the whole module.
                     let ptr = memory.global_slot(*global_id, size_of_hir_ty(&global.ty));
                     let idx = cf.const_pool.len() as u32;
                     cf.const_pool.push(ZyntaxValue::Pointer(ptr));
-                    const_idx_for.insert(*val_id, idx);
+                    cf.code.push(Op::LoadConst { dst: r, c: idx });
                     cf.global_consts.push((*global_id, idx));
                 }
             }
@@ -1416,7 +1416,7 @@ pub fn compile_function_with(
     cf.n_regs = next_reg as u32;
 
     // Loop headers promoted code can resume at, keyed by block.
-    let mut header_sites: HashMap<HirId, u32> = HashMap::new();
+    let mut header_sites: IdHashMap<HirId, u32> = IdHashMap::default();
     // Headers whose resumed code reads a repaired live-in through a join.
     let mut joined: std::collections::HashSet<HirId> = std::collections::HashSet::new();
     if !address_taken {
@@ -1491,14 +1491,16 @@ pub fn compile_function_with(
     // Registers read whatever op runs: constants and entry storage,
     // written once at entry.
     let mut always = vec![0u64; (cf.n_regs as usize).div_ceil(64)];
-    for id in const_idx_for.keys() {
-        set_bit(&mut always, reg_of[id] as usize);
+    for op in &cf.code {
+        if let Op::LoadConst { dst, .. } = op {
+            set_bit(&mut always, *dst as usize);
+        }
     }
     for (r, _) in &cf.entry_storage {
         set_bit(&mut always, *r as usize);
     }
     let mut read_sets = live_across_calls(func, &reg_of, &always);
-    let union_slot_of: HashMap<HirId, u32> =
+    let union_slot_of: IdHashMap<HirId, u32> =
         confined_unions(func).into_iter().zip(0u32..).collect();
     cf.union_slots = union_slot_of.len() as u32;
     // Each call's ops, with the read set in force while they run.
@@ -1507,7 +1509,7 @@ pub fn compile_function_with(
     // ── Code emission ──
     // First pass: emit ops; record block-id → start PC; track every
     // jump-target site so we can backpatch after pass 1.
-    let mut block_pcs: HashMap<HirId, Pc> = HashMap::new();
+    let mut block_pcs: IdHashMap<HirId, Pc> = IdHashMap::default();
     // Patch entry: (op_index, slot) — slot 0..N selects which Pc field
     // in the op to overwrite.
     let mut patches: Vec<(usize, u8, HirId)> = Vec::new();
@@ -1530,13 +1532,6 @@ pub fn compile_function_with(
             .blocks
             .get(bid)
             .ok_or_else(|| InterpError::Host(format!("missing block {:?}", bid)))?;
-
-        // Constants used in this block get their LoadConst emitted at
-        // the block entry. Simplest correct strategy; refinement is to
-        // hoist to entry block. (Constants from `func.values` only —
-        // they're function-scoped, not block-scoped, in SSA, so a
-        // single load at the block prefix is fine since each block
-        // dominates its uses for constants.)
 
         if let Some(&site) = header_sites.get(bid) {
             cf.code.push(Op::LoopHeader { site });
@@ -1586,77 +1581,14 @@ pub fn compile_function_with(
         cf.switch_pool[table_idx as usize][case_idx].1 = target_pc;
     }
 
-    // Hoist constant LoadConst ops to the entry-block prefix in
-    // source order. This is the simplest correct approach: re-emit the
-    // entry block's prefix by shifting `code[entry_pc..]` right by N
-    // ops where N = number of constants used.
-    // Skipped for now — instead, when the dispatcher hits a register
-    // that's never been written, it falls through to consulting the
-    // function's const_pool by examining `const_idx_for` via a
-    // side-channel. To keep things simple, we instead emit one
-    // `LoadConst` per constant at the top of the entry block.
-    let before = cf.code.len();
-    inject_const_loads_at_entry(func, &mut cf, &reg_of, &const_idx_for, &block_pcs)?;
-    let shift = cf.code.len() - before;
     if !call_ops.is_empty() {
         cf.read_set_at = vec![u32::MAX; cf.code.len()];
         for (first, end, set) in call_ops {
-            cf.read_set_at[first + shift..end + shift].fill(set);
+            cf.read_set_at[first..end].fill(set);
         }
     }
 
     Ok(cf)
-}
-
-/// Insert `LoadConst` ops at the start of the entry block (which is
-/// always at PC 0) for every constant in the function. Patches all
-/// recorded backpatch sites + block_pcs to account for the shift.
-fn inject_const_loads_at_entry(
-    _func: &HirFunction,
-    cf: &mut CompiledFunction,
-    _reg_of: &HashMap<HirId, Reg>,
-    const_idx_for: &HashMap<HirId, u32>,
-    _block_pcs: &HashMap<HirId, Pc>,
-) -> Result<(), InterpError> {
-    if const_idx_for.is_empty() {
-        return Ok(());
-    }
-    // Build prefix ops.
-    let mut prefix: Vec<Op> = Vec::with_capacity(const_idx_for.len());
-    let mut entries: Vec<(HirId, u32)> =
-        const_idx_for.iter().map(|(id, idx)| (*id, *idx)).collect();
-    entries.sort_by_key(|(_, idx)| *idx);
-    for (id, idx) in entries {
-        let r = _reg_of[&id];
-        prefix.push(Op::LoadConst { dst: r, c: idx });
-    }
-    let shift = prefix.len() as Pc;
-
-    // Shift every Pc inside existing ops by `shift`.
-    for op in cf.code.iter_mut() {
-        match op {
-            Op::Jump { target } => *target += shift,
-            Op::JumpIf { t, f, .. } => {
-                *t += shift;
-                *f += shift;
-            }
-            Op::Switch { default, .. } => *default += shift,
-            _ => {}
-        }
-    }
-    // Shift switch-pool case targets too.
-    for table in cf.switch_pool.iter_mut() {
-        for (_, pc) in table.iter_mut() {
-            *pc += shift;
-        }
-    }
-
-    // Splice prefix into the front of code.
-    let mut new_code = Vec::with_capacity(prefix.len() + cf.code.len());
-    new_code.extend(prefix);
-    new_code.extend(cf.code.drain(..));
-    cf.code = new_code;
-    Ok(())
 }
 
 /// Bound on blocks × register words the liveness analysis works over;
@@ -1692,10 +1624,10 @@ fn has_bit(bits: &[u64], i: usize) -> bool {
 /// is.
 fn live_across_calls(
     func: &HirFunction,
-    reg_of: &HashMap<HirId, Reg>,
+    reg_of: &IdHashMap<HirId, Reg>,
     always: &[u64],
-) -> HashMap<(HirId, usize), Vec<u64>> {
-    let mut sets = HashMap::new();
+) -> IdHashMap<(HirId, usize), Vec<u64>> {
+    let mut sets = IdHashMap::default();
     let words = always.len();
     let ids: Vec<HirId> = func.blocks.keys().copied().collect();
     let n = ids.len();
@@ -1708,7 +1640,7 @@ fn live_across_calls(
         }
         return sets;
     }
-    let index: HashMap<HirId, usize> = ids.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    let index: IdHashMap<HirId, usize> = ids.iter().enumerate().map(|(i, b)| (*b, i)).collect();
     let slot = |id: HirId| reg_of.get(&id).map(|r| *r as usize);
     let row = |b: usize| b * words..(b + 1) * words;
     let succs: Vec<Vec<usize>> = ids
@@ -1818,7 +1750,7 @@ fn confined_unions(func: &HirFunction) -> Vec<HirId> {
         Select(HirId),
         Escapes,
     }
-    let mut uses: HashMap<HirId, Vec<Use>> = HashMap::new();
+    let mut uses: IdHashMap<HirId, Vec<Use>> = IdHashMap::default();
     let mut made = Vec::new();
     for block in func.blocks.values() {
         for phi in &block.phis {
@@ -1858,7 +1790,7 @@ fn confined_unions(func: &HirFunction) -> Vec<HirId> {
             .terminator
             .for_each_operand(|v| uses.entry(v).or_default().push(Use::Escapes));
     }
-    fn confined(v: HirId, uses: &HashMap<HirId, Vec<Use>>, depth: u32) -> bool {
+    fn confined(v: HirId, uses: &IdHashMap<HirId, Vec<Use>>, depth: u32) -> bool {
         depth < 8
             && uses.get(&v).is_none_or(|us| {
                 us.iter().all(|u| match u {
@@ -1913,9 +1845,9 @@ fn inst_result_ty(inst: &HirInstruction) -> Option<HirType> {
 fn lower_inst(
     inst: &HirInstruction,
     cf: &mut CompiledFunction,
-    reg_of: &HashMap<HirId, Reg>,
-    const_ints: &HashMap<HirId, i64>,
-    union_slot_of: &HashMap<HirId, u32>,
+    reg_of: &IdHashMap<HirId, Reg>,
+    const_ints: &IdHashMap<HirId, i64>,
+    union_slot_of: &IdHashMap<HirId, u32>,
 ) -> Result<(), InterpError> {
     let reg = |id: HirId| -> Result<Reg, InterpError> {
         reg_of
@@ -2805,7 +2737,7 @@ fn lower_terminator(
     src_block: HirId,
     func: &HirFunction,
     cf: &mut CompiledFunction,
-    reg_of: &HashMap<HirId, Reg>,
+    reg_of: &IdHashMap<HirId, Reg>,
     patches: &mut Vec<(usize, u8, HirId)>,
     switch_case_patches: &mut Vec<(u32, usize, HirId)>,
 ) -> Result<(), InterpError> {
