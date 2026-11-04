@@ -485,6 +485,10 @@ pub struct ParamAttributes {
     pub noalias: bool,
     pub nonnull: bool,
     pub readonly: bool,
+    /// Valid accesses through this pointer stay within allocated storage,
+    /// disjoint from static global storage. Other pointers may still alias it.
+    #[serde(default)]
+    pub allocation_backed: bool,
     /// Runtime symbol that releases an owned value carried by this
     /// parameter when its HIR type does not encode that policy. OSR uses
     /// this for opaque scalar handles.

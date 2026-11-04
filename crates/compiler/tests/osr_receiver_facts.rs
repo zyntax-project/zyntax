@@ -89,6 +89,11 @@ fn allocation_fact_survives_a_loop_phi_and_outlining_without_noalias() {
     .unwrap();
     assert!(outlined.function.signature.params[index].attributes.nonnull);
     assert!(
+        outlined.function.signature.params[index]
+            .attributes
+            .allocation_backed
+    );
+    assert!(
         outlined
             .function
             .signature
@@ -127,6 +132,11 @@ fn a_nullable_backedge_does_not_inherit_the_initial_allocation_fact() {
     )
     .unwrap();
     assert!(!outlined.function.signature.params[index].attributes.nonnull);
+    assert!(
+        !outlined.function.signature.params[index]
+            .attributes
+            .allocation_backed
+    );
     let mut module = HirModule::new(InternedString::new_global("facts"));
     let id = outlined.function.id;
     module.functions.insert(id, outlined.function);
@@ -135,4 +145,78 @@ fn a_nullable_backedge_does_not_inherit_the_initial_allocation_fact() {
         module.functions[&id].values[&checked].kind,
         HirValueKind::Instruction
     ));
+}
+
+#[test]
+fn a_narrow_pointer_encoding_carries_neither_nonnull_nor_allocation_provenance() {
+    let (mut f, header, current, _, _) = fixture(false);
+    let entry = f.entry_block;
+    let initial = f.blocks[&header].phis.last().unwrap().incoming[0].0;
+    let truncated = f.create_value(HirType::I8, HirValueKind::Instruction);
+    let recovered = f.create_value(pointer(), HirValueKind::Instruction);
+    f.blocks.get_mut(&entry).unwrap().instructions.extend([
+        HirInstruction::Cast {
+            result: truncated,
+            operand: initial,
+            op: CastOp::PtrToInt,
+            ty: HirType::I8,
+        },
+        HirInstruction::Cast {
+            result: recovered,
+            operand: truncated,
+            op: CastOp::IntToPtr,
+            ty: pointer(),
+        },
+    ]);
+    f.blocks
+        .get_mut(&header)
+        .unwrap()
+        .phis
+        .last_mut()
+        .unwrap()
+        .incoming[0]
+        .0 = recovered;
+    let layout = osr::osr_layout(&f, header).unwrap();
+    let index = layout
+        .live_ins
+        .iter()
+        .position(|id| *id == current)
+        .unwrap();
+    let outlined = osr::outline(
+        &f,
+        &layout,
+        HirId::new(),
+        InternedString::new_global("narrow"),
+    )
+    .unwrap();
+    let attrs = &outlined.function.signature.params[index].attributes;
+    assert!(!attrs.allocation_backed);
+    assert!(!attrs.nonnull);
+}
+
+#[test]
+fn allocated_live_ins_may_alias_each_other() {
+    let (mut f, header, _, _, _) = fixture(true);
+    f.signature.params[1].attributes.allocation_backed = true;
+    let layout = osr::osr_layout(&f, header).unwrap();
+    let outlined = osr::outline(
+        &f,
+        &layout,
+        HirId::new(),
+        InternedString::new_global("aliased"),
+    )
+    .unwrap();
+    let pointers: Vec<_> = outlined
+        .function
+        .signature
+        .params
+        .iter()
+        .filter(|p| matches!(p.ty, HirType::Ptr(_)))
+        .collect();
+    assert_eq!(pointers.len(), 2);
+    assert!(
+        pointers
+            .iter()
+            .all(|p| p.attributes.allocation_backed && !p.attributes.noalias)
+    );
 }

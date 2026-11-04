@@ -198,9 +198,15 @@ impl ZyntaxCraneliftBackend {
             layout.loop_ordinal
         ));
         let nonnull = crate::sign_fold::inferred_nonnull_callees(&def.module);
-        let Some(mut outlined) =
-            crate::osr::outline_with_nonnull(&def.function, &layout, region_id, name, &nonnull)
-        else {
+        let allocated = crate::allocation_provenance::returning_functions(&def.module);
+        let Some(mut outlined) = crate::osr::outline_with_facts(
+            &def.function,
+            &layout,
+            region_id,
+            name,
+            &nonnull,
+            &allocated,
+        ) else {
             return None;
         };
         // `ZYNTAX_DUMP_HIR_DIR` gets the region before and after its

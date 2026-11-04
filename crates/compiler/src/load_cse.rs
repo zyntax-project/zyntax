@@ -52,6 +52,7 @@ struct Addresses<'a> {
     function: &'a HirFunction,
     defs: HashMap<HirId, &'a HirInstruction>,
     cache: HashMap<HirId, Option<Address>>,
+    allocated_params: IdHashSet<HirId>,
 }
 
 impl Addresses<'_> {
@@ -78,6 +79,13 @@ impl Addresses<'_> {
                 })
                 .collect(),
             cache: HashMap::default(),
+            allocated_params: function
+                .signature
+                .params
+                .iter()
+                .filter(|p| p.attributes.allocation_backed && matches!(p.ty, HirType::Ptr(_)))
+                .map(|p| p.id)
+                .collect(),
         }
     }
 
@@ -112,18 +120,19 @@ impl Addresses<'_> {
             )
         };
         let fresh = |id| {
-            matches!(
-                self.defs.get(&id),
-                Some(
-                    HirInstruction::Alloca { .. }
-                        | HirInstruction::Call {
-                            callee: crate::hir::HirCallable::Intrinsic(
-                                crate::hir::Intrinsic::Malloc
-                            ),
-                            ..
-                        }
+            self.allocated_params.contains(&id)
+                || matches!(
+                    self.defs.get(&id),
+                    Some(
+                        HirInstruction::Alloca { .. }
+                            | HirInstruction::Call {
+                                callee: crate::hir::HirCallable::Intrinsic(
+                                    crate::hir::Intrinsic::Malloc
+                                ),
+                                ..
+                            }
+                    )
                 )
-            )
         };
         (global(a.root) && fresh(b.root)) || (fresh(a.root) && global(b.root))
     }

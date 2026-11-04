@@ -1218,21 +1218,23 @@ pub fn outline(
     region_id: HirId,
     region_name: zyntax_typed_ast::InternedString,
 ) -> Option<Outlined> {
-    outline_with_nonnull(
+    outline_with_facts(
         function,
         layout,
         region_id,
         region_name,
         &Default::default(),
+        &Default::default(),
     )
 }
 
-pub(crate) fn outline_with_nonnull(
+pub(crate) fn outline_with_facts(
     function: &HirFunction,
     layout: &OsrLayout,
     region_id: HirId,
     region_name: zyntax_typed_ast::InternedString,
     nonnull_callees: &crate::hir::IdHashSet<HirId>,
+    allocation_callees: &crate::hir::IdHashSet<HirId>,
 ) -> Option<Outlined> {
     #[cfg(feature = "allocation-audit")]
     let _allocations = crate::allocation_audit::Scope::enter(crate::allocation_audit::Phase::Osr);
@@ -1240,6 +1242,7 @@ pub(crate) fn outline_with_nonnull(
         HirBlock, HirFunctionSignature, HirInstruction, HirParam, HirPhi, HirValue, HirValueKind,
     };
     let nonzero = crate::sign_fold::non_zero(function, nonnull_callees);
+    let allocated = crate::allocation_provenance::values(function, allocation_callees);
     let resumed = resumable_body(function, layout);
     let reachable = reachable_from(&resumed, layout.header);
     let in_region: IdSet = reachable.iter().copied().collect();
@@ -1279,6 +1282,7 @@ pub(crate) fn outline_with_nonnull(
         );
         let mut attributes = crate::hir::ParamAttributes::default();
         attributes.nonnull = matches!(ty, HirType::Ptr(_)) && nonzero.contains(id);
+        attributes.allocation_backed = matches!(ty, HirType::Ptr(_)) && allocated.contains(id);
         attributes.release_symbol = live_in_release_symbol(function, *id);
         params.push(HirParam {
             id: param_id,

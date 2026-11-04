@@ -30,6 +30,7 @@ pub mod aggregate_split; // Replace struct round-trips with direct field Load/St
 pub mod alloca_promote; // Alloca → Malloc promotion for escaping allocations (pairs with drop_insert)
 #[cfg(feature = "allocation-audit")]
 pub mod allocation_audit;
+pub mod allocation_provenance; // Allocated storage remains distinct from static globals
 pub mod analysis;
 pub mod associated_type_resolver; // Associated type resolution for trait dispatch
 pub mod async_support;

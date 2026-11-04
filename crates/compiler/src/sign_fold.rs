@@ -215,7 +215,7 @@ fn run_function(func: &mut HirFunction, nonnull: &HashSet<HirId>) -> SignFoldSta
 /// is, which carries the fact around loops without guessing about a
 /// parameter or load.
 pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<HirId> {
-    use crate::hir::{CastOp, Intrinsic};
+    use crate::hir::Intrinsic;
 
     let constant = |id: &HirId| {
         matches!(
@@ -257,10 +257,11 @@ pub(crate) fn non_zero(func: &HirFunction, nonnull: &HashSet<HirId>) -> HashSet<
                     ..
                 } => nonnull.contains(callee),
                 HirInstruction::Cast {
-                    op: CastOp::PtrToInt | CastOp::IntToPtr | CastOp::Bitcast,
-                    ..
-                }
-                | HirInstruction::Select { .. } => true,
+                    operand, op, ty, ..
+                } => func.values.get(operand).is_some_and(|v| {
+                    crate::allocation_provenance::preserves_address(*op, &v.ty, ty)
+                }),
+                HirInstruction::Select { .. } => true,
                 _ => false,
             };
             if kept && start(&result) {
