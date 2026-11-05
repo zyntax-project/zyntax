@@ -2743,7 +2743,7 @@ fn analyze_site(
     facts: &ModuleFacts,
     users: &Users,
 ) -> SiteOutcome {
-    // Walk every block, every instruction, every terminator, and
+    // Walk indexed instruction uses and every terminator, and
     // for each use of `site.result`:
     //   - record the (block, idx) location and the use *kind*
     //   - bail to `Escaped` immediately on any escape-classified use
@@ -2789,8 +2789,13 @@ fn analyze_site(
         return SiteOutcome::MultiBlock;
     }
 
-    for (block_id, block) in &func.blocks {
-        for (idx, inst) in block.instructions.iter().enumerate() {
+    let mut uses = users
+        .instruction_uses(func, &derived)
+        .into_iter()
+        .peekable();
+    for (block_pos, (block_id, block)) in func.blocks.iter().enumerate() {
+        while let Some((_, idx)) = uses.next_if(|(pos, _)| *pos == block_pos) {
+            let inst = &block.instructions[idx];
             // Skip the malloc instruction itself.
             if *block_id == site.block && idx == site.inst_idx {
                 continue;
@@ -2898,6 +2903,28 @@ pub(crate) struct Users {
 }
 
 impl Users {
+    /// Instruction positions in block insertion order, with alias uses
+    /// deduplicated so classification preserves the full scan's order.
+    fn instruction_uses(
+        &self,
+        func: &HirFunction,
+        values: &IdSet,
+    ) -> smallvec::SmallVec<[(usize, usize); 8]> {
+        let mut positions = smallvec::SmallVec::<[(usize, usize); 8]>::new();
+        for value in values {
+            if let Some(uses) = self.by_value.get(value) {
+                for &(block, idx) in uses {
+                    if let Some(pos) = func.blocks.get_index_of(&block) {
+                        positions.push((pos, idx));
+                    }
+                }
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
+
     pub(crate) fn of(func: &HirFunction) -> Self {
         let mut by_value: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::default();
         let mut phi_users: HashMap<HirId, Vec<(HirId, usize)>> = HashMap::default();
@@ -3448,6 +3475,7 @@ fn release_instructions(
 #[cfg(test)]
 mod tests {
     mod gc_policy;
+    mod indexed_uses;
     use super::*;
     use crate::hir::{
         HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirInstruction, HirModule,
