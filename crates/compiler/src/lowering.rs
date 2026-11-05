@@ -220,6 +220,9 @@ pub struct LoweringContext {
     /// The string-literal global holding each text the module's own
     /// lowered bodies spell, one per text.
     string_literals: std::collections::HashMap<InternedString, HirId>,
+    /// Resolved named globals shared by SSA builders. Private literal globals
+    /// do not change name resolution; named declarations invalidate this table.
+    ssa_globals: Option<Arc<crate::ssa::ModuleGlobals>>,
     /// Bodies to lower, when lowering is skipping what nothing reaches.
     ///
     /// `None` lowers everything, which is what happens when no entry
@@ -597,6 +600,7 @@ impl LoweringContext {
                 ..HirModule::new(module_name)
             },
             string_literals: std::collections::HashMap::new(),
+            ssa_globals: None,
             wanted: None,
             lowered_fns: std::collections::HashSet::new(),
             skipped_at: std::collections::HashMap::new(),
@@ -1041,6 +1045,7 @@ impl LoweringContext {
     /// the type. A global a linked module already declares is used as it
     /// is.
     fn declare_type_descriptors(&mut self) {
+        self.ssa_globals = None;
         use crate::object_header::{
             DescribedField, TypeDescriptor, descriptor_name, field_layout, has_header,
             header_field, qualified_name,
@@ -1210,6 +1215,7 @@ impl PhaseTimer {
 
 impl AstLowering for LoweringContext {
     fn lower_program(&mut self, program: &mut TypedProgram) -> CompilerResult<HirModule> {
+        self.ssa_globals = None;
         crate::module_init::prepare(program);
         if self.config.closed || !self.config.entry_names.is_empty() {
             self.config
@@ -5305,30 +5311,34 @@ impl LoweringContext {
         }
     }
 
-    /// Lower a global variable
-    /// The module's globals by name, with their ids and types.
-    fn module_globals(&self) -> indexmap::IndexMap<InternedString, (crate::hir::HirId, HirType)> {
-        self.symbols
-            .globals
-            .iter()
-            .filter_map(|(name, id)| {
-                // A linked global is where the module is going, not in it.
-                let global = self.module.globals.get(id).or_else(|| {
-                    self.config
-                        .prelowered
-                        .iter()
-                        .find_map(|m| m.stripped().globals.get(id))
-                })?;
-                let ty = global.ty.clone();
-                Some((*name, (*id, ty)))
-            })
-            .collect()
+    /// The module's globals by name, with their ids and types. Literal globals
+    /// added while lowering bodies are private and never enter this table.
+    fn module_globals(&mut self) -> Arc<crate::ssa::ModuleGlobals> {
+        Arc::clone(self.ssa_globals.get_or_insert_with(|| {
+            Arc::new(
+                self.symbols
+                    .globals
+                    .iter()
+                    .filter_map(|(name, id)| {
+                        // A linked global is where the module is going, not in it.
+                        let global = self.module.globals.get(id).or_else(|| {
+                            self.config
+                                .prelowered
+                                .iter()
+                                .find_map(|m| m.stripped().globals.get(id))
+                        })?;
+                        Some((*name, (*id, global.ty.clone())))
+                    })
+                    .collect(),
+            )
+        }))
     }
 
     fn lower_global_variable(
         &mut self,
         var: &zyntax_typed_ast::TypedVariable,
     ) -> CompilerResult<()> {
+        self.ssa_globals = None;
         // A declaration explicitly exposes a prelowered global by name.
         if let Some(id) = self.prelowered.globals.get(&var.name).copied() {
             self.symbols.globals.insert(var.name, id);

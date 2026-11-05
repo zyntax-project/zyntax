@@ -617,3 +617,109 @@ fn configured_error_flag_marks_imported_state() {
         }
     }
 }
+
+#[test]
+fn repeated_global_reads_keep_linked_types_and_local_shadowing() {
+    use zyntax_compiler::hir::{HirConstant, HirGlobal, HirType, HirValueKind, Linkage};
+    use zyntax_typed_ast::TypedVariable;
+
+    let state = InternedString::new_global("state");
+    let id = HirId::new();
+    let mut source = library();
+    source.add_global(HirGlobal {
+        id,
+        name: state,
+        ty: HirType::I64,
+        initializer: Some(HirConstant::I64(17)),
+        is_const: false,
+        is_thread_local: false,
+        error_flag: false,
+        linkage: Linkage::External,
+        visibility: zyntax_compiler::hir::Visibility::Default,
+    });
+    let bytes = serialize_module(&source, Format::Split).unwrap();
+    let source = Arc::new(deserialize_module_lazy(bytes).unwrap());
+    // Split images relocate globals along with their functions.
+    let id = source
+        .stripped()
+        .globals
+        .values()
+        .find(|g| g.name == state)
+        .unwrap()
+        .id;
+    for linked in [false, true] {
+        let read = |name: &str, shadow| {
+            function(
+                InternedString::new_global(name),
+                if shadow {
+                    vec![TypedParameter {
+                        name: state,
+                        ty: i64_ty(),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                },
+                Some(TypedBlock {
+                    statements: vec![typed_node(
+                        TypedStatement::Return(Some(Box::new(typed_node(
+                            TypedExpression::Variable(state),
+                            i64_ty(),
+                            SPAN,
+                        )))),
+                        Type::Primitive(PrimitiveType::Unit),
+                        SPAN,
+                    )],
+                    span: SPAN,
+                }),
+                None,
+            )
+        };
+        let mut program = program(vec![
+            TypedDeclaration::Variable(TypedVariable {
+                name: state,
+                ty: i64_ty(),
+                mutability: Mutability::Mutable,
+                initializer: None,
+                visibility: Visibility::Public,
+            }),
+            read("first", false),
+            read("shadow", true),
+            read("last", false),
+        ]);
+        let module = lower(
+            "global_client",
+            &mut program,
+            LoweringConfig {
+                prelowered: vec![Arc::clone(&source)],
+                linked: Arc::new(if linked {
+                    [id].into_iter().collect()
+                } else {
+                    Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(module.globals.contains_key(&id), !linked);
+        for name in ["first", "shadow", "last"] {
+            let function = module
+                .functions
+                .values()
+                .find(|f| f.name.resolve_global().as_deref() == Some(name))
+                .unwrap();
+            let globals: Vec<_> = function
+                .values
+                .values()
+                .filter_map(|value| match value.kind {
+                    HirValueKind::Global(global) => Some(global),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                globals,
+                if name == "shadow" { vec![] } else { vec![id] },
+                "{name}, linked={linked}"
+            );
+        }
+    }
+}

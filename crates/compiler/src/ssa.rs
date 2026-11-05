@@ -308,6 +308,9 @@ impl TermIndex {
     }
 }
 
+/// Named module storage available to a function during SSA construction.
+pub type ModuleGlobals = IndexMap<InternedString, (HirId, HirType)>;
+
 pub struct SsaBuilder {
     /// Current function being built
     function: HirFunction,
@@ -386,7 +389,7 @@ pub struct SsaBuilder {
     stack_slots: IndexMap<InternedString, HirId>,
     /// Module globals by name, with the global's id and type. A name a
     /// `let` or parameter binds in this function shadows the global.
-    module_globals: IndexMap<InternedString, (HirId, HirType)>,
+    module_globals: Option<Arc<ModuleGlobals>>,
     /// Address values for the globals this function has touched.
     global_refs: IndexMap<InternedString, HirId>,
     /// The one undefined value of each scalar type, see `create_undef`.
@@ -845,7 +848,7 @@ impl SsaBuilder {
             original_return_type: None,
             address_taken_vars: IdHashSet::default(),
             stack_slots: IndexMap::new(),
-            module_globals: IndexMap::new(),
+            module_globals: None,
             global_refs: IndexMap::new(),
             shared_undefs: IdHashMap::default(),
             let_names: IdHashSet::default(),
@@ -908,7 +911,7 @@ impl SsaBuilder {
             original_return_type: None,
             address_taken_vars: IdHashSet::default(),
             stack_slots: IndexMap::new(),
-            module_globals: IndexMap::new(),
+            module_globals: None,
             global_refs: IndexMap::new(),
             shared_undefs: IdHashMap::default(),
             let_names: IdHashSet::default(),
@@ -1001,11 +1004,8 @@ impl SsaBuilder {
     /// of its own. The Call handler will not rewrite a call to one of
     /// them into a same-named built-in intrinsic.
     /// The module's global variables, for reads and writes by name.
-    pub fn with_module_globals(
-        mut self,
-        globals: IndexMap<InternedString, (HirId, HirType)>,
-    ) -> Self {
-        self.module_globals = globals;
+    pub fn with_module_globals(mut self, globals: impl Into<Arc<ModuleGlobals>>) -> Self {
+        self.module_globals = Some(globals.into());
         self
     }
 
@@ -8801,7 +8801,7 @@ impl SsaBuilder {
     /// The address and type of module global `name`, unless a binding
     /// in this function shadows it.
     fn global_slot(&mut self, name: InternedString) -> Option<(HirId, HirType)> {
-        let (global_id, ty) = self.module_globals.get(&name).cloned()?;
+        let (global_id, ty) = self.module_globals.as_ref()?.get(&name).cloned()?;
         if self.let_names.contains(&name)
             || self.var_types.contains_key(&name)
             || self
