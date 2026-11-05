@@ -249,11 +249,13 @@ pub fn run_module_with(module: &mut HirModule, cache: Option<&crate::OptCache>) 
     };
     let optimizing: Vec<HirId> = module.ids_to_optimize();
     let mut taken: Vec<(usize, HirId, HirFunction)> = Vec::with_capacity(optimizing.len());
-    for id in &optimizing {
+    // Remove from the end so each saved index is its original position.
+    for id in optimizing.iter().rev() {
         if let Some((index, _, f)) = module.functions.shift_remove_full(id) {
             taken.push((index, *id, f));
         }
     }
+    taken.reverse();
 
     // Each function's copy is kept from round to round until it is
     // inlined into, the only change a round makes to it.
@@ -339,7 +341,6 @@ pub fn run_module_with(module: &mut HirModule, cache: Option<&crate::OptCache>) 
 
     // Back in their places, lowest index first so each lands where the
     // ones before it left room.
-    taken.sort_by_key(|(index, _, _)| *index);
     for (index, id, f) in taken {
         let at = index.min(module.functions.len());
         module.functions.shift_insert(at, id, f);
