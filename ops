@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1793899651,"nonce":"H6qwyUDEYUJdcfwgRhVzpluzUy0=","message":"Landed in 6d9f9ba3dca76c5663b3b69db3c3e4269c4ea5b7. Closing the release-graph/liveness scaling slice; broader preparation costs and timing uncertainty remain under 1be184c.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1793899651,"nonce":"6xvRA758wW14u6Gu/L0HJcV8q94=","status":2}]}
