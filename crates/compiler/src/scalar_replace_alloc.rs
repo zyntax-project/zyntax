@@ -153,10 +153,8 @@ fn run_function(func: &mut HirFunction) -> ScalarReplaceAllocStats {
             _ => None,
         })
         .collect();
-    // Which blocks use each value, for the escape check; a rewrite
-    // substitutes loads with stored values, which can put a pointer in
-    // another block's hands, so the map is gathered again after one.
-    let mut uses = block_uses(func);
+    // Only candidates surviving local checks need a whole-function index.
+    let mut uses = None;
     for bid in block_ids {
         stats.combine(run_block(func, bid, &const_map, &mut uses));
     }
@@ -220,7 +218,7 @@ fn run_block(
     func: &mut HirFunction,
     bid: HirId,
     const_map: &HashMap<HirId, i64>,
-    uses: &mut BlockUses,
+    uses: &mut Option<BlockUses>,
 ) -> ScalarReplaceAllocStats {
     let mut stats = ScalarReplaceAllocStats::default();
     // collect_candidates returns malloc-result HirIds in document order.
@@ -240,7 +238,8 @@ fn run_block(
                     stats.mallocs_eliminated += mallocs;
                     stats.frees_eliminated += frees;
                     applied_one = true;
-                    *uses = block_uses(func);
+                    // Forwarding a load can introduce cross-block pointer uses.
+                    *uses = None;
                     // Restart sweep — block indices have shifted.
                     break;
                 }
@@ -331,7 +330,7 @@ fn build_candidate(
     bid: HirId,
     malloc_result: HirId,
     const_map: &HashMap<HirId, i64>,
-    uses: &BlockUses,
+    uses: &mut Option<BlockUses>,
 ) -> Option<Candidate> {
     let block = func.blocks.get(&bid)?;
 
@@ -639,15 +638,6 @@ fn build_candidate(
         }
     }
 
-    // Cross-block escape: any other block referencing a tracked id.
-    let used_elsewhere = |v: &HirId| {
-        uses.get(v)
-            .is_some_and(|blocks| blocks.iter().any(|b| *b != bid))
-    };
-    if tracked.iter().any(used_elsewhere) || encoded.iter().any(used_elsewhere) {
-        return None;
-    }
-
     // A field stored whole and read in parts would be read from the
     // wrong register.
     let mut spans: Vec<(u64, u64)> = accessed
@@ -665,6 +655,16 @@ fn build_candidate(
         if !field_ty.contains_key(off) {
             return None;
         }
+    }
+
+    // Cross-block escape: reuse the index until a rewrite invalidates it.
+    let uses = uses.get_or_insert_with(|| block_uses(func));
+    let used_elsewhere = |v: &HirId| {
+        uses.get(v)
+            .is_some_and(|blocks| blocks.iter().any(|b| *b != bid))
+    };
+    if tracked.iter().any(used_elsewhere) || encoded.iter().any(used_elsewhere) {
+        return None;
     }
 
     Some(Candidate {

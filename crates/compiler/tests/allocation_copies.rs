@@ -11,6 +11,7 @@ use zyntax_typed_ast::InternedString;
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+static AUDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn constant_function(name: &str, instructions: usize) -> HirFunction {
     let mut f = HirFunction::new(
@@ -78,6 +79,7 @@ fn rejected_inlining_and_borrowed_reads_do_not_clone_bodies() {
 
 #[test]
 fn scalarization_without_allocations_builds_no_indexes() {
+    let _lock = AUDIT_LOCK.lock().unwrap();
     use zyntax_compiler::hir::{CastOp, HirPhi};
     let mut f = constant_function("scalar_arithmetic", 1000);
     let entry = f.entry_block;
@@ -121,4 +123,68 @@ fn scalarization_without_allocations_builds_no_indexes() {
     assert_eq!(after.allocations, before.allocations);
     assert_eq!(after.reallocations, before.reallocations);
     assert_eq!(bincode::serialize(&module).unwrap(), original);
+}
+
+#[test]
+fn locally_escaping_allocations_do_not_index_the_rest_of_the_function() {
+    use zyntax_compiler::hir::{HirCallable, Intrinsic};
+    let _lock = AUDIT_LOCK.lock().unwrap();
+    let measure = |instructions| {
+        let mut f = constant_function("escaping_allocation", instructions);
+        let entry = f.entry_block;
+        let exit = f.create_block();
+        let arithmetic = std::mem::take(&mut f.blocks[&entry].instructions);
+        f.blocks[&exit].instructions = arithmetic;
+        f.blocks[&exit].terminator = f.blocks[&entry].terminator.clone();
+        f.blocks[&entry].terminator = HirTerminator::Branch { target: exit };
+        let size = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(8)));
+        let ptr = f.create_value(
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        for (result, callee, args) in [
+            (
+                Some(ptr),
+                HirCallable::Intrinsic(Intrinsic::Malloc),
+                vec![size],
+            ),
+            (None, HirCallable::Symbol("observe".into()), vec![ptr]),
+            (None, HirCallable::Intrinsic(Intrinsic::Free), vec![ptr]),
+        ] {
+            f.blocks[&entry].instructions.push(HirInstruction::Call {
+                result,
+                callee,
+                args,
+                type_args: vec![],
+                const_args: vec![],
+                is_tail: false,
+            });
+        }
+        f.rebuild_cfg_edges();
+        let mut module = HirModule::new(InternedString::new_global("escape_audit"));
+        module.functions.insert(f.id, f);
+        let original = bincode::serialize(&module).unwrap();
+        let before = for_phase(Phase::Optimize);
+        let stats = {
+            let _scope = Scope::enter(Phase::Optimize);
+            zyntax_compiler::scalar_replace_alloc::run_module(&mut module)
+        };
+        let after = for_phase(Phase::Optimize);
+        assert_eq!(stats.candidates_examined, 1);
+        assert_eq!(stats.escapes_skipped, 1);
+        assert_eq!(stats.mallocs_eliminated, 0);
+        assert_eq!(bincode::serialize(&module).unwrap(), original);
+        (
+            after.allocations - before.allocations,
+            after.reallocations - before.reallocations,
+            after.requested_bytes - before.requested_bytes,
+        )
+    };
+    let small = measure(1);
+    let large = measure(1000);
+    eprintln!("local escape audit: small={small:?}, large={large:?}");
+    assert_eq!(
+        small, large,
+        "unrelated uses must not grow analysis storage"
+    );
 }
