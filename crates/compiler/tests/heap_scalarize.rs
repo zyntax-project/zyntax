@@ -261,6 +261,17 @@ fn carries_initialized_fields_and_releases_without_allocating() {
         check(fixture(n, false).f, 7 + n * 3, 2);
     }
 }
+
+#[test]
+fn block_local_scalarization_still_checks_uses_in_allocation_free_blocks() {
+    let mut m = module(fixture(20, false).f);
+    let original = bincode::serialize(&m).unwrap();
+    let stats = zyntax_compiler::scalar_replace_alloc::run_module(&mut m);
+    assert_eq!(stats.candidates_examined, 2);
+    assert_eq!(stats.escapes_skipped, 2);
+    assert_eq!(stats.mallocs_eliminated, 0);
+    assert_eq!(bincode::serialize(&m).unwrap(), original);
+}
 #[test]
 fn retains_null_tests_on_zero_and_nonzero_iteration_paths() {
     for n in [0, 1, 20] {

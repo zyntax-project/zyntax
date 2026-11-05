@@ -127,6 +127,21 @@ pub fn run_module(module: &mut HirModule) -> ScalarReplaceAllocStats {
 
 fn run_function(func: &mut HirFunction) -> ScalarReplaceAllocStats {
     let mut stats = ScalarReplaceAllocStats::default();
+    // Rewrites remove allocations but never introduce them in other blocks.
+    let block_ids: Vec<_> = func
+        .blocks
+        .iter()
+        .filter(|(_, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| allocation_result(inst).is_some())
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if block_ids.is_empty() {
+        return stats;
+    }
     // The integer constants, for GEP indices: gathered once, since a
     // function has as many candidates as allocations and every value
     // is a constant to look at. A rewrite adds no constants.
@@ -142,7 +157,6 @@ fn run_function(func: &mut HirFunction) -> ScalarReplaceAllocStats {
     // substitutes loads with stored values, which can put a pointer in
     // another block's hands, so the map is gathered again after one.
     let mut uses = block_uses(func);
-    let block_ids: Vec<HirId> = func.blocks.keys().copied().collect();
     for bid in block_ids {
         stats.combine(run_block(func, bid, &const_map, &mut uses));
     }
@@ -248,18 +262,24 @@ fn collect_candidates(func: &HirFunction, bid: HirId) -> Vec<HirId> {
         Some(b) => b,
         None => return Vec::new(),
     };
-    let mut out = Vec::new();
-    for inst in &block.instructions {
-        if let HirInstruction::Call {
-            result: Some(r),
-            callee: HirCallable::Intrinsic(Intrinsic::Malloc),
-            ..
-        } = inst
-        {
-            out.push(*r);
-        }
+    block
+        .instructions
+        .iter()
+        .filter_map(allocation_result)
+        .collect()
+}
+
+fn allocation_result(inst: &HirInstruction) -> Option<HirId> {
+    if let HirInstruction::Call {
+        result: Some(result),
+        callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+        ..
+    } = inst
+    {
+        Some(*result)
+    } else {
+        None
     }
-    out
 }
 
 /// All the per-candidate state we need to rewrite the block.

@@ -55,6 +55,9 @@ pub fn run_module(module: &mut HirModule) -> usize {
 pub fn run_function(f: &mut HirFunction) -> usize {
     let mut eliminated = 0;
     let mut index = WebIndex::new(f);
+    if index.allocs.is_empty() {
+        return 0;
+    }
     // Webs grow from the phis that carry objects and from allocations no
     // phi carries.
     let mut seeds: Vec<_> = f
@@ -110,6 +113,38 @@ struct WebIndex {
 
 impl WebIndex {
     fn new(f: &HirFunction) -> Self {
+        let mut index = Self {
+            phis: HashMap::default(),
+            users: HashMap::default(),
+            allocs: HashMap::default(),
+        };
+        for (bid, block) in &f.blocks {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if let HirInstruction::Call {
+                    result: Some(r),
+                    callee: HirCallable::Intrinsic(Intrinsic::Malloc),
+                    args,
+                    ..
+                } = inst
+                {
+                    if let Some(size) = args.first().and_then(|v| integer(f, *v)).filter(|s| *s > 0)
+                    {
+                        index.allocs.insert(
+                            *r,
+                            Root::Alloc {
+                                block: *bid,
+                                index: i,
+                                size: size as u64,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // Every scalarizable web needs a local fixed-size allocation root.
+        if index.allocs.is_empty() {
+            return index;
+        }
         let casts: HashMap<_, _> = f
             .blocks
             .values()
@@ -159,12 +194,7 @@ impl WebIndex {
             }
             value
         };
-        let mut index = Self {
-            phis: HashMap::default(),
-            users: HashMap::default(),
-            allocs: HashMap::default(),
-        };
-        for (bid, block) in &f.blocks {
+        for block in f.blocks.values() {
             for phi in &block.phis {
                 index.phis.insert(
                     phi.result,
@@ -172,27 +202,6 @@ impl WebIndex {
                 );
                 for (v, _) in &phi.incoming {
                     index.users.entry(origin(*v)).or_default().push(phi.result);
-                }
-            }
-            for (i, inst) in block.instructions.iter().enumerate() {
-                if let HirInstruction::Call {
-                    result: Some(r),
-                    callee: HirCallable::Intrinsic(Intrinsic::Malloc),
-                    args,
-                    ..
-                } = inst
-                {
-                    if let Some(size) = args.first().and_then(|v| integer(f, *v)).filter(|s| *s > 0)
-                    {
-                        index.allocs.insert(
-                            *r,
-                            Root::Alloc {
-                                block: *bid,
-                                index: i,
-                                size: size as u64,
-                            },
-                        );
-                    }
                 }
             }
         }
