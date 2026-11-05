@@ -895,9 +895,8 @@ fn compile_workers() -> usize {
 /// Work for the warm-up threads while they have none of their own: an
 /// interpreted loop that asked for its resume points comes first (it is
 /// running, slowly, until they land), a function whose calls crossed
-/// the baseline threshold next. A request made while every thread is in
-/// a job would wait behind one, so the asking thread does that one
-/// itself; the planned order of everything else fills the gaps.
+/// the baseline threshold next. Busy workers leave requests queued while
+/// the interpreter continues executing.
 struct CompileQueue {
     /// Interpreted frames' requests, each with the OSR site it waits at.
     promote: Mutex<std::collections::VecDeque<(u64, u64, bool)>>,
@@ -918,9 +917,7 @@ struct CompileQueue {
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// The workers draining the queue.
     workers: std::sync::atomic::AtomicUsize,
-    /// How many of them are in no job. A request made while none is
-    /// would wait behind a job; the asking thread does the work itself
-    /// then, as it did before there were workers.
+    /// Idle workers available for OSR requests and scratch reclamation.
     idle_workers: std::sync::atomic::AtomicUsize,
 }
 
@@ -954,9 +951,14 @@ impl CompileQueue {
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Whether a worker would take a request now.
+    /// Whether a worker would take an OSR request now.
     fn idle(&self) -> bool {
         self.idle_workers.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
+    /// Whether a worker can eventually take a request, including busy ones.
+    fn has_workers(&self) -> bool {
+        self.workers.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     /// A worker starts on the requests waiting.
@@ -982,9 +984,17 @@ impl CompileQueue {
         promote && self.compile.lock().unwrap().is_empty()
     }
 
-    /// Whether a compile of `bead_id` was asked for already.
-    fn is_queued(&self, bead_id: u64) -> bool {
-        self.queued.lock().unwrap().contains(&bead_id)
+    /// Keep interpreted calls running while workers prepare their native entry.
+    /// False permits synchronous compilation only when no worker exists.
+    fn request_hot_call(&self, bead_id: u64, count: u32) -> bool {
+        if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        if !self.has_workers() {
+            return false;
+        }
+        self.request_compile(bead_id, Some(count));
+        true
     }
 
     fn request_compile(&self, bead_id: u64, count: Option<u32>) {
@@ -6004,19 +6014,13 @@ impl BindingParts {
                     counter.store(count, std::sync::atomic::Ordering::Relaxed);
                 }
                 if count >= threshold {
-                    // Hot: queued already, so its code is on the way and
-                    // the call runs interpreted meanwhile; else asked of
-                    // the worker if it is free, else compiled here.
-                    match &queue {
-                        Some(queue) if queue.is_queued(ctx.bead_id) => {}
-                        Some(queue) if queue.idle() => {
-                            queue.request_compile(ctx.bead_id, Some(count))
-                        }
-                        _ => {
-                            let code = osr::try_lazy_compile(ctx.bead_id);
-                            if !code.is_null() {
-                                return Some(code);
-                            }
+                    if !queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.request_hot_call(ctx.bead_id, count))
+                    {
+                        let code = osr::try_lazy_compile(ctx.bead_id);
+                        if !code.is_null() {
+                            return Some(code);
                         }
                     }
                 } else if count >= warm
@@ -6025,7 +6029,7 @@ impl BindingParts {
                     // Warm: asked of the worker now, whatever it is doing,
                     // so the code is there by the time the threshold
                     // comes; nobody waits on this one.
-                    queue.request_compile(ctx.bead_id, Some(count));
+                    queue.request_hot_call(ctx.bead_id, count);
                 }
                 return None;
             }
@@ -6731,6 +6735,10 @@ fn remap_body(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tiered_backend/queue_tests.rs"]
+mod queue_tests;
 
 #[cfg(test)]
 mod tests {
