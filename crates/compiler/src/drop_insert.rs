@@ -56,6 +56,9 @@
 //! * Storage handed to an owning parameter is the callee's; a callee
 //!   that stores or returns its parameter must say so with `Owned`.
 
+mod liveness;
+use liveness::{ReleaseGraph, drop_points, drop_points_transferring_with_uses};
+
 use crate::hir::IdHashMap as HashMap;
 
 /// Sets of ids: the pass spends its time asking whether a value is one
@@ -1024,7 +1027,8 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         .collect();
     let mut inserted = 0;
     for (block_id, phi_result, release) in owned_phis {
-        let derived = derived_values_local(func, phi_result, facts);
+        let users = Users::of(func);
+        let derived = derived_values_using(func, phi_result, false, Some(facts), &users);
         // Leaving a block along an edge into an owning phi hands the
         // value on.
         let transfer_out: IdSet = func
@@ -1077,6 +1081,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
             facts,
             &transfer_out,
             &implicit_uses,
+            &users,
         ) {
             inserted += apply_points(func, points, phi_result, release);
         }
@@ -1424,19 +1429,6 @@ fn phis_using(func: &HirFunction, value: HirId) -> Vec<HirId> {
     for block in func.blocks.values() {
         for phi in &block.phis {
             if phi.incoming.iter().any(|(v, _)| *v == value) {
-                out.push(phi.result);
-            }
-        }
-    }
-    out
-}
-
-/// The phis that read any of `values` on some edge.
-fn phis_using_any(func: &HirFunction, values: &IdSet) -> Vec<HirId> {
-    let mut out = Vec::new();
-    for block in func.blocks.values() {
-        for phi in &block.phis {
-            if phi.incoming.iter().any(|(v, _)| values.contains(v)) {
                 out.push(phi.result);
             }
         }
@@ -2544,192 +2536,6 @@ fn collect_malloc_sites(func: &HirFunction) -> Vec<MallocSite> {
     sites
 }
 
-/// Where an allocation dies, when it outlives the block it was made in.
-///
-/// A value is live at a point when some use is still ahead of it. Read
-/// backwards: a block's exit is live if any successor's entry is, and a
-/// block's entry is live if it uses the value or its own exit is. The
-/// definition kills it, so nothing above the allocation is ever called
-/// live and a loop's back edge cannot carry a claim into the iteration
-/// that made it.
-///
-/// The release goes wherever the value is live and no successor keeps
-/// it so. That is one point for a value dying at the end of a loop
-/// body, and one per arm for a value dying inside a branch.
-///
-/// Returns `None` where no such point exists, which is a value that is
-/// live on every exit and so is not this function's to release.
-fn drop_points(
-    func: &HirFunction,
-    site: &MallocSite,
-    derived: &IdSet,
-    facts: &ModuleFacts,
-) -> Option<Vec<Point>> {
-    drop_points_transferring(func, site, derived, facts, &IdSet::default())
-}
-
-/// [`drop_points`] where leaving `transfer_out` blocks hands the storage
-/// to whoever owns it past the edge, a phi that releases it later: the
-/// value is live out of such a block whatever its successors do, so no
-/// release is placed in it.
-fn drop_points_transferring(
-    func: &HirFunction,
-    site: &MallocSite,
-    derived: &IdSet,
-    facts: &ModuleFacts,
-    transfer_out: &IdSet,
-) -> Option<Vec<Point>> {
-    drop_points_transferring_with_uses(func, site, derived, facts, transfer_out, &IdSet::default())
-}
-
-fn drop_points_transferring_with_uses(
-    func: &HirFunction,
-    site: &MallocSite,
-    derived: &IdSet,
-    facts: &ModuleFacts,
-    transfer_out: &IdSet,
-    implicit_uses: &IdSet,
-) -> Option<Vec<Point>> {
-    // Only blocks the entry can get to. An unreachable one has no
-    // bearing on where the value dies and its successors would drag
-    // liveness around the graph for nothing.
-    let mut reachable = IdSet::default();
-    let mut stack = vec![func.entry_block];
-    while let Some(b) = stack.pop() {
-        if !reachable.insert(b) {
-            continue;
-        }
-        if let Some(block) = func.blocks.get(&b) {
-            stack.extend(successors_of(block));
-        }
-    }
-
-    // What each block does with the value: the last instruction that
-    // uses it, and whether the terminator does.
-    let mut last_use: HashMap<HirId, usize> = HashMap::default();
-    let mut uses_block: IdSet = implicit_uses.clone();
-    for (block_id, block) in &func.blocks {
-        if !reachable.contains(block_id) {
-            continue;
-        }
-        for (idx, inst) in block.instructions.iter().enumerate() {
-            if *block_id == site.block && idx == site.inst_idx {
-                continue;
-            }
-            match classify_derived_use(inst, derived, facts) {
-                UseKind::Use => {
-                    uses_block.insert(*block_id);
-                    let e = last_use.entry(*block_id).or_insert(idx);
-                    *e = (*e).max(idx);
-                }
-                UseKind::Escape => {
-                    if trace_enabled() {
-                        eprintln!("[drop]   escapes through {inst:?}");
-                    }
-                    return None;
-                }
-                UseKind::None => {}
-            }
-        }
-        match derived
-            .iter()
-            .map(|d| classify_terminator_use(&block.terminator, *d))
-            .fold(UseKind::None, strongest)
-        {
-            UseKind::Use => {
-                uses_block.insert(*block_id);
-            }
-            UseKind::Escape => {
-                if trace_enabled() {
-                    eprintln!("[drop]   escapes through terminator {:?}", block.terminator);
-                }
-                return None;
-            }
-            UseKind::None => {}
-        }
-    }
-    if uses_block.is_empty() {
-        if trace_enabled() {
-            eprintln!("[drop]   no block reads it");
-        }
-        return None;
-    }
-
-    // live_in[B] = B uses it, or its exit is live. The block holding
-    // the allocation kills it: nothing before the call can be holding
-    // what the call has not produced.
-    let mut live_in: IdSet = IdSet::default();
-    let mut live_out: IdSet = IdSet::default();
-    loop {
-        let mut changed = false;
-        for (block_id, block) in &func.blocks {
-            if !reachable.contains(block_id) {
-                continue;
-            }
-            let out = transfer_out.contains(block_id)
-                || successors_of(block).iter().any(|sc| live_in.contains(sc));
-            if out && live_out.insert(*block_id) {
-                changed = true;
-            }
-            let inn = *block_id != site.block && (uses_block.contains(block_id) || out);
-            if inn && live_in.insert(*block_id) {
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Where it is live and nothing after it is: after the last use in a
-    // block no successor of which keeps it, and on each edge out of a
-    // block that keeps it into one that does not.
-    let mut points = Vec::new();
-    for (block_id, block) in &func.blocks {
-        if !reachable.contains(block_id) {
-            continue;
-        }
-        let holds = *block_id == site.block || live_in.contains(block_id);
-        if !holds {
-            continue;
-        }
-        if live_out.contains(block_id) {
-            // Handed on along a transfer edge, or read further on along
-            // some successor; the others end its life as they are taken.
-            if transfer_out.contains(block_id) {
-                continue;
-            }
-            for succ in successors_of(block) {
-                if !live_in.contains(&succ) && succ != site.block && reachable.contains(&succ) {
-                    points.push(Point::Edge(*block_id, succ));
-                }
-            }
-            continue;
-        }
-        if !uses_block.contains(block_id) && *block_id != site.block {
-            continue;
-        }
-        // After the last use, or ahead of a terminator that is the only
-        // thing using it. A terminator reads the address rather than
-        // what is at it, so releasing first is still the right order.
-        let at = match last_use.get(block_id) {
-            Some(idx) => idx + 1,
-            None if *block_id == site.block && !uses_block.contains(block_id) => {
-                if trace_enabled() {
-                    eprintln!("[drop]   its own block neither reads it nor passes it on");
-                }
-                return None;
-            }
-            None => block.instructions.len(),
-        };
-        points.push(Point::After(*block_id, at.saturating_sub(1)));
-    }
-    if points.is_empty() && trace_enabled() {
-        eprintln!("[drop]   live on every path out");
-    }
-    (!points.is_empty()).then_some(points)
-}
-
 /// A block's successors, read off its terminator rather than off the
 /// cached list, which a pass that rewrote control flow may not have
 /// kept up to date.
@@ -2767,7 +2573,7 @@ fn analyze_site(
     // it was never defined. Such storage is released through the phi
     // (`release_owned_phis`), never here, so this is decided before any
     // block's instructions are read.
-    let merged = phis_using_any(func, &derived);
+    let merged = users.phi_uses(func, &derived);
     if !merged.is_empty()
         || func
             .blocks
@@ -2807,7 +2613,7 @@ fn analyze_site(
                     if *block_id != site.block {
                         return match facts
                             .automatic_release
-                            .then(|| drop_points(func, site, &derived, facts))
+                            .then(|| drop_points(func, site, &derived, facts, users))
                             .flatten()
                         {
                             Some(points) => SiteOutcome::MultiBlockDrop { points },
@@ -2837,7 +2643,7 @@ fn analyze_site(
             UseKind::Use => {
                 return match facts
                     .automatic_release
-                    .then(|| drop_points(func, site, &derived, facts))
+                    .then(|| drop_points(func, site, &derived, facts, users))
                     .flatten()
                 {
                     Some(points) => SiteOutcome::MultiBlockDrop { points },
@@ -2875,13 +2681,6 @@ fn derived_values_in(func: &HirFunction, root: HirId, facts: &ModuleFacts) -> Id
     derived_values_with(func, root, true, Some(facts))
 }
 
-/// [`derived_values_in`] stopping at phis: the names for the storage on
-/// the paths where `root` itself is defined, which is where a release by
-/// its name is defined too.
-fn derived_values_local(func: &HirFunction, root: HirId, facts: &ModuleFacts) -> IdSet {
-    derived_values_with(func, root, false, Some(facts))
-}
-
 fn derived_values_with(
     func: &HirFunction,
     root: HirId,
@@ -2900,6 +2699,7 @@ pub(crate) struct Users {
     by_value: HashMap<HirId, Vec<(HirId, usize)>>,
     phi_users: HashMap<HirId, Vec<(HirId, usize)>>,
     instructions: usize,
+    flow: std::cell::OnceCell<ReleaseGraph>,
 }
 
 impl Users {
@@ -2910,9 +2710,24 @@ impl Users {
         func: &HirFunction,
         values: &IdSet,
     ) -> smallvec::SmallVec<[(usize, usize); 8]> {
+        Self::ordered_uses(func, values, &self.by_value)
+    }
+
+    fn phi_uses(&self, func: &HirFunction, values: &IdSet) -> Vec<HirId> {
+        Self::ordered_uses(func, values, &self.phi_users)
+            .into_iter()
+            .map(|(block, phi)| func.blocks.get_index(block).unwrap().1.phis[phi].result)
+            .collect()
+    }
+
+    fn ordered_uses(
+        func: &HirFunction,
+        values: &IdSet,
+        index: &HashMap<HirId, Vec<(HirId, usize)>>,
+    ) -> smallvec::SmallVec<[(usize, usize); 8]> {
         let mut positions = smallvec::SmallVec::<[(usize, usize); 8]>::new();
         for value in values {
-            if let Some(uses) = self.by_value.get(value) {
+            if let Some(uses) = index.get(value) {
                 for &(block, idx) in uses {
                     if let Some(pos) = func.blocks.get_index_of(&block) {
                         positions.push((pos, idx));
@@ -2950,6 +2765,7 @@ impl Users {
             by_value,
             phi_users,
             instructions,
+            flow: std::cell::OnceCell::new(),
         }
     }
 

@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn indexed_phi_uses_are_deduplicated_in_block_order() {
+    let (mut f, ptr) = build_alloc_store_load_return();
+    let entry = f.entry_block;
+    let join = f.create_block();
+    let ty = f.values[&ptr].ty.clone();
+    let other = add_inst_val(&mut f, ty.clone());
+    let first = add_inst_val(&mut f, ty.clone());
+    let second = add_inst_val(&mut f, ty.clone());
+    for (block, result) in [(entry, first), (join, second)] {
+        f.blocks[&block].phis.push(crate::hir::HirPhi {
+            result,
+            ty: ty.clone(),
+            incoming: vec![(ptr, entry), (other, join), (ptr, join)],
+        });
+    }
+    f.blocks.swap_indices(0, 1);
+    let users = Users::of(&f);
+    assert_eq!(
+        users.phi_uses(&f, &IdSet::from_iter([ptr, other])),
+        vec![second, first]
+    );
+    assert!(users.phi_uses(&f, &IdSet::from_iter([first])).is_empty());
+}
+
+#[test]
 fn indexed_alias_uses_preserve_block_order_and_indirect_callees() {
     let (mut f, ptr) = build_alloc_store_load_return();
     let entry = f.entry_block;
