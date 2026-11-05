@@ -133,3 +133,42 @@ fn forwarding_a_pointer_rechecks_its_new_cross_block_uses() {
     );
     assert_eq!(bincode::serialize(&module).unwrap(), original);
 }
+
+#[test]
+fn an_indirect_callee_in_another_block_keeps_the_allocation() {
+    let (mut module, id, pointee) = fixture();
+    let f = module.functions.get_mut(&id).unwrap();
+    let exit = match f.blocks[&f.entry_block].terminator {
+        HirTerminator::Branch { target } => target,
+        _ => unreachable!(),
+    };
+    let (result, alias) = match f.blocks[&exit].instructions[0] {
+        HirInstruction::Load { result, ptr, .. } => (result, ptr),
+        _ => unreachable!(),
+    };
+    // Analysis only: the synthetic callee observes the pointer without
+    // passing it as an argument. Its backing storage must remain live.
+    f.blocks[&exit].instructions = vec![HirInstruction::Call {
+        result: Some(result),
+        callee: HirCallable::Indirect(alias),
+        args: vec![],
+        type_args: vec![],
+        const_args: vec![],
+        is_tail: false,
+    }];
+    let stats = scalar_replace_alloc::run_module(&mut module);
+    assert_eq!(stats.mallocs_eliminated, 1);
+    let f = &module.functions[&id];
+    assert!(f.values.contains_key(&pointee));
+    assert!(
+        matches!(f.blocks[&exit].instructions[0], HirInstruction::Call {
+        callee: HirCallable::Indirect(target), ..
+    } if target == pointee)
+    );
+    let original = bincode::serialize(&module).unwrap();
+    assert_eq!(
+        scalar_replace_alloc::run_module(&mut module).mallocs_eliminated,
+        0
+    );
+    assert_eq!(bincode::serialize(&module).unwrap(), original);
+}

@@ -166,9 +166,8 @@ fn run_function(func: &mut HirFunction) -> ScalarReplaceAllocStats {
 type BlockUses = HashMap<HirId, smallvec::SmallVec<[HirId; 2]>>;
 
 fn block_uses(func: &HirFunction) -> BlockUses {
-    use crate::hir::HirTerminator;
     let mut uses: BlockUses = HashMap::default();
-    let mut note = |uses: &mut BlockUses, v: HirId, b: HirId| {
+    let mut note = |v: HirId, b: HirId| {
         let blocks = uses.entry(v).or_default();
         if !blocks.contains(&b) {
             blocks.push(b);
@@ -176,36 +175,12 @@ fn block_uses(func: &HirFunction) -> BlockUses {
     };
     for (&bid, blk) in &func.blocks {
         for inst in &blk.instructions {
-            for v in inst.operands() {
-                note(&mut uses, v, bid);
-            }
-            if let HirInstruction::Call {
-                callee: HirCallable::Indirect(v),
-                ..
-            } = inst
-            {
-                note(&mut uses, *v, bid);
-            }
+            inst.for_each_operand(|v| note(v, bid));
         }
-        match &blk.terminator {
-            HirTerminator::Return { values } => {
-                for v in values {
-                    note(&mut uses, *v, bid);
-                }
-            }
-            HirTerminator::CondBranch { condition, .. } => note(&mut uses, *condition, bid),
-            HirTerminator::Switch { value, .. } => note(&mut uses, *value, bid),
-            HirTerminator::Invoke { args, .. } => {
-                for v in args {
-                    note(&mut uses, *v, bid);
-                }
-            }
-            HirTerminator::PatternMatch { value, .. } => note(&mut uses, *value, bid),
-            HirTerminator::Branch { .. } | HirTerminator::Unreachable => {}
-        }
+        blk.terminator.for_each_operand(|v| note(v, bid));
         for phi in &blk.phis {
             for (v, _) in &phi.incoming {
-                note(&mut uses, *v, bid);
+                note(*v, bid);
             }
         }
     }
@@ -612,10 +587,8 @@ fn build_candidate(
                 // Any other instruction touching a tracked id is an
                 // escape (Return / IndirectCall / Atomic / CreateClosure
                 // / Async* / Throw / ExtractValue / InsertValue …).
-                let uses_tracked = other
-                    .operands()
-                    .iter()
-                    .any(|o| tracked.contains(o) || encoded.contains(o));
+                let uses_tracked =
+                    other.any_operand(|o| tracked.contains(&o) || encoded.contains(&o));
                 if uses_tracked {
                     return None;
                 }
@@ -853,15 +826,9 @@ fn type_of(func: &HirFunction, id: HirId) -> Option<HirType> {
 }
 
 fn term_uses_any(term: &crate::hir::HirTerminator, set: &HashSet<HirId>) -> bool {
-    use crate::hir::HirTerminator;
-    match term {
-        HirTerminator::Return { values } => values.iter().any(|v| set.contains(v)),
-        HirTerminator::CondBranch { condition, .. } => set.contains(condition),
-        HirTerminator::Switch { value, .. } => set.contains(value),
-        HirTerminator::Invoke { args, .. } => args.iter().any(|v| set.contains(v)),
-        HirTerminator::PatternMatch { value, .. } => set.contains(value),
-        HirTerminator::Branch { .. } | HirTerminator::Unreachable => false,
-    }
+    let mut found = false;
+    term.for_each_operand(|v| found = found || set.contains(&v));
+    found
 }
 
 // ─── tests ────────────────────────────────────────────────────────

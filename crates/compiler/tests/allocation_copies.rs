@@ -188,3 +188,72 @@ fn locally_escaping_allocations_do_not_index_the_rest_of_the_function() {
         "unrelated uses must not grow analysis storage"
     );
 }
+
+#[test]
+fn scalar_replacement_does_not_allocate_an_operand_vector_per_instruction() {
+    use zyntax_compiler::hir::{HirCallable, Intrinsic};
+    let _lock = AUDIT_LOCK.lock().unwrap();
+    let measure = |instructions| {
+        let mut f = constant_function("scalarized_allocation", instructions);
+        let entry = f.entry_block;
+        let size = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(8)));
+        let seven = f.create_value(HirType::I64, HirValueKind::Constant(HirConstant::I64(7)));
+        let ptr = f.create_value(
+            HirType::Ptr(std::sync::Arc::new(HirType::I64)),
+            HirValueKind::Instruction,
+        );
+        let loaded = f.create_value(HirType::I64, HirValueKind::Instruction);
+        let call = |result, intrinsic, args| HirInstruction::Call {
+            result,
+            callee: HirCallable::Intrinsic(intrinsic),
+            args,
+            type_args: vec![],
+            const_args: vec![],
+            is_tail: false,
+        };
+        f.blocks[&entry].instructions.extend([
+            call(Some(ptr), Intrinsic::Malloc, vec![size]),
+            HirInstruction::Store {
+                value: seven,
+                ptr,
+                align: 8,
+                volatile: false,
+            },
+            HirInstruction::Load {
+                result: loaded,
+                ptr,
+                ty: HirType::I64,
+                align: 8,
+                volatile: false,
+            },
+            call(None, Intrinsic::Free, vec![ptr]),
+        ]);
+        f.blocks[&entry].terminator = HirTerminator::Return {
+            values: vec![loaded],
+        };
+        let id = f.id;
+        let mut module = HirModule::new(InternedString::new_global("operand_audit"));
+        module.functions.insert(id, f);
+        let before = for_phase(Phase::Optimize);
+        let stats = {
+            let _scope = Scope::enter(Phase::Optimize);
+            zyntax_compiler::scalar_replace_alloc::run_module(&mut module)
+        };
+        let after = for_phase(Phase::Optimize);
+        assert_eq!(stats.mallocs_eliminated, 1);
+        assert_eq!(stats.frees_eliminated, 1);
+        assert!(matches!(&module.functions[&id].blocks[&entry].terminator,
+            HirTerminator::Return { values } if values == &[seven]));
+        (
+            after.allocations - before.allocations,
+            after.reallocations - before.reallocations,
+            after.requested_bytes - before.requested_bytes,
+        )
+    };
+    let small = measure(1);
+    let large = measure(1000);
+    eprintln!("operand traversal audit: small={small:?}, large={large:?}");
+    // Index growth can allocate, but visiting operands must not allocate
+    // for each instruction in either the local scan or the global index.
+    assert!(large.0 + large.1 <= small.0 + small.1 + 32);
+}
