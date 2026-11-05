@@ -317,6 +317,10 @@ pub fn register_runtime(
     runtime.set_automatic_release(true);
     runtime.set_error_flag_global(library::PENDING);
     runtime.set_collector(zyntax_embed::Collector::MarkSweep);
+    // Opt-in collector-owned plain storage; safe with the configured collector.
+    if std::env::var("ZYNTAX_GC_MANAGED_DROPS").as_deref() == Ok("1") {
+        runtime.set_gc_managed_drops(true)?;
+    }
     // Programs declare no effects or handlers, and lower the same
     // without the structural cleanup.
     runtime.set_pattern_rewrites(false);

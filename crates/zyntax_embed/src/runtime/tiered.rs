@@ -1356,6 +1356,25 @@ impl TieredRuntime {
         self.automatic_release = on;
     }
 
+    /// Defer plain storage releases to the configured collector when preparing
+    /// lazy interpreter and JIT bodies. Select before loading code. Snapshot
+    /// construction and already compiled cleanup keep their existing policy.
+    pub fn set_gc_managed_drops(&mut self, on: bool) -> RuntimeResult<()> {
+        use zyntax_compiler::drop_insert::DropPolicy;
+        if on && !self.collecting {
+            return Err(RuntimeError::Execution(
+                "collector-managed drops require a configured collector".into(),
+            ));
+        }
+        self.backend
+            .set_drop_policy(if on {
+                DropPolicy::CollectorOwned
+            } else {
+                DropPolicy::EarlyRelease
+            })
+            .map_err(|e| RuntimeError::Execution(e.to_string()))
+    }
+
     /// Name the global a language keeps its pending error in: null while
     /// none is pending. Lowered with `HirGlobal::error_flag` set, which
     /// promises that only stores, `sets_error_flag` functions and calls

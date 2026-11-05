@@ -23,6 +23,8 @@ use std::sync::Arc;
 use zyntax_compiler::hir::HirModule;
 
 mod cache;
+#[cfg(feature = "portable-code")]
+mod native_policy;
 #[cfg(not(target_arch = "wasm32"))]
 mod preparation;
 use cache::CachedInputs;
@@ -295,24 +297,10 @@ pub struct Snapshot {
     signature_indexes: Vec<std::sync::OnceLock<Result<(SignatureIndex, usize), String>>>,
 }
 
-/// Whether nothing in the environment changes how the runtime compiles,
-/// so machine code compiled ahead of time is what it would compile: no
-/// `ZYNTAX_*` variable is set but traces, dumps and worker settings.
+/// Whether the environment permits the snapshot's precompiled code.
 #[cfg(feature = "portable-code")]
 fn portable_code_allowed() -> bool {
-    std::env::vars_os().all(|(key, _)| {
-        let key = key.to_string_lossy();
-        !key.starts_with("ZYNTAX_")
-            || key.starts_with("ZYNTAX_TRACE_")
-            || key.starts_with("ZYNTAX_DUMP_")
-            || matches!(
-                key.as_ref(),
-                "ZYNTAX_COMPILE_WORKERS"
-                    | "ZYNTAX_DISABLE_WARM_UP"
-                    | "ZYNTAX_OPTIMIZE_QUIET_MS"
-                    | "ZYNTAX_PORTABLE_COMPILE_AT_LOAD"
-            )
-    })
+    std::env::vars_os().all(|(key, _)| native_policy::allows_key(&key.to_string_lossy()))
 }
 
 /// A statically linked plugin's symbols as the compiler takes them: name,

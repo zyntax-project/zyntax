@@ -734,6 +734,7 @@ impl Drop for ScratchUse<'_> {
 /// their facts, so the build covers the program's own.
 #[derive(Default)]
 struct Facts {
+    drop_policy: crate::drop_insert::DropPolicy,
     facts: Mutex<HashMap<usize, Arc<crate::drop_insert::ModuleFacts>>>,
     caches: Mutex<HashMap<usize, Arc<crate::OptCache>>>,
     /// The linked libraries' encoded bodies, which a scratch holds as
@@ -747,7 +748,8 @@ impl Facts {
         let mut built = self.facts.lock().unwrap();
         Arc::clone(built.entry(key).or_insert_with(|| {
             let started = web_time::Instant::now();
-            let facts = Arc::new(crate::drop_insert::facts_of(module));
+            let facts =
+                Arc::new(crate::drop_insert::facts_of(module).with_drop_policy(self.drop_policy));
             if std::env::var_os("ZYNTAX_TRACE_LAZY").is_some() {
                 eprintln!(
                     "[lazy] release facts built in {:.2} ms on {}",
@@ -1318,6 +1320,7 @@ struct RuntimeSymbol {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct TieredBackend {
+    drop_policy: crate::drop_insert::DropPolicy,
     /// Beadie's tiered adapter: owns broker threads + per-bead state.
     /// Shared so a promotion request raised from running JIT'd code can
     /// submit a compile without reaching back into the backend.
@@ -1520,6 +1523,7 @@ impl TieredBackend {
         lap("brokers");
 
         Ok(Self {
+            drop_policy: crate::drop_insert::DropPolicy::default(),
             adapter,
             cranelift,
             #[cfg(feature = "llvm-backend")]
@@ -2753,6 +2757,21 @@ impl TieredBackend {
         self.state_migration = policy;
     }
 
+    /// Select cleanup for lazy bodies before loading code. CollectorOwned
+    /// requires the host to collect pool storage throughout execution.
+    pub fn set_drop_policy(
+        &mut self,
+        policy: crate::drop_insert::DropPolicy,
+    ) -> CompilerResult<()> {
+        if !self.loaded.is_empty() || self.current_module.is_some() {
+            return Err(CompilerError::Backend(
+                "drop policy must be selected before loading code".into(),
+            ));
+        }
+        self.drop_policy = policy;
+        Ok(())
+    }
+
     /// Work out how to move a handler's live state from the running
     /// layout into the edited one. `None` when the shapes cannot be
     /// related — the caller then declines as it would without a policy.
@@ -3672,6 +3691,7 @@ impl TieredBackend {
         // inlines, and what the passes know about the module as a whole
         // is built once, since optimising a body changes none of it.
         let facts: Arc<Facts> = Arc::new(Facts {
+            drop_policy: self.drop_policy,
             encoded: body_sources.clone(),
             ..Facts::default()
         });

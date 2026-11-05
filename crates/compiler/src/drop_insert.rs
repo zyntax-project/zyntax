@@ -177,6 +177,23 @@ pub fn facts_of(module: &HirModule) -> ModuleFacts {
     ModuleFacts::build(module)
 }
 
+/// Whether the runtime reclaims storage that needs no destructor.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DropPolicy {
+    #[default]
+    EarlyRelease,
+    /// Requires a collector for pool allocations. Boxes, containers,
+    /// foreign values and type glue still use their release functions.
+    CollectorOwned,
+}
+
+impl DropPolicy {
+    fn needs_release(self, release: Release) -> bool {
+        self == Self::EarlyRelease
+            || !matches!(release, Release::Intrinsic | Release::Symbol(STRING_FREE))
+    }
+}
+
 /// Whether the release facts `func` carries stand for its body in
 /// `module`: when they do not, the module's facts are computed from the
 /// body, which a signature shell does not have.
@@ -300,6 +317,7 @@ pub fn run_module_with(module: &mut HirModule, facts: &ModuleFacts) -> DropStats
 /// What this pass knows about the other functions in the module.
 #[derive(Default)]
 pub struct ModuleFacts {
+    drop_policy: DropPolicy,
     /// See [`automatic_release_for`].
     automatic_release: bool,
     returns_owned: IdSet,
@@ -328,6 +346,13 @@ pub struct ModuleFacts {
 }
 
 impl ModuleFacts {
+    /// Select release placement without changing the ownership summaries.
+    /// Runtime policy is not recorded in snapshots' release facts.
+    pub fn with_drop_policy(mut self, policy: DropPolicy) -> Self {
+        self.drop_policy = policy;
+        self
+    }
+
     /// The facts of `module`. A function carrying facts recorded when
     /// its own module was optimised keeps them, and the fixed points run
     /// over the rest: what a stored library recorded holds for any
@@ -469,6 +494,7 @@ impl ModuleFacts {
             HashMap::default()
         };
         let mut facts = Self {
+            drop_policy: DropPolicy::EarlyRelease,
             automatic_release,
             returns_owned: IdSet::default(),
             string_makers,
@@ -729,6 +755,7 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
                 .or_insert_with(|| declared.unwrap_or_else(|| release_for(func, value.id, facts)));
         }
     }
+    sites.retain(|_, release| facts.drop_policy.needs_release(*release));
     if sites.is_empty() {
         return 0;
     }
@@ -779,6 +806,10 @@ fn release_owned_phis(func: &mut HirFunction, facts: &ModuleFacts) -> usize {
         .filter(|(p, block)| {
             (may_be_storage(&p.ty) || owned_flow.contains(&p.result))
                 && (facts.automatic_release || bodies.contains_key(block))
+                && (facts
+                    .drop_policy
+                    .needs_release(release_for(func, p.result, facts))
+                    || owned_flow.contains(&p.result))
         })
         .map(|(p, _)| p.result)
         .collect();
@@ -1945,7 +1976,12 @@ fn run_function(func: &mut HirFunction, facts: &ModuleFacts) -> DropStats {
     }
     let phases = std::env::var_os("ZYNTAX_TRACE_DROP_PHASES").is_some();
     let started = web_time::Instant::now();
-    let mallocs: Vec<MallocSite> = collect_owned_sites(func, facts);
+    let mut mallocs = collect_owned_sites(func, facts);
+    mallocs.retain(|site| facts.drop_policy.needs_release(site.release));
+    if mallocs.is_empty() {
+        stats.frees_inserted += release_owned_phis(func, facts);
+        return stats;
+    }
     let sites = mallocs.len();
     let collected = started.elapsed();
     let mut rebuilding = std::time::Duration::ZERO;
@@ -3411,6 +3447,7 @@ fn release_instructions(
 
 #[cfg(test)]
 mod tests {
+    mod gc_policy;
     use super::*;
     use crate::hir::{
         HirBlock, HirConstant, HirFunction, HirFunctionSignature, HirInstruction, HirModule,
