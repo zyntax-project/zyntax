@@ -1220,7 +1220,7 @@ impl<'a> Marker<'a> {
             // SAFETY: the caller hands over memory it owns and that is
             // mapped for the whole range.
             let w = unsafe { std::ptr::read_volatile(p as *const usize) };
-            if w < lo || w >= hi {
+            if self.lo <= w && w < self.hi && (w < lo || w >= hi) {
                 self.consider(w);
             }
             p += 8;
