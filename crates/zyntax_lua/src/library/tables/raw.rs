@@ -21,6 +21,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         ..
     } = context;
     let arr_of = |tb: Expr| crate::library::arr_of(tb, t);
+    let arr_raw = |tb: Expr| crate::library::arr_raw(tb, t);
     let hash_of = |tb: Expr| crate::library::hash_of(tb, t);
     // `arr` is the array part boxed.
     let struct_lit = |arr: Expr, high: Expr| {
@@ -117,6 +118,41 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             ret(arr_of(tb.e())),
         ],
     ));
+    // The array part as a list of boxes: a flat list of integers is
+    // replaced by the boxed equivalent, once; the table is generic from
+    // then on.
+    let flat = local("flat", t.ints());
+    let boxed = local("boxed", t.anys());
+    let at_i = local("at_i", i64());
+    let flat_len = local("flat_len", i64());
+    d.push(define(
+        "zl_arr_generic",
+        &[tb],
+        anys.clone(),
+        vec![
+            when(
+                crate::library::arr_is_ints(tb.e()),
+                vec![
+                    flat.decl(crate::library::arr_ints(tb.e(), t)),
+                    boxed.decl(list(Vec::new(), anys.clone())),
+                    at_i.decl(int(0)),
+                    while_(
+                        lt(at_i.e(), len(flat.e())),
+                        vec![
+                            push(boxed.e(), box_i64(idx(flat.e(), at_i.e(), i64()))),
+                            at_i.add_assign(int(1)),
+                        ],
+                    ),
+                    set_field(
+                        tb.e(),
+                        "arr",
+                        call("zb_list_box_any", vec![boxed.e()], any()),
+                    ),
+                ],
+            ),
+            ret(crate::library::arr_raw(tb.e(), t)),
+        ],
+    ));
     d.push(define(
         "zl_table_new",
         &[],
@@ -135,6 +171,26 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             n.decl(len(arr.e())),
             ret(struct_lit(call("zl_arr_box", vec![arr.e()], any()), n.e())),
         ]
+    }));
+    // A table over the integer values of a constructor, flat. The
+    // shaped constructors box the same list.
+    let ints_kept = kept("ints", t.ints());
+    d.push(define(
+        "zl_table_with_flat",
+        &[&ints_kept],
+        table.clone(),
+        {
+            vec![
+                n.decl(len(ints_kept.e())),
+                ret(struct_lit(
+                    call("zl_arr_box_flat", vec![ints_kept.e()], any()),
+                    n.e(),
+                )),
+            ]
+        },
+    ));
+    d.push(define("zl_arr_box_flat", &[&ints_kept], any(), {
+        vec![ret(call("zb_list_box_i64", vec![ints_kept.e()], any()))]
     }));
     // The array part of a shaped table, boxed, trimmed like a plain
     // table's; the program lays the rest of the table out itself. An
@@ -183,7 +239,23 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, i],
         any(),
         vec![
-            arr.decl(arr_of(tb.e())),
+            when(
+                crate::library::arr_is_ints(tb.e()),
+                vec![
+                    flat.decl(crate::library::arr_ints(tb.e(), t)),
+                    when(
+                        and(ge(i.e(), int(1)), le(i.e(), len(flat.e()))),
+                        vec![ret(box_i64(idx(flat.e(), sub(i.e(), int(1)), i64())))],
+                    ),
+                    when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
+                    ret(call(
+                        "zb_dict_get_default",
+                        vec![hash_of(tb.e()), box_i64(i.e()), nil()],
+                        any(),
+                    )),
+                ],
+            ),
+            arr.decl(arr_raw(tb.e())),
             when(
                 and(ge(i.e(), int(1)), le(i.e(), len(arr.e()))),
                 vec![ret(at(arr.e(), sub(i.e(), int(1))))],
@@ -364,11 +436,62 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, i, v],
         unit(),
         vec![
+            // A flat array of integers takes an integer in place, at the
+            // end when the table has no hash part to migrate from, and
+            // loses its last element to nil; any other store makes it
+            // generic below.
+            when(
+                crate::library::arr_is_ints(tb.e()),
+                vec![
+                    flat.decl(crate::library::arr_ints(tb.e(), t)),
+                    flat_len.decl(len(flat.e())),
+                    when(
+                        and(
+                            is_nil(v.e()),
+                            and(ge(i.e(), int(1)), eq(i.e(), flat_len.e())),
+                        ),
+                        vec![
+                            when(
+                                gt(flat_len.e(), crate::library::high_of(tb.e())),
+                                vec![set_field(tb.e(), "high", flat_len.e())],
+                            ),
+                            expr(mcall(flat.e(), "pop_last", vec![], i64())),
+                            ret_void(),
+                        ],
+                    ),
+                    when(
+                        not(is_nil(v.e())),
+                        vec![
+                            cat.decl(category(v.e())),
+                            when(
+                                is_cat(cat, INT),
+                                vec![
+                                    when(
+                                        and(ge(i.e(), int(1)), le(i.e(), flat_len.e())),
+                                        vec![
+                                            set_idx(flat.e(), sub(i.e(), int(1)), get_i64(v.e())),
+                                            ret_void(),
+                                        ],
+                                    ),
+                                    when(
+                                        and(
+                                            eq(i.e(), add(flat_len.e(), int(1))),
+                                            is_nil(hash_field(tb.e())),
+                                        ),
+                                        vec![push(flat.e(), get_i64(v.e())), ret_void()],
+                                    ),
+                                ],
+                            ),
+                        ],
+                    ),
+                    expr(call("zl_arr_generic", vec![tb.e()], anys.clone())),
+                ],
+            ),
             when(
                 eq(arr_field(tb.e()), read_global(ARR_EMPTY, any())),
                 vec![expr(call("zl_arr_own", vec![tb.e()], anys.clone()))],
             ),
-            arr.decl(arr_of(tb.e())),
+            arr.decl(arr_raw(tb.e())),
             n.decl(len(arr.e())),
             when(
                 and(ge(i.e(), int(1)), le(i.e(), n.e())),
@@ -541,7 +664,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         "zl_len",
         &[tb],
         i64(),
-        vec![ret(len(arr_of(tb.e())))],
+        vec![ret(len(arr_raw(tb.e())))],
     ));
     // `#t` with `__len`, as an integer: what the table library
     // measures a table by, which a value the length cannot be read as
@@ -553,10 +676,10 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         vec![
             when(
                 eq(meta_of(tb.e(), t), null(table.clone())),
-                vec![ret(len(arr_of(tb.e())))],
+                vec![ret(len(arr_raw(tb.e())))],
             ),
             handler.decl(call("zl_meta", vec![tb.e(), text("__len")], any())),
-            when(is_nil(handler.e()), vec![ret(len(arr_of(tb.e())))]),
+            when(is_nil(handler.e()), vec![ret(len(arr_raw(tb.e())))]),
             metamethod_call_check(handler.e(), text("len")),
             x.decl(call(
                 "zl_math_tointeger",

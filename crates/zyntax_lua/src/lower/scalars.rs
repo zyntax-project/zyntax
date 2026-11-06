@@ -68,6 +68,18 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// in one block and an item may carry control flow (a check after a
     /// call) below a wrapper.
     pub(super) fn array_of(&mut self, items: Vec<Node>, pre: &mut Vec<St>, span: Span) -> Node {
+        let anys = self.m.anys();
+        self.array_of_typed(items, anys, pre, span)
+    }
+
+    /// [`Self::array_of`] for a list of the given type.
+    pub(super) fn array_of_typed(
+        &mut self,
+        items: Vec<Node>,
+        list_ty: Type,
+        pre: &mut Vec<St>,
+        span: Span,
+    ) -> Node {
         let mut plain = Vec::with_capacity(items.len());
         for item in items {
             if Self::is_simple(&item) {
@@ -79,7 +91,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 plain.push(var(name, ty, span));
             }
         }
-        node(TypedExpression::Array(plain), self.m.anys(), span)
+        node(TypedExpression::Array(plain), list_ty, span)
     }
 
     /// The truth of a value, as a boolean.

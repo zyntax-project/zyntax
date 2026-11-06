@@ -192,6 +192,18 @@ unsafe fn list_of(b: *const BoxHeader) -> Option<&'static mut ListHeader> {
     (!list.is_null()).then(|| unsafe { &mut *list })
 }
 
+/// A table's array part when it holds boxes; a flat list of integers
+/// holds nothing the collector reaches or clears.
+///
+/// # Safety
+/// As [`list_of`].
+unsafe fn array_of(b: *const BoxHeader) -> Option<&'static mut ListHeader> {
+    if b.is_null() || unsafe { (*b).tag } as i64 == library::int_list_tag() {
+        return None;
+    }
+    unsafe { list_of(b) }
+}
+
 /// A list's elements.
 ///
 /// # Safety
@@ -239,7 +251,7 @@ fn hold(f: &mut dyn FnMut(usize)) {
             f(list.data as usize);
         }
         if w.mode & WEAK_VALUES != 0
-            && let Some(list) = unsafe { list_of(t.arr) }
+            && let Some(list) = unsafe { array_of(t.arr) }
             && !list.data.is_null()
         {
             f(list.data as usize);
@@ -281,7 +293,7 @@ fn trace(m: &mut dyn Marking) {
             }
         }
         if w.mode & WEAK_VALUES != 0
-            && let Some(list) = unsafe { list_of(t.arr) }
+            && let Some(list) = unsafe { array_of(t.arr) }
         {
             for &v in unsafe { elements(list) }.iter() {
                 if alive(m, v, true) {
@@ -375,7 +387,7 @@ fn report_survivors(s: &State, m: &dyn Marking) {
         }
         // SAFETY: reached, so live; the world is stopped.
         let t = unsafe { &*(t as *const TableHeader) };
-        if let Some(list) = unsafe { list_of(t.arr) } {
+        if let Some(list) = unsafe { array_of(t.arr) } {
             for &v in unsafe { elements(list) }.iter() {
                 // SAFETY: an element of a reached table is null or a live box.
                 if let Some(r) = unsafe { referent(v) } {
@@ -422,7 +434,7 @@ fn clear_dead_values(weak: &mut BTreeMap<usize, Weak>, m: &dyn Marking, trim: bo
                 }
             }
         }
-        if let Some(list) = unsafe { list_of(t.arr) } {
+        if let Some(list) = unsafe { array_of(t.arr) } {
             let n = list.len;
             for v in unsafe { elements(list) }.iter_mut() {
                 if dead(*v) {

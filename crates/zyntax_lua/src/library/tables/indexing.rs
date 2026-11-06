@@ -282,6 +282,83 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             box_i64(i.e()),
         ),
     ));
+    // `t[i] = v` for an integer value, which a flat array of integers
+    // takes without a box: in place when the element is there, at the
+    // end or as the first element of an empty array when no metatable
+    // or hash part could say otherwise. Anything else stores the box.
+    let vi = local("vi", i64());
+    let flat = local("flat", t.ints());
+    let flat_len = local("flat_len", i64());
+    d.push(define(
+        "zl_table_seti_int",
+        &[tb, i, &vi],
+        unit(),
+        vec![
+            when(
+                crate::library::arr_is_ints(tb.e()),
+                vec![
+                    flat.decl(crate::library::arr_ints(tb.e(), t)),
+                    flat_len.decl(len(flat.e())),
+                    when(
+                        and(ge(i.e(), int(1)), le(i.e(), flat_len.e())),
+                        vec![set_idx(flat.e(), sub(i.e(), int(1)), vi.e()), ret_void()],
+                    ),
+                    when(
+                        and(
+                            eq(i.e(), add(flat_len.e(), int(1))),
+                            and(
+                                eq(meta_of(tb.e(), t), null(table.clone())),
+                                is_nil(hash_field(tb.e())),
+                            ),
+                        ),
+                        vec![push(flat.e(), vi.e()), ret_void()],
+                    ),
+                ],
+            ),
+            when(
+                and(
+                    eq(i.e(), int(1)),
+                    and(
+                        eq(
+                            crate::library::arr_field(tb.e()),
+                            read_global(ARR_EMPTY, any()),
+                        ),
+                        and(
+                            eq(meta_of(tb.e(), t), null(table.clone())),
+                            is_nil(hash_field(tb.e())),
+                        ),
+                    ),
+                ),
+                vec![
+                    set_field(
+                        tb.e(),
+                        "arr",
+                        call("zb_list_box_i64", vec![list(vec![vi.e()], t.ints())], any()),
+                    ),
+                    ret_void(),
+                ],
+            ),
+            // No metatable: the raw store; otherwise `__newindex` may
+            // have a say.
+            when(
+                eq(meta_of(tb.e(), t), null(table.clone())),
+                vec![
+                    expr(call(
+                        "zl_rawseti",
+                        vec![tb.e(), i.e(), box_i64(vi.e())],
+                        unit(),
+                    )),
+                    ret_void(),
+                ],
+            ),
+            expr(call(
+                "zl_table_seti",
+                vec![tb.e(), i.e(), box_i64(vi.e())],
+                unit(),
+            )),
+            ret_void(),
+        ],
+    ));
     d.push(define(
         "zl_table_setindex_key",
         &[tb, k, v],

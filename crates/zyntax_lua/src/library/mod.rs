@@ -18,12 +18,13 @@ pub use layout::{
 
 mod expressions;
 pub use expressions::{
-    arg_type_name, arr_field, arr_of, at, bad_arg, bad_arg_at, box_bool, box_f64, box_i64, box_str,
-    box_table, category, concat, get_bool, get_f64, get_i64, get_str, hash_field, hash_of, high_of,
-    is_any_userdata, is_cat, is_file, is_func, is_int_cat, is_light, is_nil, is_nil_error,
-    is_number_cat, is_shaped, is_table, is_thread, is_userdata, len, lua_error, meta_of,
-    metamethod_call_check, metamethod_site, nil, node, obj_type_name, push, set_field, shape_of,
-    slot_present, str_eq, tag_of, type_error, type_name, unbox_table,
+    arg_type_name, arr_field, arr_ints, arr_is_ints, arr_of, arr_raw, at, bad_arg, bad_arg_at,
+    box_bool, box_f64, box_i64, box_str, box_table, category, concat, get_bool, get_f64, get_i64,
+    get_str, hash_field, hash_of, high_of, int_list_tag, is_any_userdata, is_cat, is_file, is_func,
+    is_int_cat, is_light, is_nil, is_nil_error, is_number_cat, is_shaped, is_table, is_thread,
+    is_userdata, len, lua_error, meta_of, metamethod_call_check, metamethod_site, nil, node,
+    obj_type_name, push, set_field, shape_of, slot_present, str_eq, tag_of, type_error, type_name,
+    unbox_table,
 };
 use expressions::{nil_error, shape_hook_decls};
 
@@ -91,6 +92,10 @@ pub struct Types {
 impl Types {
     pub fn anys(&self) -> Type {
         zyntax_builtins::list_of(self.list_type, any())
+    }
+    /// A flat list of integers.
+    pub fn ints(&self) -> Type {
+        zyntax_builtins::list_of(self.list_type, i64())
     }
     pub fn table(&self) -> Type {
         table_ty(self.table_type)

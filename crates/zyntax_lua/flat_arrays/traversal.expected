@@ -1,0 +1,21 @@
+clear	 #0
+evens out	1=1,3=3,5=5,7=7,9=9 #9
+pop2	1=1,2=2,3=3,4=4 #4
+push after pop	1=1,2=2,3=3,4=4,5=100 #5
+sparse	10=5,1=1,2=2,3=3,4=4,5=100 #5
+migrate	1=1,2=2,3=3,4=4,5=5,6=6,7=7 #7
+ctor+hash	1=1,2=2,3=3,4=4,x=1 #4
+seq	1=1,2=2,3=3 #3	3
+ins/rem	1=2,2=99,3=3,4=4,5=5 #5
+sort	1=-5,2=-4,3=-3,4=-2,5=-1 #5
+float	1=1,2=2.0,3=3.5,4=4,5=5 #5	float	integer
+true	5	nil	number
+swap	1=3,2=2,3=1 #3
+nil head	2=20 #2
+4	4	true
+unpack ctor	1=1,2=2,3=3,4=4 #4
+ctor then str	1=10,2=x,3=30 #3
+ctor then float	1=1,2=2,3=3,4=4.5 #4
+hash then arr	1=1,2=2,3=3,4=4,n=0 #4
+len mm	42	3
+3	xxx	7

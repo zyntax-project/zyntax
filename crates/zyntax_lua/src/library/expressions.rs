@@ -188,8 +188,33 @@ pub fn arr_field(tb: Expr) -> Expr {
     fld(tb, "arr", any())
 }
 
-pub fn arr_of(tb: Expr, t: &Types) -> Expr {
+/// The box tag of a flat list of integers, which an array part may be.
+pub fn int_list_tag() -> i64 {
+    zyntax_builtins::Kind::Int.list_tag()
+}
+
+/// Whether the array part is a flat list of integers.
+pub fn arr_is_ints(tb: Expr) -> Expr {
+    eq(
+        cast(call("zb_box_header_tag", vec![arr_field(tb)], i32()), i64()),
+        int(int_list_tag()),
+    )
+}
+
+/// The array part as a flat list of integers; it is known to be one.
+pub fn arr_ints(tb: Expr, t: &Types) -> Expr {
+    call("zb_unbox_list_raw_i64", vec![arr_field(tb)], t.ints())
+}
+
+/// The array part viewed as a list of boxes without a check. Only its
+/// length is meaningful when it may be flat.
+pub fn arr_raw(tb: Expr, t: &Types) -> Expr {
     call("zb_unbox_list_raw_any", vec![arr_field(tb)], t.anys())
+}
+
+/// The array part as a list of boxes, made so first when it is flat.
+pub fn arr_of(tb: Expr, t: &Types) -> Expr {
+    call("zl_arr_generic", vec![tb], t.anys())
 }
 
 pub fn hash_field(tb: Expr) -> Expr {

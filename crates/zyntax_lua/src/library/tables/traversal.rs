@@ -14,7 +14,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         tb,
         ..
     } = context;
-    let arr_of = |tb: Expr| crate::library::arr_of(tb, t);
+    let arr_raw = |tb: Expr| crate::library::arr_raw(tb, t);
     let hash_of = |tb: Expr| crate::library::hash_of(tb, t);
     let shaped = |tb: Expr| crate::library::is_shaped(tb);
     let slot_index = |tb: Expr, name: Expr| call("zl_shape_index", vec![tb, name], i64());
@@ -36,15 +36,21 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, &pos],
         i64(),
         vec![
-            arr.decl(arr_of(tb.e())),
+            arr.decl(arr_raw(tb.e())),
             n.decl(len(arr.e())),
             i.decl(pos.e()),
-            while_(
-                lt(i.e(), n.e()),
-                vec![
-                    when(not(is_nil(at(arr.e(), i.e()))), vec![ret(i.e())]),
-                    i.add_assign(int(1)),
-                ],
+            // A flat array holds no nil: its next element is the next
+            // position.
+            if_(
+                crate::library::arr_is_ints(tb.e()),
+                vec![when(lt(i.e(), n.e()), vec![ret(i.e())])],
+                vec![while_(
+                    lt(i.e(), n.e()),
+                    vec![
+                        when(not(is_nil(at(arr.e(), i.e()))), vec![ret(i.e())]),
+                        i.add_assign(int(1)),
+                    ],
+                )],
             ),
             slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
             while_(
@@ -82,7 +88,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, &pos],
         any(),
         vec![
-            n.decl(len(arr_of(tb.e()))),
+            n.decl(len(arr_raw(tb.e()))),
             when(lt(pos.e(), n.e()), vec![ret(box_i64(add(pos.e(), int(1))))]),
             slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
             when(
@@ -101,8 +107,16 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, &pos],
         any(),
         vec![
-            arr.decl(arr_of(tb.e())),
+            arr.decl(arr_raw(tb.e())),
             n.decl(len(arr.e())),
+            when(
+                and(lt(pos.e(), n.e()), crate::library::arr_is_ints(tb.e())),
+                vec![ret(box_i64(idx(
+                    crate::library::arr_ints(tb.e(), t),
+                    pos.e(),
+                    i64(),
+                )))],
+            ),
             when(lt(pos.e(), n.e()), vec![ret(at(arr.e(), pos.e()))]),
             slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
             when(
@@ -124,7 +138,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         i64(),
         vec![
             when(is_nil(k.e()), vec![ret(int(0))]),
-            n.decl(len(arr_of(tb.e()))),
+            n.decl(len(arr_raw(tb.e()))),
             cat.decl(category(k.e())),
             when(
                 is_int_cat(cat),
@@ -192,7 +206,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, &pos, &seen],
         i64(),
         vec![
-            n.decl(len(arr_of(tb.e()))),
+            n.decl(len(arr_raw(tb.e()))),
             i.decl(pos.e()),
             when(
                 lt(n.e(), seen.e()),

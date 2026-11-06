@@ -187,16 +187,27 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         Ok((pre, vals, tail))
     }
 
-    /// The values of an expression list as a `List<Any>`.
-    pub(super) fn packed_list(&mut self, exprs: &[&Expression], span: Span) -> Result<Node> {
+    /// The values of an expression list as a `List<Any>`, or as a flat
+    /// `List<i64>` (the second result) when there is no open tail and
+    /// every value is an integer.
+    pub(super) fn packed_list(
+        &mut self,
+        exprs: &[&Expression],
+        span: Span,
+    ) -> Result<(Node, bool)> {
         let (mut pre, vals, tail) = self.expr_list(exprs)?;
+        if tail.is_none() && !vals.is_empty() && vals.iter().all(|v| v.ty == Ty::Int) {
+            let items = vals.into_iter().map(|v| v.node).collect();
+            let list = self.array_of_typed(items, self.m.types.ints(), &mut pre, span);
+            return Ok((block_value(pre, list, span), true));
+        }
         let mut items = Vec::with_capacity(vals.len());
         for v in vals {
             items.push(self.boxed(v));
         }
         let list = self.array_of(items, &mut pre, span);
         Ok(match tail {
-            None => block_value(pre, list, span),
+            None => (block_value(pre, list, span), false),
             Some(tail) => {
                 let name = self.temp();
                 pre.push(let_(name, self.m.anys(), list, span));
@@ -206,7 +217,10 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::Unit),
                     span,
                 )));
-                block_value(pre, var(name, self.m.anys(), span), span)
+                (
+                    block_value(pre, var(name, self.m.anys(), span), span),
+                    false,
+                )
             }
         })
     }

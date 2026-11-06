@@ -147,6 +147,62 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 );
             }
         }
+        // An integer stored under an integer key into a table goes to
+        // the entry that keeps an integer array flat; the box is made
+        // there only when the array is not.
+        if value.ty == Ty::Int && key.ty == Ty::Int && matches!(obj.ty, Ty::Table | Ty::Shape(_)) {
+            let mut pre = Vec::new();
+            let t = self.hold(obj, &mut pre);
+            let k = self.hold(key, &mut pre);
+            let held = self.hold(value, &mut pre);
+            let on_table = call(
+                "zl_table_seti_int",
+                vec![t.node.clone(), k.node.clone(), held.node.clone()],
+                unit.clone(),
+                span,
+            );
+            let node = if matches!(t.ty, Ty::Shape(_)) {
+                // A shaped receiver is a table unless it is nil, when the
+                // dynamic path raises as Lua does.
+                let on_nil = call(
+                    "zl_seti",
+                    vec![nil(span), k.node, self.boxed(held)],
+                    unit.clone(),
+                    span,
+                );
+                let is_null = binary(
+                    BinaryOp::Eq,
+                    t.node,
+                    null(self.ir(Ty::Table), span),
+                    prim(PrimitiveType::Bool),
+                    span,
+                );
+                pre.push(if_(
+                    is_null,
+                    vec![expr_stmt(on_nil)],
+                    Some(vec![expr_stmt(on_table)]),
+                    span,
+                ));
+                pre.push(self.pending_check_described(span, &descs));
+                return stmt(
+                    TypedStatement::Block(TypedBlock {
+                        statements: pre,
+                        span,
+                    }),
+                    span,
+                );
+            } else {
+                on_table
+            };
+            pre.push(self.guarded_stmt(node, &descs));
+            return stmt(
+                TypedStatement::Block(TypedBlock {
+                    statements: pre,
+                    span,
+                }),
+                span,
+            );
+        }
         let v = self.boxed(value);
         if let Some(k) = self.constant_key(&key) {
             let node = match obj.ty {

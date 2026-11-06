@@ -412,15 +412,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 bool_t.clone(),
                 span,
             ),
-            bool_t,
+            bool_t.clone(),
             span,
         );
-        let element = index(
-            arr(),
-            binary(BinaryOp::Sub, k.node.clone(), int_lit(1, span), i64_t, span),
-            Type::Any,
+        let slot = binary(
+            BinaryOp::Sub,
+            k.node.clone(),
+            int_lit(1, span),
+            i64_t.clone(),
             span,
         );
+        let element = index(arr(), slot.clone(), Type::Any, span);
         let element = self.coerce(
             Val {
                 node: element,
@@ -428,6 +430,58 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             ty,
         );
+        // A flat array of integers is read in place: raw when the type
+        // says integer, boxed otherwise.
+        let flat = index(
+            call(
+                "zb_unbox_list_raw_i64",
+                vec![field(t.node.clone(), "arr", Type::Any, span)],
+                self.m.types.ints(),
+                span,
+            ),
+            slot,
+            i64_t.clone(),
+            span,
+        );
+        let flat = if ty == Ty::Int {
+            flat
+        } else {
+            let boxed = call("zb_box_i64", vec![flat], Type::Any, span);
+            self.coerce(
+                Val {
+                    node: boxed,
+                    ty: Ty::Any,
+                },
+                ty,
+            )
+        };
+        let is_flat = binary(
+            BinaryOp::Eq,
+            cast(
+                call(
+                    "zb_box_header_tag",
+                    vec![field(t.node.clone(), "arr", Type::Any, span)],
+                    prim(PrimitiveType::I32),
+                    span,
+                ),
+                i64_t,
+                span,
+            ),
+            int_lit(crate::library::int_list_tag(), span),
+            bool_t.clone(),
+            span,
+        );
+        // An array the types say holds only values of another kind is
+        // never flat.
+        let may_be_flat = !matches!(
+            ty,
+            Ty::Str | Ty::Float | Ty::Bool | Ty::Table | Ty::Shape(_) | Ty::Func(_) | Ty::Nil
+        );
+        let element = if may_be_flat {
+            if_value(is_flat, flat, element, self.ir(ty), span)
+        } else {
+            element
+        };
         let general = self.coerce(general, ty);
         Val {
             node: block_value(
