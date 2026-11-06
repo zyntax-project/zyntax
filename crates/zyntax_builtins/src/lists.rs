@@ -1309,6 +1309,8 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let what = local("what", string());
     let el = |xs: &Local, i: Expr| idx(xs.e(), i, k.elem.clone());
     let empty = || list(Vec::new(), k.list.clone());
+    // An empty list whose buffer already has room for `n` elements.
+    let with_capacity = |n: Expr| mcall(empty(), "with_capacity", vec![n], k.list.clone());
     let mut d = Vec::new();
     if let Some(kind) = k.kind.filter(|kind| kind.wide() != *kind) {
         d.extend(narrow_declarations(k, kind));
@@ -1516,7 +1518,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &[&xs],
         k.list.clone(),
         vec![
-            out.decl(empty()),
+            out.decl(with_capacity(len(xs.e()))),
             expr(call(&name("extend"), vec![out.e(), xs.e()], unit())),
             ret(out.e()),
         ],
@@ -1526,13 +1528,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         &[&xs, &ys],
         k.list.clone(),
         vec![
-            out.decl(empty()),
-            expr(mcall(
-                out.e(),
-                "reserve",
-                vec![add(len(xs.e()), len(ys.e()))],
-                unit(),
-            )),
+            out.decl(with_capacity(add(len(xs.e()), len(ys.e())))),
             expr(call(&name("extend"), vec![out.e(), xs.e()], unit())),
             expr(call(&name("extend"), vec![out.e(), ys.e()], unit())),
             ret(out.e()),
@@ -1607,6 +1603,7 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
     let st = local("st", i64());
     let lo = local("lo", i64());
     let hi = local("hi", i64());
+    let room = local("room", i64());
     let step_body = |i: &Local| {
         vec![
             expr(mcall(out.e(), "push", vec![el(&xs, i.e())], unit())),
@@ -1643,7 +1640,12 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
                 ne(bitand(mask.e(), int(2)), int(0)),
                 vec![hi.set(call("zb_slice_bound", vec![stop.e(), n.e(), st.e()], i64()))],
             ),
-            out.decl(empty()),
+            room.decl(int(0)),
+            when(
+                and(eq(st.e(), int(1)), gt(hi.e(), lo.e())),
+                vec![room.set(sub(hi.e(), lo.e()))],
+            ),
+            out.decl(with_capacity(room.e())),
             i.decl(lo.e()),
             // A unit step is one copy of the run; the bounds are clamped
             // to the list already.

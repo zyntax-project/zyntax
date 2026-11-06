@@ -487,6 +487,13 @@ impl BuiltinClass for ListClass {
                 ssa.emit_list_reserve(block_id, receiver, elem, &args[0])
                     .map(Some)
             }
+            // A fresh list with room for the argument's elements; the
+            // receiver is an empty list literal and is not built.
+            "with_capacity" => {
+                arity(1)?;
+                ssa.emit_list_with_capacity(block_id, elem, &args[0])
+                    .map(Some)
+            }
             "truncate" => {
                 arity(1)?;
                 ssa.emit_list_truncate(block_id, receiver, elem, &args[0])

@@ -12252,6 +12252,57 @@ impl SsaBuilder {
         Ok(self.create_undef(HirType::Void))
     }
 
+    /// `[].with_capacity(n)`: a fresh, empty list whose buffer holds
+    /// `n` elements, at least four. Slots past the fourth are left as the
+    /// block held them: the caller writes the first `n` before anything
+    /// else allocates.
+    pub(crate) fn emit_list_with_capacity(
+        &mut self,
+        block: HirId,
+        elem_ty: &Type,
+        wanted: &zyntax_typed_ast::TypedNode<zyntax_typed_ast::typed_ast::TypedExpression>,
+    ) -> CompilerResult<HirId> {
+        use crate::hir::BinaryOp as B;
+        let elem = self.element_storage_type(elem_ty);
+        let mut cur = block;
+        let n = self.translate_operand(&mut cur, wanted)?;
+        let n = self.coerce_scalar_to(cur, n, &HirType::I64);
+        let header_bytes = self.i64_const(24);
+        let list_ty = HirType::Ptr(std::sync::Arc::new(list_header_type()));
+        let list = self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Malloc,
+            vec![header_bytes],
+            &list_ty,
+        );
+        let four = self.i64_const(4);
+        let small = self.emit_bin(cur, B::Lt, &HirType::I64, n, four);
+        let cap = self.emit_select(cur, small, four, n, &HirType::I64);
+        let size = self.i64_const(hir_ty_size(&elem).max(1) as i64);
+        let bytes = self.emit_bin(cur, B::Mul, &HirType::I64, cap, size);
+        let data = self.emit_intrinsic(
+            cur,
+            crate::hir::Intrinsic::Malloc,
+            vec![bytes],
+            &HirType::Ptr(std::sync::Arc::new(elem.clone())),
+        );
+        let zero = self.i64_const(0);
+        self.emit_store(cur, list, data);
+        self.list_set_len(cur, list, zero);
+        let cap_ptr = self.list_field_ptr(cur, list, 16);
+        self.emit_store(cur, cap_ptr, cap);
+        // The first four slots, the only ones not certain to be written
+        // by the caller, are cleared at a size known here.
+        let elem_size = hir_ty_size(&elem).max(1);
+        for i in 0..4 {
+            let off = self.i64_const((i * elem_size) as i64);
+            let slot = self.emit_byte_gep(cur, data, off, elem.clone());
+            self.list_clear_slot(cur, slot, &elem);
+        }
+        self.settle(block, cur);
+        Ok(list)
+    }
+
     /// A fresh, empty list with room for `capacity` elements, on the heap.
     pub(crate) fn emit_list_new(&mut self, block: HirId, elem_ty: &Type, capacity: HirId) -> HirId {
         use crate::hir::BinaryOp as B;
