@@ -309,3 +309,119 @@ fn an_exit_phi_keeps_the_edge_that_bypasses_the_loop() {
         }
     }
 }
+
+fn restarted(toggles: bool) -> (HirModule, HirId) {
+    let (mut module, id) = build(toggles);
+    let f = module.functions.get_mut(&id).unwrap();
+    let entry = f.entry_block;
+    let HirTerminator::Branch { target: header } = f.blocks[&entry].terminator else {
+        panic!()
+    };
+    let HirTerminator::CondBranch {
+        true_target: body,
+        false_target: exit,
+        ..
+    } = f.blocks[&header].terminator
+    else {
+        panic!()
+    };
+    let reset = f.create_block();
+    let finish = f.create_block();
+    let zero = konst(f, 0);
+    let one = konst(f, 1);
+    let three = konst(f, 3);
+    let round = int(f);
+    let next_round = int(f);
+    let more = add_value(f, HirType::Bool, HirValueKind::Instruction);
+    let acc = f.blocks[&header].phis[2].result;
+    let h = f.blocks.get_mut(&header).unwrap();
+    for (phi, incoming) in h.phis.iter_mut().zip([zero, zero, acc]) {
+        phi.incoming.push((incoming, reset));
+    }
+    h.phis.push(HirPhi {
+        result: round,
+        ty: HirType::I64,
+        incoming: vec![(zero, entry), (round, body), (next_round, reset)],
+    });
+    let e = f.blocks.get_mut(&exit).unwrap();
+    let result = std::mem::replace(
+        &mut e.terminator,
+        HirTerminator::CondBranch {
+            condition: more,
+            true_target: reset,
+            false_target: finish,
+        },
+    );
+    e.instructions.extend([
+        bin(BinaryOp::Add, next_round, round, one),
+        bin(BinaryOp::Lt, more, next_round, three),
+    ]);
+    f.blocks.get_mut(&reset).unwrap().terminator = HirTerminator::Branch { target: header };
+    f.blocks.get_mut(&finish).unwrap().terminator = result;
+    (module, id)
+}
+
+#[test]
+fn a_restart_with_a_different_tag_keeps_the_inner_version() {
+    let (mut module, id) = restarted(false);
+    assert_eq!(loop_specialize::run_module(&mut module), 1);
+    let check_restarts = |mut call: Box<dyn FnMut(i64, i64, i64) -> i64>| {
+        for tag in [-1, 0, 1, 2] {
+            for n in [-1, 0, 1, 2, 3, 4, 20] {
+                for seed in [-7, 0, 19] {
+                    let mut acc = seed;
+                    let mut last_tag = tag;
+                    for round in 0..3 {
+                        let start = if round == 0 { tag } else { 0 };
+                        last_tag = if n > 2 { 1 } else { start };
+                        acc = reference(start, n, acc) - last_tag * 1000 - n.max(0) * 1000000;
+                    }
+                    assert_eq!(
+                        call(tag, n, seed),
+                        acc + last_tag * 1000 + n.max(0) * 1000000
+                    );
+                }
+            }
+        }
+    };
+    let mut interp = zyntax_compiler::hir_interp::HirInterpreter::new();
+    let interpreted = module.clone();
+    check_restarts(Box::new(move |tag, n, seed| {
+        use zyntax_compiler::{hir_interp::value_to_i64, value::ZyntaxValue};
+        value_to_i64(
+            &interp
+                .call(
+                    &interpreted,
+                    "f",
+                    vec![
+                        ZyntaxValue::Int(tag),
+                        ZyntaxValue::Int(n),
+                        ZyntaxValue::Int(seed),
+                    ],
+                )
+                .unwrap(),
+        )
+        .unwrap()
+    }));
+    let mut clif = zyntax_compiler::cranelift_backend::CraneliftBackend::new().unwrap();
+    clif.compile_module(&module).unwrap();
+    clif.finalize_definitions().unwrap();
+    let f: unsafe extern "C" fn(i64, i64, i64) -> i64 =
+        unsafe { std::mem::transmute(clif.get_function_ptr(id).unwrap()) };
+    check_restarts(Box::new(move |tag, n, seed| unsafe { f(tag, n, seed) }));
+    #[cfg(feature = "llvm-backend")]
+    {
+        let context = inkwell::context::Context::create();
+        let mut llvm = zyntax_compiler::llvm_jit_backend::LLVMJitBackend::new(&context).unwrap();
+        llvm.compile_module(&module).unwrap();
+        let f: unsafe extern "C" fn(i64, i64, i64) -> i64 =
+            unsafe { std::mem::transmute(llvm.get_function_pointer(id).unwrap()) };
+        check_restarts(Box::new(move |tag, n, seed| unsafe { f(tag, n, seed) }));
+    }
+}
+
+#[test]
+fn a_restart_does_not_make_a_changing_inner_tag_constant() {
+    let (mut module, _) = restarted(true);
+    assert_eq!(loop_specialize::run_module(&mut module), 0);
+}

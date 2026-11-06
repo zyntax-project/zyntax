@@ -43,72 +43,83 @@ pub fn run_function(func: &mut HirFunction) -> usize {
         if made == 2 {
             break;
         }
-        let size: usize = lp
-            .body
-            .iter()
-            .map(|b| {
-                let block = &func.blocks[b];
-                block.instructions.len() + block.phis.len()
-            })
-            .sum();
-        if size > MAX_BODY
-            || lp.exits.len() != 1
-            || lp.body.iter().any(|b| {
-                *b != lp.header
-                    && func.blocks[b]
-                        .predecessors
-                        .iter()
-                        .any(|p| !lp.body.contains(p))
-            })
-        {
-            continue;
-        }
-        if lp
-            .body
-            .iter()
-            .any(|b| func.blocks[b].instructions.iter().any(|i| !copyable(i)))
-        {
-            continue;
-        }
         let dt = DominatorTree::of(func);
-        let Some(merges) = exit_merges(func, &lp, &dt) else {
+        let regions = lp.latch_regions(func, &dt);
+        if regions
+            .iter()
+            .chain(std::iter::once(&lp))
+            .any(|lp| version(func, lp, &dt))
+        {
+            rebuild_edges(func);
+            made += 1;
+        }
+    }
+    made
+}
+
+fn version(func: &mut HirFunction, lp: &NaturalLoop, dt: &DominatorTree) -> bool {
+    let size: usize = lp
+        .body
+        .iter()
+        .map(|b| {
+            let block = &func.blocks[b];
+            block.instructions.len() + block.phis.len()
+        })
+        .sum();
+    if size > MAX_BODY
+        || lp.exits.len() != 1
+        || lp.body.iter().any(|b| {
+            *b != lp.header
+                && func.blocks[b]
+                    .predecessors
+                    .iter()
+                    .any(|p| !lp.body.contains(p))
+        })
+    {
+        return false;
+    }
+    if lp
+        .body
+        .iter()
+        .any(|b| func.blocks[b].instructions.iter().any(|i| !copyable(i)))
+    {
+        return false;
+    }
+    let Some(merges) = exit_merges(func, lp, dt) else {
+        return false;
+    };
+    let mut plan = None;
+    for phi in &func.blocks[&lp.header].phis {
+        if !matches!(phi.ty, HirType::Bool | HirType::I64 | HirType::I32) {
             continue;
-        };
-        let mut plan = None;
-        for phi in &func.blocks[&lp.header].phis {
-            if !matches!(phi.ty, HirType::Bool | HirType::I64 | HirType::I32) {
-                continue;
-            }
-            if !tested(func, &lp, phi.result) {
-                continue;
-            }
-            for constant in candidates(func, &lp, phi) {
-                if let Some(body) = specialize(func, &lp, phi.result, &constant) {
-                    plan = Some((phi.result, constant, body));
-                    break;
-                }
-            }
-            if plan.is_some() {
+        }
+        if !tested(func, lp, phi.result) {
+            continue;
+        }
+        for constant in candidates(func, lp, phi) {
+            if let Some(body) = specialize(func, lp, phi.result, &constant) {
+                plan = Some((phi.result, constant, body));
                 break;
             }
         }
-        let Some((state, constant, body)) = plan else {
-            continue;
-        };
-        // `ZYNTAX_TRACE_LOOP_SPECIALIZE=1` reports selected states; safe to run with.
-        if std::env::var_os("ZYNTAX_TRACE_LOOP_SPECIALIZE").is_some() {
-            eprintln!(
-                "[loop_specialize] {}: {:?} = {:?}",
-                func.name.resolve_global().unwrap_or_default(),
-                state,
-                constant
-            );
+        if plan.is_some() {
+            break;
         }
-        apply(func, &lp, state, constant, body, merges, &dt);
-        rebuild_edges(func);
-        made += 1;
     }
-    made
+    let Some((state, constant, body)) = plan else {
+        return false;
+    };
+    // `ZYNTAX_TRACE_LOOP_SPECIALIZE=1` reports selected states; safe to run with.
+    if std::env::var_os("ZYNTAX_TRACE_LOOP_SPECIALIZE").is_some() {
+        eprintln!(
+            "[loop_specialize] {}: {:?} = {:?}",
+            func.name.resolve_global().unwrap_or_default(),
+            state,
+            constant
+        );
+    }
+    apply(func, lp, state, constant, body, merges, dt);
+    true
 }
 
 fn copyable(i: &HirInstruction) -> bool {
@@ -339,7 +350,7 @@ fn exit_merges(func: &HirFunction, lp: &NaturalLoop, dt: &DominatorTree) -> Opti
         Some(())
     };
     for (id, block) in &func.blocks {
-        if lp.body.contains(id) || dt.rpo_position(*id).is_none() {
+        if dt.rpo_position(*id).is_none() {
             continue;
         }
         for phi in &block.phis {
@@ -348,6 +359,9 @@ fn exit_merges(func: &HirFunction, lp: &NaturalLoop, dt: &DominatorTree) -> Opti
                     need(*from, *v)?;
                 }
             }
+        }
+        if lp.body.contains(id) {
+            continue;
         }
         let mut uses = Vec::new();
         for i in &block.instructions {
@@ -496,15 +510,15 @@ fn apply(
             .collect();
         let subst = IndexMap::from([(v, merged)]);
         for (b, block) in &mut func.blocks {
-            if lp.body.contains(b) {
-                continue;
-            }
             for phi in &mut block.phis {
                 for (value, from) in &mut phi.incoming {
                     if *value == v && !lp.body.contains(from) && dt.dominates(exit, *from) {
                         *value = merged;
                     }
                 }
+            }
+            if lp.body.contains(b) {
+                continue;
             }
             if dt.dominates(exit, *b) {
                 for i in &mut block.instructions {

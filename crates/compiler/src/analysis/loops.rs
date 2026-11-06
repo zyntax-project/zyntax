@@ -70,6 +70,32 @@ pub struct NaturalLoop {
     pub exits: HashSet<HirId>,
 }
 
+impl NaturalLoop {
+    /// Smaller regions closed by individual backedges. Entering a nested
+    /// loop through OSR can make its restart and inner latch share a header.
+    pub(crate) fn latch_regions(&self, func: &HirFunction, dt: &DominatorTree) -> Vec<Self> {
+        if self.latches.len() < 2 {
+            return Vec::new();
+        }
+        let mut regions: Vec<Self> = Vec::new();
+        for &latch in &self.latches {
+            let body = collect_body(func, dt, self.header, &[latch]);
+            if body.len() == self.body.len() || regions.iter().any(|lp| lp.body == body) {
+                continue;
+            }
+            let exits = collect_exits(func, &body);
+            regions.push(Self {
+                header: self.header,
+                body,
+                latches: vec![latch],
+                exits,
+            });
+        }
+        regions.sort_by_key(|lp| (lp.body.len(), dt.rpo_position(lp.latches[0])));
+        regions
+    }
+}
+
 /// All natural loops in a function plus the nesting structure.
 #[derive(Debug, Default, Clone)]
 pub struct LoopForest {
