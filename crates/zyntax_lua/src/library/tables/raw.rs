@@ -364,7 +364,11 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
         &[tb, i, v],
         unit(),
         vec![
-            arr.decl(call("zl_arr_own", vec![tb.e()], anys.clone())),
+            when(
+                eq(arr_field(tb.e()), read_global(ARR_EMPTY, any())),
+                vec![expr(call("zl_arr_own", vec![tb.e()], anys.clone()))],
+            ),
+            arr.decl(arr_of(tb.e())),
             n.decl(len(arr.e())),
             when(
                 and(ge(i.e(), int(1)), le(i.e(), n.e())),
@@ -394,7 +398,10 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
                 and(eq(i.e(), add(n.e(), int(1))), not(is_nil(v.e()))),
                 vec![
                     push(arr.e(), v.e()),
-                    expr(call("zl_migrate", vec![tb.e()], unit())),
+                    when(
+                        not(is_nil(hash_field(tb.e()))),
+                        vec![expr(call("zl_migrate", vec![tb.e()], unit()))],
+                    ),
                     ret_void(),
                 ],
             ),
