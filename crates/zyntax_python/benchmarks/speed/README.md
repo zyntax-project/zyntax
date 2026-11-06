@@ -5,7 +5,7 @@ chart, as the PyPy benchmarks repository carries them (the revision and
 the files are in `kernels/REVISION`; `kernels/LICENSE` is theirs), run
 on zypy, PyPy and CPython the way the speed center runs them. Each row
 first says what matters: whether zypy is faster or slower than the
-fastest of the other runtimes on that kernel, and by how much. Beside
+fastest of the other runtimes on that kernel, and by how much; a difference of 5% or less either way is reported as within noise. Beside
 it is the speed center's own figure, each runtime's mean iteration
 time relative to CPython (lower is faster); the whole process's wall
 time is in the JSON.

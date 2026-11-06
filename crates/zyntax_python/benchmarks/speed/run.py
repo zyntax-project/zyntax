@@ -239,6 +239,11 @@ def main():
     print(f"\nwritten to {args.out}")
 
 
+# A difference this small, either way, is not told apart from the
+# run-to-run spread; the published pages use the same band.
+NOISE = 0.05
+
+
 def table(results, interps):
     """One line per kernel saying whether zypy is faster or slower than
     the fastest of the other runtimes on it, by how much, and the
@@ -247,7 +252,7 @@ def table(results, interps):
     others = [i for i in interps if i != "zypy"]
     head = f"{'kernel':<24}{'zypy against the best':<36}time vs cpython (lower is faster)"
     lines = [head, "-" * len(head)]
-    faster = slower = 0
+    faster = slower = level = 0
     for name, r in results.items():
         z = r.get("zypy", {})
         c = r.get("cpython", {})
@@ -256,7 +261,10 @@ def table(results, interps):
         if z.get("status") == "ok" and ran:
             best, best_ms = min(ran, key=lambda x: x[1])
             ratio = best_ms / z["mean_ms"]
-            if ratio >= 1.0:
+            if abs(ratio - 1.0) <= NOISE:
+                verdict = f"within noise of {best}"
+                level += 1
+            elif ratio >= 1.0:
                 verdict = f"FASTER than {best} by {ratio:.2f}x"
                 faster += 1
             else:
@@ -277,7 +285,7 @@ def table(results, interps):
         else:
             lines.append(f"{name:<24}{verdict:<36}{' '.join(chart)}")
     lines.append("")
-    lines.append(f"zypy faster than the best other runtime on {faster} kernel(s), slower on {slower}, not running on {len(results) - faster - slower}.")
+    lines.append(f"zypy faster than the best other runtime on {faster} kernel(s), within noise on {level}, slower on {slower}, not running on {len(results) - faster - level - slower}.")
     lines.append("time vs cpython: each runtime's mean iteration time divided by CPython's, the speed center's own chart; 0.25 means four times as fast as CPython.")
     return "\n".join(lines)
 

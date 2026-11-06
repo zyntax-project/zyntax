@@ -231,6 +231,7 @@
     table.narrow tr.all td { border-bottom: 1px dashed var(--rule); font-weight: 700; }
     td.ratio.faster { color: var(--text-primary); font-weight: 700; }
     td.ratio.slower { color: var(--text-secondary); }
+    td.ratio.level { color: var(--text-secondary); font-style: italic; }
     /* A phone keeps the ratio in view: the third interpreter, the
        slowest reference, gives way first. */
     @media (max-width: 640px) {
@@ -364,7 +365,7 @@
       The iteration time is the mean of these measurements. The speed center uses this number.
       The full process time is the time of all iterations, plus start-up, compilation and exit.
       The iteration count of each kernel is in its row.
-      The ratio column compares zypy with PyPy. The bars in a row use the slowest interpreter in that row as the full length.
+      The ratio column compares zypy with PyPy; a difference of 5% or less either way reads as within noise. The bars in a row use the slowest interpreter in that row as the full length.
     </p>
   </section>
 
@@ -438,9 +439,14 @@
       return row[metric];
     }
 
+    // A difference this small, either way, is not told apart from the
+    // run-to-run spread of a single machine.
+    const NOISE = 0.05;
+
     function ratioText(ours, base) {
       if (ours == null || base == null || ours <= 0) return { text: '—', cls: '' };
       const r = base / ours;
+      if (Math.abs(r - 1) <= NOISE) return { text: 'within noise', cls: 'level' };
       if (r >= 1) return { text: `${r.toFixed(2)}× faster`, cls: 'faster' };
       return { text: `${(1 / r).toFixed(2)}× slower`, cls: 'slower' };
     }
@@ -508,7 +514,7 @@
       const known = Object.keys(BENCHES).filter((b) => results[b]);
       const extra = Object.keys(results).filter((b) => !BENCHES[b]);
       let rows = '';
-      let shown = 0, faster = 0;
+      let shown = 0, faster = 0, level = 0;
       for (const bench of [...known, ...extra]) {
         const r = results[bench];
         const ours = timeOf(r[OURS], metric);
@@ -528,6 +534,7 @@
         const base = times[COLUMNS.findIndex((c) => c.key === BASELINE)];
         const ratio = ratioText(ours, base);
         if (ratio.cls === 'faster') faster++;
+        if (ratio.cls === 'level') level++;
         if (base != null) shown++;
         const script = r.script || `${bench}.py`;
         const detail = [script, ...(r.args || [])].join(' ') + (r.trials ? ` · ${r.trials} iteration${r.trials === 1 ? '' : 's'}` : '');
@@ -545,7 +552,7 @@
       }<th>zypy vs PyPy</th></tr></thead><tbody>${rows}</tbody></table>`;
       const what = metric === 'wall_ms' ? 'full process time' : 'iteration time';
       document.getElementById('summary').innerHTML =
-        `zypy is faster than PyPy on <b>${faster} of ${shown}</b> kernels by ${what}.`;
+        `zypy is faster than PyPy on <b>${faster} of ${shown}</b> kernels by ${what}${level ? `, and within noise on ${level}` : ''}.`;
 
       const m = data.meta || {};
       const chips = [];
