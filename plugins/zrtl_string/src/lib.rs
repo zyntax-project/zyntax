@@ -345,13 +345,14 @@ pub extern "C" fn string_index_of_from(haystack: StringPtr, needle: StringPtr, f
     }
 }
 
-/// A hash of the bytes, the same for equal contents; FNV-1a.
+/// A hash of the bytes, the same for equal contents and never zero; FNV-1a
+/// truncated to 32 bits, kept in the string's header after the first call.
 #[no_mangle]
 pub extern "C" fn string_hash(s: StringPtr) -> i64 {
     if s.is_null() {
         return 0;
     }
-    zrtl::fnv1a_bytes(unsafe { string_as_bytes(s) }) as i64
+    unsafe { zrtl::string::string_hash32(s) as i64 }
 }
 
 /// Find last index of substring, returns -1 if not found
@@ -1020,7 +1021,8 @@ mod tests {
         assert_eq!(unsafe { string_header(up) }.flags & TEXT, 0);
         let mixed = string_concat(raw, b);
         assert_eq!(unsafe { string_header(mixed) }.flags & TEXT, 0);
-        assert_eq!(string_hash(b), zrtl::fnv1a_bytes(&[b'x'; 40]) as i64);
+        assert_eq!(string_hash(b), zrtl::string::hash32_of(&[b'x'; 40]) as i64);
+        assert_eq!(string_hash(b), string_hash(b));
     }
 
     #[test]
