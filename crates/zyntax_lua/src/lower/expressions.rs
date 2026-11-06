@@ -188,18 +188,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     }
 
     /// The values of an expression list as a `List<Any>`, or as a flat
-    /// `List<i64>` (the second result) when there is no open tail and
-    /// every value is an integer.
+    /// list (the kind is the second result) when there is no open tail
+    /// and every value is an integer, or every one a float.
     pub(super) fn packed_list(
         &mut self,
         exprs: &[&Expression],
         span: Span,
-    ) -> Result<(Node, bool)> {
+    ) -> Result<(Node, Option<Ty>)> {
         let (mut pre, vals, tail) = self.expr_list(exprs)?;
-        if tail.is_none() && !vals.is_empty() && vals.iter().all(|v| v.ty == Ty::Int) {
-            let items = vals.into_iter().map(|v| v.node).collect();
-            let list = self.array_of_typed(items, self.m.types.ints(), &mut pre, span);
-            return Ok((block_value(pre, list, span), true));
+        for (kind, list_ty) in [
+            (Ty::Int, self.m.types.ints()),
+            (Ty::Float, self.m.types.floats()),
+        ] {
+            if tail.is_none() && !vals.is_empty() && vals.iter().all(|v| v.ty == kind) {
+                let items = vals.into_iter().map(|v| v.node).collect();
+                let list = self.array_of_typed(items, list_ty, &mut pre, span);
+                return Ok((block_value(pre, list, span), Some(kind)));
+            }
         }
         let mut items = Vec::with_capacity(vals.len());
         for v in vals {
@@ -207,7 +212,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         let list = self.array_of(items, &mut pre, span);
         Ok(match tail {
-            None => (block_value(pre, list, span), false),
+            None => (block_value(pre, list, span), None),
             Some(tail) => {
                 let name = self.temp();
                 pre.push(let_(name, self.m.anys(), list, span));
@@ -217,10 +222,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::Unit),
                     span,
                 )));
-                (
-                    block_value(pre, var(name, self.m.anys(), span), span),
-                    false,
-                )
+                (block_value(pre, var(name, self.m.anys(), span), span), None)
             }
         })
     }

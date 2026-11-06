@@ -430,58 +430,63 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             },
             ty,
         );
-        // A flat array of integers is read in place: raw when the type
-        // says integer, boxed otherwise.
-        let flat = index(
-            call(
-                "zb_unbox_list_raw_i64",
-                vec![field(t.node.clone(), "arr", Type::Any, span)],
-                self.m.types.ints(),
-                span,
-            ),
-            slot,
-            i64_t.clone(),
-            span,
-        );
-        let flat = if ty == Ty::Int {
-            flat
-        } else {
-            let boxed = call("zb_box_i64", vec![flat], Type::Any, span);
-            self.coerce(
-                Val {
-                    node: boxed,
-                    ty: Ty::Any,
-                },
-                ty,
-            )
+        // A flat array is read in place: raw when the type is its
+        // kind, boxed otherwise. An array the types say holds only
+        // values of another kind is never flat.
+        let kinds: &[crate::library::Flat] = match ty {
+            Ty::Int | Ty::IntOrNil => &[crate::library::Flat::Int],
+            Ty::Float | Ty::FloatOrNil => &[crate::library::Flat::Float],
+            Ty::Number | Ty::Scalar | Ty::Any | Ty::Unknown => &crate::library::Flat::ALL,
+            _ => &[],
         };
-        let is_flat = binary(
-            BinaryOp::Eq,
-            cast(
+        let mut element = element;
+        for f in kinds.iter().rev() {
+            let (unbox, list_ty, own) = match f {
+                crate::library::Flat::Int => {
+                    ("zb_unbox_list_raw_i64", self.m.types.ints(), Ty::Int)
+                }
+                crate::library::Flat::Float => {
+                    ("zb_unbox_list_raw_f64", self.m.types.floats(), Ty::Float)
+                }
+            };
+            let flat = index(
                 call(
-                    "zb_box_header_tag",
+                    unbox,
                     vec![field(t.node.clone(), "arr", Type::Any, span)],
-                    prim(PrimitiveType::I32),
+                    list_ty,
                     span,
                 ),
-                i64_t,
+                slot.clone(),
+                self.ir(own),
                 span,
-            ),
-            int_lit(crate::library::int_list_tag(), span),
-            bool_t.clone(),
-            span,
-        );
-        // An array the types say holds only values of another kind is
-        // never flat.
-        let may_be_flat = !matches!(
-            ty,
-            Ty::Str | Ty::Float | Ty::Bool | Ty::Table | Ty::Shape(_) | Ty::Func(_) | Ty::Nil
-        );
-        let element = if may_be_flat {
-            if_value(is_flat, flat, element, self.ir(ty), span)
-        } else {
-            element
-        };
+            );
+            // The element widens to the read's type; only a dynamic one
+            // is boxed.
+            let flat = self.coerce(
+                Val {
+                    node: flat,
+                    ty: own,
+                },
+                ty,
+            );
+            let is_flat = binary(
+                BinaryOp::Eq,
+                cast(
+                    call(
+                        "zb_box_header_tag",
+                        vec![field(t.node.clone(), "arr", Type::Any, span)],
+                        prim(PrimitiveType::I32),
+                        span,
+                    ),
+                    i64_t.clone(),
+                    span,
+                ),
+                int_lit(f.tag(), span),
+                bool_t.clone(),
+                span,
+            );
+            element = if_value(is_flat, flat, element, self.ir(ty), span);
+        }
         let general = self.coerce(general, ty);
         Val {
             node: block_value(

@@ -42,7 +42,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             // A flat array holds no nil: its next element is the next
             // position.
             if_(
-                crate::library::arr_is_ints(tb.e()),
+                crate::library::arr_is_flat(tb.e()),
                 vec![when(lt(i.e(), n.e()), vec![ret(i.e())])],
                 vec![while_(
                     lt(i.e(), n.e()),
@@ -102,34 +102,27 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             )),
         ],
     ));
-    d.push(define(
-        "zl_pos_value",
-        &[tb, &pos],
-        any(),
-        vec![
-            arr.decl(arr_raw(tb.e())),
-            n.decl(len(arr.e())),
-            when(
-                and(lt(pos.e(), n.e()), crate::library::arr_is_ints(tb.e())),
-                vec![ret(box_i64(idx(
-                    crate::library::arr_ints(tb.e(), t),
-                    pos.e(),
-                    i64(),
-                )))],
-            ),
-            when(lt(pos.e(), n.e()), vec![ret(at(arr.e(), pos.e()))]),
-            slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
-            when(
-                lt(sub(pos.e(), n.e()), slots.e()),
-                vec![ret(slot_load(tb.e(), sub(pos.e(), n.e())))],
-            ),
-            ret(call(
-                "zb_dict_value_at",
-                vec![hash_of(tb.e()), sub(sub(pos.e(), n.e()), slots.e())],
-                any(),
-            )),
-        ],
-    ));
+    let mut pos_value = vec![arr.decl(arr_raw(tb.e())), n.decl(len(arr.e()))];
+    for f in Flat::ALL {
+        pos_value.push(when(
+            and(lt(pos.e(), n.e()), f.is(tb.e())),
+            vec![ret(f.boxed(idx(f.list(tb.e(), t), pos.e(), f.elem())))],
+        ));
+    }
+    pos_value.extend(vec![
+        when(lt(pos.e(), n.e()), vec![ret(at(arr.e(), pos.e()))]),
+        slots.decl(if_expr(shaped(tb.e()), slot_count(tb.e()), int(0))),
+        when(
+            lt(sub(pos.e(), n.e()), slots.e()),
+            vec![ret(slot_load(tb.e(), sub(pos.e(), n.e())))],
+        ),
+        ret(call(
+            "zb_dict_value_at",
+            vec![hash_of(tb.e()), sub(sub(pos.e(), n.e()), slots.e())],
+            any(),
+        )),
+    ]);
+    d.push(define("zl_pos_value", &[tb, &pos], any(), pos_value));
     // The position just past key `k`: 0 for nil, the array slot for an
     // integer in the array part, the hash entry for anything else.
     d.push(define(

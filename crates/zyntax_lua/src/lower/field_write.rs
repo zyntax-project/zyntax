@@ -147,16 +147,24 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 );
             }
         }
-        // An integer stored under an integer key into a table goes to
-        // the entry that keeps an integer array flat; the box is made
+        // A number stored under an integer key into a table goes to the
+        // entry that keeps an array of its kind flat; the box is made
         // there only when the array is not.
-        if value.ty == Ty::Int && key.ty == Ty::Int && matches!(obj.ty, Ty::Table | Ty::Shape(_)) {
+        if matches!(value.ty, Ty::Int | Ty::Float)
+            && key.ty == Ty::Int
+            && matches!(obj.ty, Ty::Table | Ty::Shape(_))
+        {
+            let store = if value.ty == Ty::Int {
+                "zl_table_seti_int"
+            } else {
+                "zl_table_seti_float"
+            };
             let mut pre = Vec::new();
             let t = self.hold(obj, &mut pre);
             let k = self.hold(key, &mut pre);
             let held = self.hold(value, &mut pre);
             let on_table = call(
-                "zl_table_seti_int",
+                store,
                 vec![t.node.clone(), k.node.clone(), held.node.clone()],
                 unit.clone(),
                 span,

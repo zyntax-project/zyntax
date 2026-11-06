@@ -44,8 +44,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         }
         debug_assert!(meta.is_none(), "a metatable at birth needs a slotted shape");
         let table = match arr {
-            Some((arr, true)) => call("zl_table_with_flat", vec![arr], table_t.clone(), span),
-            Some((arr, false)) => call("zl_table_with_arr", vec![arr], table_t.clone(), span),
+            Some((arr, Some(Ty::Int))) => {
+                call("zl_table_with_flat", vec![arr], table_t.clone(), span)
+            }
+            Some((arr, Some(_))) => {
+                call("zl_table_with_flat_float", vec![arr], table_t.clone(), span)
+            }
+            Some((arr, None)) => call("zl_table_with_arr", vec![arr], table_t.clone(), span),
             None => call("zl_table_new", vec![], table_t.clone(), span),
         };
         let keyed: Vec<&ast::Field> = fields
@@ -95,7 +100,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         &mut self,
         k: ShapeId,
         fields: &[&ast::Field],
-        arr: Option<(Node, bool)>,
+        arr: Option<(Node, Option<Ty>)>,
         positional: usize,
         meta: Option<&Expression>,
         span: Span,
@@ -240,8 +245,9 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             )
             .node;
         let arr = match arr {
-            Some((arr, true)) => call("zl_arr_box_flat", vec![arr], Type::Any, span),
-            Some((arr, false)) => call("zl_arr_box", vec![arr], Type::Any, span),
+            Some((arr, Some(Ty::Int))) => call("zl_arr_box_flat", vec![arr], Type::Any, span),
+            Some((arr, Some(_))) => call("zl_arr_box_flat_float", vec![arr], Type::Any, span),
+            Some((arr, None)) => call("zl_arr_box", vec![arr], Type::Any, span),
             // The shared empty one, made at state entry.
             None => var(intern(library::ARR_EMPTY), Type::Any, span),
         };

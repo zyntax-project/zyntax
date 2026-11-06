@@ -192,13 +192,17 @@ unsafe fn list_of(b: *const BoxHeader) -> Option<&'static mut ListHeader> {
     (!list.is_null()).then(|| unsafe { &mut *list })
 }
 
-/// A table's array part when it holds boxes; a flat list of integers
+/// A table's array part when it holds boxes; a flat list of numbers
 /// holds nothing the collector reaches or clears.
 ///
 /// # Safety
 /// As [`list_of`].
 unsafe fn array_of(b: *const BoxHeader) -> Option<&'static mut ListHeader> {
-    if b.is_null() || unsafe { (*b).tag } as i64 == library::int_list_tag() {
+    if b.is_null()
+        || library::Flat::ALL
+            .iter()
+            .any(|f| unsafe { (*b).tag } as i64 == f.tag())
+    {
         return None;
     }
     unsafe { list_of(b) }

@@ -188,22 +188,97 @@ pub fn arr_field(tb: Expr) -> Expr {
     fld(tb, "arr", any())
 }
 
-/// The box tag of a flat list of integers, which an array part may be.
-pub fn int_list_tag() -> i64 {
-    zyntax_builtins::Kind::Int.list_tag()
+/// A flat array part: the elements of one number kind, stored without
+/// a box each.
+#[derive(Clone, Copy)]
+pub enum Flat {
+    Int,
+    Float,
 }
 
-/// Whether the array part is a flat list of integers.
-pub fn arr_is_ints(tb: Expr) -> Expr {
-    eq(
-        cast(call("zb_box_header_tag", vec![arr_field(tb)], i32()), i64()),
-        int(int_list_tag()),
-    )
+impl Flat {
+    pub const ALL: [Flat; 2] = [Flat::Int, Flat::Float];
+
+    fn kind(self) -> zyntax_builtins::Kind {
+        match self {
+            Flat::Int => zyntax_builtins::Kind::Int,
+            Flat::Float => zyntax_builtins::Kind::Float,
+        }
+    }
+
+    /// The box tag of the list.
+    pub fn tag(self) -> i64 {
+        self.kind().list_tag()
+    }
+
+    /// Whether the array part is flat of this kind.
+    pub fn is(self, tb: Expr) -> Expr {
+        eq(
+            cast(call("zb_box_header_tag", vec![arr_field(tb)], i32()), i64()),
+            int(self.tag()),
+        )
+    }
+
+    pub fn elem(self) -> Type {
+        match self {
+            Flat::Int => i64(),
+            Flat::Float => f64(),
+        }
+    }
+
+    pub fn list_ty(self, t: &Types) -> Type {
+        match self {
+            Flat::Int => t.ints(),
+            Flat::Float => t.floats(),
+        }
+    }
+
+    /// The array part as a list of this kind; it is known to be one.
+    pub fn list(self, tb: Expr, t: &Types) -> Expr {
+        let unbox = match self {
+            Flat::Int => "zb_unbox_list_raw_i64",
+            Flat::Float => "zb_unbox_list_raw_f64",
+        };
+        call(unbox, vec![arr_field(tb)], self.list_ty(t))
+    }
+
+    /// A list of this kind as an array part.
+    pub fn box_list(self, list: Expr) -> Expr {
+        let name = match self {
+            Flat::Int => "zb_list_box_i64",
+            Flat::Float => "zb_list_box_f64",
+        };
+        call(name, vec![list], any())
+    }
+
+    /// An element as a dynamic value.
+    pub fn boxed(self, e: Expr) -> Expr {
+        match self {
+            Flat::Int => box_i64(e),
+            Flat::Float => box_f64(e),
+        }
+    }
+
+    /// The element a dynamic value of this kind holds.
+    pub fn unboxed(self, v: Expr) -> Expr {
+        match self {
+            Flat::Int => get_i64(v),
+            Flat::Float => get_f64(v),
+        }
+    }
+
+    /// The category of a dynamic value of this kind.
+    pub fn category(self) -> i64 {
+        match self {
+            Flat::Int => INT,
+            Flat::Float => FLOAT,
+        }
+    }
 }
 
-/// The array part as a flat list of integers; it is known to be one.
-pub fn arr_ints(tb: Expr, t: &Types) -> Expr {
-    call("zb_unbox_list_raw_i64", vec![arr_field(tb)], t.ints())
+/// Whether the array part is flat of either kind.
+pub fn arr_is_flat(tb: Expr) -> Expr {
+    or(Flat::Int.is(tb.clone()), Flat::Float.is(tb))
 }
 
 /// The array part viewed as a list of boxes without a check. Only its

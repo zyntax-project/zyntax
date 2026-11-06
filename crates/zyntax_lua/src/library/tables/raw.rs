@@ -118,41 +118,49 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             ret(arr_of(tb.e())),
         ],
     ));
-    // The array part as a list of boxes: a flat list of integers is
-    // replaced by the boxed equivalent, once; the table is generic from
-    // then on.
-    let flat = local("flat", t.ints());
-    let boxed = local("boxed", t.anys());
-    let at_i = local("at_i", i64());
+    // The array part as a list of boxes: a flat list is replaced by the
+    // boxed equivalent, once; the table is generic from then on.
+    let flats: Vec<(Flat, Local, Local, Local)> = Flat::ALL
+        .iter()
+        .map(|f| {
+            let (flat, boxed, at_i) = match f {
+                Flat::Int => ("flat_i", "boxed_i", "at_i"),
+                Flat::Float => ("flat_f", "boxed_f", "at_f"),
+            };
+            (
+                *f,
+                local(flat, f.list_ty(t)),
+                local(boxed, t.anys()),
+                local(at_i, i64()),
+            )
+        })
+        .collect();
     let flat_len = local("flat_len", i64());
-    d.push(define(
-        "zl_arr_generic",
-        &[tb],
-        anys.clone(),
-        vec![
-            when(
-                crate::library::arr_is_ints(tb.e()),
-                vec![
-                    flat.decl(crate::library::arr_ints(tb.e(), t)),
-                    boxed.decl(list(Vec::new(), anys.clone())),
-                    at_i.decl(int(0)),
-                    while_(
-                        lt(at_i.e(), len(flat.e())),
-                        vec![
-                            push(boxed.e(), box_i64(idx(flat.e(), at_i.e(), i64()))),
-                            at_i.add_assign(int(1)),
-                        ],
-                    ),
-                    set_field(
-                        tb.e(),
-                        "arr",
-                        call("zb_list_box_any", vec![boxed.e()], any()),
-                    ),
-                ],
-            ),
-            ret(crate::library::arr_raw(tb.e(), t)),
-        ],
-    ));
+    let mut generic = Vec::new();
+    for (f, fl, boxed, at_i) in &flats {
+        generic.push(when(
+            f.is(tb.e()),
+            vec![
+                fl.decl(f.list(tb.e(), t)),
+                boxed.decl(list(Vec::new(), anys.clone())),
+                at_i.decl(int(0)),
+                while_(
+                    lt(at_i.e(), len(fl.e())),
+                    vec![
+                        push(boxed.e(), f.boxed(idx(fl.e(), at_i.e(), f.elem()))),
+                        at_i.add_assign(int(1)),
+                    ],
+                ),
+                set_field(
+                    tb.e(),
+                    "arr",
+                    call("zb_list_box_any", vec![boxed.e()], any()),
+                ),
+            ],
+        ));
+    }
+    generic.push(ret(crate::library::arr_raw(tb.e(), t)));
+    d.push(define("zl_arr_generic", &[tb], anys.clone(), generic));
     d.push(define(
         "zl_table_new",
         &[],
@@ -172,26 +180,27 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             ret(struct_lit(call("zl_arr_box", vec![arr.e()], any()), n.e())),
         ]
     }));
-    // A table over the integer values of a constructor, flat. The
+    // A table over the number values of a constructor, flat. The
     // shaped constructors box the same list.
-    let ints_kept = kept("ints", t.ints());
-    d.push(define(
-        "zl_table_with_flat",
-        &[&ints_kept],
-        table.clone(),
-        {
+    for f in Flat::ALL {
+        let (with_name, box_name) = match f {
+            Flat::Int => ("zl_table_with_flat", "zl_arr_box_flat"),
+            Flat::Float => ("zl_table_with_flat_float", "zl_arr_box_flat_float"),
+        };
+        let kept_list = kept("flat", f.list_ty(t));
+        d.push(define(with_name, &[&kept_list], table.clone(), {
             vec![
-                n.decl(len(ints_kept.e())),
+                n.decl(len(kept_list.e())),
                 ret(struct_lit(
-                    call("zl_arr_box_flat", vec![ints_kept.e()], any()),
+                    call(box_name, vec![kept_list.e()], any()),
                     n.e(),
                 )),
             ]
-        },
-    ));
-    d.push(define("zl_arr_box_flat", &[&ints_kept], any(), {
-        vec![ret(call("zb_list_box_i64", vec![ints_kept.e()], any()))]
-    }));
+        }));
+        d.push(define(box_name, &[&kept_list], any(), {
+            vec![ret(f.box_list(kept_list.e()))]
+        }));
+    }
     // The array part of a shaped table, boxed, trimmed like a plain
     // table's; the program lays the rest of the table out itself. An
     // empty one is the shared one.
@@ -234,40 +243,39 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
     ));
 
     // ─── raw reads ──────────────────────────────────────────────
-    d.push(define(
-        "zl_rawgeti",
-        &[tb, i],
-        any(),
-        vec![
-            when(
-                crate::library::arr_is_ints(tb.e()),
-                vec![
-                    flat.decl(crate::library::arr_ints(tb.e(), t)),
-                    when(
-                        and(ge(i.e(), int(1)), le(i.e(), len(flat.e()))),
-                        vec![ret(box_i64(idx(flat.e(), sub(i.e(), int(1)), i64())))],
-                    ),
-                    when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
-                    ret(call(
-                        "zb_dict_get_default",
-                        vec![hash_of(tb.e()), box_i64(i.e()), nil()],
-                        any(),
-                    )),
-                ],
-            ),
-            arr.decl(arr_raw(tb.e())),
-            when(
-                and(ge(i.e(), int(1)), le(i.e(), len(arr.e()))),
-                vec![ret(at(arr.e(), sub(i.e(), int(1))))],
-            ),
-            when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
-            ret(call(
-                "zb_dict_get_default",
-                vec![hash_of(tb.e()), box_i64(i.e()), nil()],
-                any(),
-            )),
-        ],
-    ));
+    let mut geti = Vec::new();
+    for (f, fl, _, _) in &flats {
+        geti.push(when(
+            f.is(tb.e()),
+            vec![
+                fl.decl(f.list(tb.e(), t)),
+                when(
+                    and(ge(i.e(), int(1)), le(i.e(), len(fl.e()))),
+                    vec![ret(f.boxed(idx(fl.e(), sub(i.e(), int(1)), f.elem())))],
+                ),
+                when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
+                ret(call(
+                    "zb_dict_get_default",
+                    vec![hash_of(tb.e()), box_i64(i.e()), nil()],
+                    any(),
+                )),
+            ],
+        ));
+    }
+    geti.extend(vec![
+        arr.decl(arr_raw(tb.e())),
+        when(
+            and(ge(i.e(), int(1)), le(i.e(), len(arr.e()))),
+            vec![ret(at(arr.e(), sub(i.e(), int(1))))],
+        ),
+        when(is_nil(hash_field(tb.e())), vec![ret(nil())]),
+        ret(call(
+            "zb_dict_get_default",
+            vec![hash_of(tb.e()), box_i64(i.e()), nil()],
+            any(),
+        )),
+    ]);
+    d.push(define("zl_rawgeti", &[tb, i], any(), geti));
     let slot = local("slot", i64());
     d.push(define(
         "zl_rawget_str",
@@ -431,128 +439,126 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             ret_void(),
         ],
     ));
-    d.push(define(
-        "zl_rawseti",
-        &[tb, i, v],
-        unit(),
-        vec![
-            // A flat array of integers takes an integer in place, at the
-            // end when the table has no hash part to migrate from, and
-            // loses its last element to nil; any other store makes it
-            // generic below.
-            when(
-                crate::library::arr_is_ints(tb.e()),
-                vec![
-                    flat.decl(crate::library::arr_ints(tb.e(), t)),
-                    flat_len.decl(len(flat.e())),
-                    when(
-                        and(
-                            is_nil(v.e()),
-                            and(ge(i.e(), int(1)), eq(i.e(), flat_len.e())),
+    // A flat array takes a number of its kind in place, at the end
+    // when the table has no hash part to migrate from, and loses its
+    // last element to nil; any other store makes it generic below.
+    let mut seti = Vec::new();
+    for (f, fl, _, _) in &flats {
+        seti.push(when(
+            f.is(tb.e()),
+            vec![
+                fl.decl(f.list(tb.e(), t)),
+                flat_len.decl(len(fl.e())),
+                when(
+                    and(
+                        is_nil(v.e()),
+                        and(ge(i.e(), int(1)), eq(i.e(), flat_len.e())),
+                    ),
+                    vec![
+                        when(
+                            gt(flat_len.e(), crate::library::high_of(tb.e())),
+                            vec![set_field(tb.e(), "high", flat_len.e())],
                         ),
-                        vec![
-                            when(
-                                gt(flat_len.e(), crate::library::high_of(tb.e())),
-                                vec![set_field(tb.e(), "high", flat_len.e())],
-                            ),
-                            expr(mcall(flat.e(), "pop_last", vec![], i64())),
-                            ret_void(),
-                        ],
-                    ),
-                    when(
-                        not(is_nil(v.e())),
-                        vec![
-                            cat.decl(category(v.e())),
-                            when(
-                                is_cat(cat, INT),
-                                vec![
-                                    when(
-                                        and(ge(i.e(), int(1)), le(i.e(), flat_len.e())),
-                                        vec![
-                                            set_idx(flat.e(), sub(i.e(), int(1)), get_i64(v.e())),
-                                            ret_void(),
-                                        ],
-                                    ),
-                                    when(
-                                        and(
-                                            eq(i.e(), add(flat_len.e(), int(1))),
-                                            is_nil(hash_field(tb.e())),
-                                        ),
-                                        vec![push(flat.e(), get_i64(v.e())), ret_void()],
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                    expr(call("zl_arr_generic", vec![tb.e()], anys.clone())),
-                ],
-            ),
-            when(
-                eq(arr_field(tb.e()), read_global(ARR_EMPTY, any())),
-                vec![expr(call("zl_arr_own", vec![tb.e()], anys.clone()))],
-            ),
-            arr.decl(arr_raw(tb.e())),
-            n.decl(len(arr.e())),
-            when(
-                and(ge(i.e(), int(1)), le(i.e(), n.e())),
-                vec![
-                    if_(
-                        and(is_nil(v.e()), eq(i.e(), n.e())),
-                        vec![
-                            when(
-                                gt(n.e(), crate::library::high_of(tb.e())),
-                                vec![set_field(tb.e(), "high", n.e())],
-                            ),
-                            expr(mcall(arr.e(), "pop_last", vec![], any())),
-                            while_(
-                                and(
-                                    gt(len(arr.e()), int(0)),
-                                    is_nil(at(arr.e(), sub(len(arr.e()), int(1)))),
+                        expr(mcall(fl.e(), "pop_last", vec![], f.elem())),
+                        ret_void(),
+                    ],
+                ),
+                when(
+                    not(is_nil(v.e())),
+                    vec![
+                        cat.decl(category(v.e())),
+                        when(
+                            is_cat(cat, f.category()),
+                            vec![
+                                when(
+                                    and(ge(i.e(), int(1)), le(i.e(), flat_len.e())),
+                                    vec![
+                                        set_idx(fl.e(), sub(i.e(), int(1)), f.unboxed(v.e())),
+                                        ret_void(),
+                                    ],
                                 ),
-                                vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
+                                when(
+                                    and(
+                                        eq(i.e(), add(flat_len.e(), int(1))),
+                                        is_nil(hash_field(tb.e())),
+                                    ),
+                                    vec![push(fl.e(), f.unboxed(v.e())), ret_void()],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                expr(call("zl_arr_generic", vec![tb.e()], anys.clone())),
+            ],
+        ));
+    }
+    seti.extend(vec![
+        when(
+            eq(arr_field(tb.e()), read_global(ARR_EMPTY, any())),
+            vec![expr(call("zl_arr_own", vec![tb.e()], anys.clone()))],
+        ),
+        arr.decl(arr_raw(tb.e())),
+        n.decl(len(arr.e())),
+        when(
+            and(ge(i.e(), int(1)), le(i.e(), n.e())),
+            vec![
+                if_(
+                    and(is_nil(v.e()), eq(i.e(), n.e())),
+                    vec![
+                        when(
+                            gt(n.e(), crate::library::high_of(tb.e())),
+                            vec![set_field(tb.e(), "high", n.e())],
+                        ),
+                        expr(mcall(arr.e(), "pop_last", vec![], any())),
+                        while_(
+                            and(
+                                gt(len(arr.e()), int(0)),
+                                is_nil(at(arr.e(), sub(len(arr.e()), int(1)))),
                             ),
-                        ],
-                        vec![set_idx(arr.e(), sub(i.e(), int(1)), v.e())],
-                    ),
-                    ret_void(),
-                ],
-            ),
-            when(
-                and(eq(i.e(), add(n.e(), int(1))), not(is_nil(v.e()))),
-                vec![
-                    push(arr.e(), v.e()),
-                    when(
-                        not(is_nil(hash_field(tb.e()))),
-                        vec![expr(call("zl_migrate", vec![tb.e()], unit()))],
-                    ),
-                    ret_void(),
-                ],
-            ),
-            // Absent, and told to stay absent.
-            when(
-                and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
-                vec![ret_void()],
-            ),
-            when(
-                ne(read_global(crate::library::gc::GC_DIRTY, i64()), int(0)),
-                vec![expr(call(
-                    "zl_gc_before_insert",
-                    vec![tb.e(), box_i64(i.e()), v.e()],
-                    unit(),
-                ))],
-            ),
-            expr(call(
-                "zb_dict_set",
-                vec![
-                    call("zl_hash_ensure", vec![tb.e()], t.dict()),
-                    box_i64(i.e()),
-                    v.e(),
-                ],
+                            vec![expr(mcall(arr.e(), "pop_last", vec![], any()))],
+                        ),
+                    ],
+                    vec![set_idx(arr.e(), sub(i.e(), int(1)), v.e())],
+                ),
+                ret_void(),
+            ],
+        ),
+        when(
+            and(eq(i.e(), add(n.e(), int(1))), not(is_nil(v.e()))),
+            vec![
+                push(arr.e(), v.e()),
+                when(
+                    not(is_nil(hash_field(tb.e()))),
+                    vec![expr(call("zl_migrate", vec![tb.e()], unit()))],
+                ),
+                ret_void(),
+            ],
+        ),
+        // Absent, and told to stay absent.
+        when(
+            and(is_nil(v.e()), is_nil(hash_field(tb.e()))),
+            vec![ret_void()],
+        ),
+        when(
+            ne(read_global(crate::library::gc::GC_DIRTY, i64()), int(0)),
+            vec![expr(call(
+                "zl_gc_before_insert",
+                vec![tb.e(), box_i64(i.e()), v.e()],
                 unit(),
-            )),
-            ret_void(),
-        ],
-    ));
+            ))],
+        ),
+        expr(call(
+            "zb_dict_set",
+            vec![
+                call("zl_hash_ensure", vec![tb.e()], t.dict()),
+                box_i64(i.e()),
+                v.e(),
+            ],
+            unit(),
+        )),
+        ret_void(),
+    ]);
+    d.push(define("zl_rawseti", &[tb, i, v], unit(), seti));
     d.push(define(
         "zl_rawset_str",
         &[tb, s, v],
