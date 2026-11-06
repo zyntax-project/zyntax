@@ -1,8 +1,8 @@
 # Zyntax Bytecode Format Specification
 
-**Version**: 11.0
+**Version**: 12.0
 **Status**: Stable
-**Last Updated**: 2026-10-24
+**Last Updated**: 2026-11-06
 
 ---
 
@@ -27,7 +27,7 @@ on values.
 | CLI loader | `crates/zyntax_cli/src/formats/hir_bytecode.rs` |
 
 The payload layout is defined by the codec applied to the declarations in
-those files. Section 5 transcribes them for format 11.0; where the two
+those files. Section 5 transcribes them for format 12.0; where the two
 disagree, the source is authoritative.
 
 ### Where the format is used
@@ -60,7 +60,7 @@ All multi-byte fields are little-endian.
 | Offset | Size | Field | Written as | Checked on read |
 |--------|------|-------|------------|-----------------|
 | 0x00 | 4 | `magic` | u32 `0x5A424300`, bytes `00 43 42 5A` | must match |
-| 0x04 | 2 | `major_version` | u16 `10` | must equal 10 |
+| 0x04 | 2 | `major_version` | u16 `12` | must equal 12 |
 | 0x06 | 2 | `minor_version` | u16 `0` | not checked |
 | 0x08 | 1 | `format` | u8 payload encoding, section 3 | must be 0 to 3 |
 | 0x09 | 3 | padding | zero | not checked |
@@ -93,7 +93,7 @@ over bytes 76 to the end of the file. The header is not covered.
 
 1. At least the eight-byte magic/version prefix is present, else `InvalidFormat`.
 2. `magic` matches, else `InvalidFormat`.
-3. `major_version` is 10, else `VersionMismatch`. The minor version is not
+3. `major_version` is 12, else `VersionMismatch`. The minor version is not
    compared. Older headers are refused before reading new fields.
 4. The complete 76-byte header is present, else `InvalidFormat`.
 5. `build_id` matches the running compiler, else `CompilerMismatch`.
@@ -202,7 +202,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (92 bytes).
 `zyntax_compiler::BUILD_ID_BYTES`:
 
 ```
-0000  00 43 42 5a 0b 00 00 00 00 00 00 00 00 00 00 00
+0000  00 43 42 5a 0c 00 00 00 00 00 00 00 00 00 00 00
 0010  01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 0020  10 00 00 00 00 00 00 00 5e fe 0f c0
 002c  B (32 bytes)
@@ -212,7 +212,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (92 bytes).
 | Bytes | Meaning |
 |-------|---------|
 | `00 43 42 5a` | magic |
-| `0b 00` `00 00` | version 11.0 |
+| `0c 00` `00 00` | version 12.0 |
 | `00` `00 00 00` | format 0 (Postcard), padding |
 | `00 00 00 00` | flags |
 | `01 00 00 00` + 12 zero bytes | module_id: module id 1 |
@@ -221,7 +221,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (92 bytes).
 | `B` | compiler fingerprint |
 | `01` | `HirModule.id` = 1 |
 | `01 6d` | `name` = `"m"` |
-| `00` x 13 | `functions`, `globals`, `types`, `imports`, `exports` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types`, `object_struct_types` and `initializers` empty |
+| `00` x 13 | `functions`, `globals`, `types`, `imports`, `exports`, `initializers` empty; `version` 0; `dependencies`, `effects`, `handlers` empty; `automatic_release` false; `exact_struct_types` and `object_struct_types` empty |
 
 ### 4.2 Instructions and terminators
 
@@ -242,7 +242,7 @@ An empty module with id 1 named `m`, in the Postcard encoding (92 bytes).
 
 ## 5. Payload Data Model
 
-This is the format 11.0 schema. Types are written in Rust notation; every
+This is the format 12.0 schema. Types are written in Rust notation; every
 struct field is present, in the order shown. A `Box<T>` or `Arc<T>` in the
 source is shown as `T`, which encodes identically.
 
@@ -331,7 +331,8 @@ HirFunctionSignature {
 HirParam { id: HirId, name: InternedString, ty: HirType,
            attributes: ParamAttributes, ownership: ParamOwnership }
 ParamAttributes { by_ref: bool, sret: bool, zext: bool, sext: bool,
-                  noalias: bool, nonnull: bool, readonly: bool }
+                  noalias: bool, nonnull: bool, readonly: bool,
+                  allocation_backed: bool, release_symbol: Option<String> }
 
 FunctionAttributes {
     inline: InlineHint,
@@ -682,7 +683,7 @@ it has no body), keyed by the entry's id.
 2. Encode it with the chosen codec (section 3). For Split, lay out the blob
    and directory as in section 6.1.
 3. Compute the CRC-32 of the encoded payload.
-4. Write the 76-byte header (section 2) with version 11.0, the format byte,
+4. Write the 76-byte header (section 2) with version 12.0, the format byte,
    flags 0, the module id, the payload length and the checksum; then the
    payload; then nothing else.
 
@@ -697,7 +698,7 @@ The Rust entry points are `serialize_module(&module, Format)`,
 ## 8. Versioning
 
 A reader accepts a file only when its major version equals the reader's own,
-10, and its compiler fingerprint matches. The minor version is written as 0
+12, and its compiler fingerprint matches. The minor version is written as 0
 and not compared. A file of any other
 major version is refused with `VersionMismatch`; a compiler mismatch produces
 `CompilerMismatch`. There is no reading of older or newer majors. The HIR
@@ -730,3 +731,4 @@ recorded by a different build or for a different width.
 | 9.0 | 2026-10-20 | `HirModule.initializers` records ordered startup roots. |
 | 10.0 | 2026-10-20 | Header grows to 76 bytes with the shared compiler/source fingerprint, checked before any payload decoding. |
 | 11.0 | 2026-10-24 | `HirModule.object_struct_types` records the struct types whose pointers never address list element storage, and `FunctionAttributes.returns_nonnull` records a function that never returns zero or null. |
+| 12.0 | 2026-11-04 | `ParamAttributes.allocation_backed` records pointers into allocated storage. The parameter schema also carries the `release_symbol` cleanup metadata. |
