@@ -21,7 +21,7 @@ use crate::zrtl::TypeTag;
 
 /// The smallest and the count of integers that have a shared box.
 pub const SMALL_INT_MIN: i64 = -5;
-pub const SMALL_INT_COUNT: usize = 262;
+pub const SMALL_INT_COUNT: usize = 2053;
 
 /// A box with its payload beside it: the layout the box pass makes.
 #[repr(C)]
