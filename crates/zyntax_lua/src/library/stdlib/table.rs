@@ -31,6 +31,72 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
     // what follows up.
     let arr = borrowed("arr", anys.clone());
     let v = kept("v", any());
+    // The shifts of insert and remove on a flat array, in place; a
+    // value of another kind makes the array generic first.
+    let flat_cat = local("flat_cat", i64());
+    let mut insert_flat = Vec::new();
+    let mut remove_flat = Vec::new();
+    for f in Flat::ALL {
+        let (ins_name, rem_name) = match f {
+            Flat::Int => ("ins_flat_i", "rem_flat_i"),
+            Flat::Float => ("ins_flat_f", "rem_flat_f"),
+        };
+        let ins = local(ins_name, f.list_ty(t));
+        let rem = local(rem_name, f.list_ty(t));
+        insert_flat.push(when(
+            and(f.is(tb.e()), is_cat(&flat_cat, f.category())),
+            vec![
+                ins.decl(f.list(tb.e(), t)),
+                when(
+                    eq(len(ins.e()), n.e()),
+                    vec![
+                        expr(mcall(
+                            ins.e(),
+                            "insert_at",
+                            vec![sub(i.e(), int(1)), f.unboxed(v.e())],
+                            unit(),
+                        )),
+                        ret_void(),
+                    ],
+                ),
+            ],
+        ));
+        remove_flat.push(when(
+            and(f.is(tb.e()), le(i.e(), n.e())),
+            vec![
+                rem.decl(f.list(tb.e(), t)),
+                when(
+                    eq(len(rem.e()), n.e()),
+                    vec![
+                        when(
+                            gt(n.e(), crate::library::high_of(tb.e())),
+                            vec![set_field(tb.e(), "high", n.e())],
+                        ),
+                        expr(mcall(
+                            rem.e(),
+                            "remove_at",
+                            vec![sub(i.e(), int(1))],
+                            f.elem(),
+                        )),
+                        ret(v.e()),
+                    ],
+                ),
+            ],
+        ));
+    }
+    let mut flat_insert_body = vec![flat_cat.decl(category(v.e()))];
+    flat_insert_body.extend(insert_flat);
+    let insert_flat = when(
+        and(
+            eq(crate::library::meta_of(tb.e(), t), null(table.clone())),
+            is_nil(hash_field(tb.e())),
+        ),
+        vec![when(not(is_nil(v.e())), flat_insert_body)],
+    );
+    let remove_flat = when(
+        eq(crate::library::meta_of(tb.e(), t), null(table.clone())),
+        remove_flat,
+    );
     d.push(define(
         "zl_table_insert",
         &[tb, args],
@@ -71,6 +137,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
                     ret_void(),
                 ],
             ),
+            insert_flat,
             // Within the array part of a table without a metatable:
             // shift in place.
             arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
@@ -133,6 +200,7 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
                 ))],
             ),
             v.decl(call("zl_table_geti", vec![tb.e(), i.e()], any())),
+            remove_flat,
             arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
             if_(
                 and(
@@ -430,6 +498,99 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             ret_void(),
         ],
     ));
+    // The same quicksort over a flat array, ordered by `<`.
+    let mut flat_sorts = Vec::new();
+    for f in Flat::ALL {
+        let (name, array, pivot_name, swap_name) = match f {
+            Flat::Int => (
+                "zl_sort_range_i",
+                "flat_arr_i",
+                "flat_pivot_i",
+                "flat_tmp_i",
+            ),
+            Flat::Float => (
+                "zl_sort_range_f",
+                "flat_arr_f",
+                "flat_pivot_f",
+                "flat_tmp_f",
+            ),
+        };
+        let farr = borrowed(array, f.list_ty(t));
+        let piv = local(pivot_name, f.elem());
+        let swap = local(swap_name, f.elem());
+        let at_f = |x: Expr| idx(farr.e(), x, f.elem());
+        d.push(define(
+            name,
+            &[&farr, &lo_i, &hi_i, &line],
+            unit(),
+            vec![
+                when(ge(lo_i.e(), hi_i.e()), vec![ret_void()]),
+                piv.decl(at_f(div(add(lo_i.e(), hi_i.e()), int(2)))),
+                i.decl(lo_i.e()),
+                j.decl(hi_i.e()),
+                while_(
+                    le(i.e(), j.e()),
+                    vec![
+                        while_(
+                            and(le(i.e(), hi_i.e()), lt(at_f(i.e()), piv.e())),
+                            vec![i.add_assign(int(1))],
+                        ),
+                        while_(
+                            and(ge(j.e(), lo_i.e()), lt(piv.e(), at_f(j.e()))),
+                            vec![j.set(sub(j.e(), int(1)))],
+                        ),
+                        when(
+                            or(gt(i.e(), hi_i.e()), lt(j.e(), lo_i.e())),
+                            vec![
+                                set_global(LINE, line.e()),
+                                lua_error(text("invalid order function for sorting")),
+                            ],
+                        ),
+                        when(
+                            le(i.e(), j.e()),
+                            vec![
+                                swap.decl(at_f(i.e())),
+                                set_idx(farr.e(), i.e(), at_f(j.e())),
+                                set_idx(farr.e(), j.e(), swap.e()),
+                                i.add_assign(int(1)),
+                                j.set(sub(j.e(), int(1))),
+                            ],
+                        ),
+                    ],
+                ),
+                expr(call(
+                    name,
+                    vec![farr.e(), lo_i.e(), j.e(), line.e()],
+                    unit(),
+                )),
+                expr(call(
+                    name,
+                    vec![farr.e(), i.e(), hi_i.e(), line.e()],
+                    unit(),
+                )),
+                ret_void(),
+            ],
+        ));
+        let sorted = local(
+            match f {
+                Flat::Int => "sorted_i",
+                Flat::Float => "sorted_f",
+            },
+            f.list_ty(t),
+        );
+        flat_sorts.push(when(
+            f.is(tb.e()),
+            vec![
+                sorted.decl(f.list(tb.e(), t)),
+                expr(call(
+                    name,
+                    vec![sorted.e(), int(0), sub(len(sorted.e()), int(1)), line.e()],
+                    unit(),
+                )),
+                ret_void(),
+            ],
+        ));
+    }
     d.push(define(
         "zl_table_sort",
         &[tb, &comp],
@@ -439,6 +600,8 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             when(
                 eq(crate::library::meta_of(tb.e(), t), null(table.clone())),
                 vec![
+                    // A flat array under the default order sorts as it is.
+                    when(is_nil(comp.e()), flat_sorts),
                     arr.decl(call("zl_arr_own", vec![tb.e()], t.anys())),
                     expr(call(
                         "zl_sort_range",

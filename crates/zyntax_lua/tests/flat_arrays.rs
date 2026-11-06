@@ -1,8 +1,7 @@
 //! An array part holding only integers, or only floats, is stored flat,
 //! without a box per element. Every way of reading or changing such a
 //! table gives the answer a boxed array part does: `ints.lua` checks
-//! itself and prints `done`; the output of `traversal.lua` and
-//! `floats.lua` is pinned.
+//! itself and prints `done`; the output of the other scripts is pinned.
 
 use std::path::Path;
 use std::process::Command;
@@ -47,4 +46,14 @@ fn traversal_and_mutation_of_integer_arrays() {
 #[test]
 fn float_arrays_answer_as_boxed_ones_do() {
     pinned("floats");
+}
+
+#[test]
+fn sort_of_flat_arrays() {
+    pinned("sorts");
+}
+
+#[test]
+fn insert_and_remove_on_flat_arrays() {
+    pinned("shifts");
 }

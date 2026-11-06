@@ -1,0 +1,20 @@
+ins head	5 10 20 30 40 50 60 #7
+ins mid	5 10 20 35 30 40 50 60 #8
+ins end	5 10 20 35 30 40 50 60 99 #9
+append	5 10 20 35 30 40 50 60 99 100 #10
+ins float into ints	5 1.5f 10 20 35 30 40 50 60 99 100 #11
+ins str	5 s 1.5f 10 20 35 30 40 50 60 99 100 #12
+rm mid	1.5	5 s 10 20 35 30 40 50 60 99 100 #11
+rm head	5	s 10 20 35 30 40 50 60 99 100 #10
+rm last	100	s 10 20 35 30 40 50 60 99 #9
+f ins	1.5f 9.25f 2.5f 3.5f 4.5f 5.5f #6
+f ins int	1.5f 3 9.25f 2.5f 3.5f 4.5f 5.5f #7
+f rm	2.5	5.5	1.5f 3.5f 4.5f #3
+5 4 3 2 1 
+emptied	 #0	nil	nil
+hash ins	1 7 2 3 4 #5	1
+oob	false	bad argument #2 to 'insert' (position out of bounds)
+oob rm	false	bad argument #2 to 'remove' (position out of bounds)
+meta ins	1 50 2 3 4 #5
+rm meta	1	50 2 3 4 #4
+big	100500	-500	100000
