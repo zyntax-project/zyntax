@@ -603,9 +603,17 @@
           '<p class="loading">No results yet. The CI benchmark workflow publishes them.</p>';
         return;
       }
-      // Open on the machine measured last.
+      // Open on the newest run. Its machines are stamped as each one
+      // finishes, and the macOS leg always finishes last, so the latest
+      // stamp alone would pick it every time. Among the newest run's
+      // machines (one commit) a Linux one is preferred, the latest of them.
       const stamp = (d) => (d.data.meta && d.data.meta.date) || '';
-      const first = datasets.reduce((a, b) => (stamp(b) > stamp(a) ? b : a), datasets[0]);
+      const sha = (d) => (d.data.meta && d.data.meta.commit) || '';
+      const newest = datasets.reduce((a, b) => (stamp(b) > stamp(a) ? b : a), datasets[0]);
+      const ofRun = datasets.filter((d) => sha(d) === sha(newest));
+      const linux = ofRun.filter((d) => /linux/i.test((d.data.meta && d.data.meta.os) || ''));
+      const first = (linux.length ? linux : ofRun)
+        .reduce((a, b) => (stamp(b) > stamp(a) ? b : a));
       let current = first.data;
       let metric = 'mean_ms';
 
