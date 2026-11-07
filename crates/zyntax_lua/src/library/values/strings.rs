@@ -85,6 +85,55 @@ pub(super) fn append(context: &Context, t: &Types, d: &mut Vec<Decl>) {
             )),
         ],
     ));
+    // `..` of a dynamic value and a string: the string is not boxed
+    // unless a metamethod takes it.
+    let s = kept("s", string());
+    for (name, text_first) in [("zl_concat_as", false), ("zl_concat_sa", true)] {
+        let pair = |piece: Expr| {
+            if text_first {
+                vec![s.e(), piece]
+            } else {
+                vec![piece, s.e()]
+            }
+        };
+        let joined = |piece: Expr| ret(call("zb_str_concat_boxed", pair(piece), any()));
+        let params: [&Local; 2] = if text_first { [&s, a] } else { [a, &s] };
+        d.push(define(
+            name,
+            &params,
+            any(),
+            vec![
+                when(
+                    not(is_nil(a.e())),
+                    vec![
+                        cat.decl(category(a.e())),
+                        when(is_cat(cat, STR), vec![joined(get_str(a.e()))]),
+                        when(
+                            is_number_cat(cat),
+                            vec![joined(call("zl_number_str", vec![a.e()], string()))],
+                        ),
+                    ],
+                ),
+                ret(call(
+                    "zl_arith_meta",
+                    vec![
+                        int(OP_CONCAT),
+                        if text_first {
+                            call("zb_str_to_dynamic", vec![s.e()], any())
+                        } else {
+                            a.e()
+                        },
+                        if text_first {
+                            a.e()
+                        } else {
+                            call("zb_str_to_dynamic", vec![s.e()], any())
+                        },
+                    ],
+                    any(),
+                )),
+            ],
+        ));
+    }
     // `#x`: a string's bytes, a table's border or its `__len`, a
     // buffer's bytes.
     d.push(define(

@@ -1,7 +1,8 @@
 //! A number of unknown kind combined with a float is a float, and an
 //! integer's float word is its value: the results of `+ - * // %`,
 //! negation, `math.abs` and the rounding functions match the dynamic
-//! arithmetic's, kind included, for integers and floats alike.
+//! arithmetic's, kind included, for integers and floats alike. `..` of
+//! a dynamic value and a string answers as it does with both boxed.
 
 use std::path::Path;
 use std::process::Command;
@@ -30,4 +31,9 @@ fn unknown_kind_with_float_answers_as_dynamic_arithmetic_does() {
 #[test]
 fn integers_of_unknown_kind_convert_to_float_exactly() {
     pinned("number_float_word");
+}
+
+#[test]
+fn concat_of_a_dynamic_value_and_a_string_answers_as_boxed_operands_do() {
+    pinned("concat_with_string");
 }

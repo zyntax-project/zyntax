@@ -259,6 +259,17 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         node: binary(BinaryOp::Add, x, y, prim(PrimitiveType::String), span),
                         ty: Ty::Str,
                     }
+                } else if let (Ty::Any, Ty::Str) | (Ty::Str, Ty::Any) = (a.ty, b.ty) {
+                    // The string stays unboxed unless a metamethod takes it.
+                    let helper = if a.ty == Ty::Any {
+                        "zl_concat_as"
+                    } else {
+                        "zl_concat_sa"
+                    };
+                    Val {
+                        node: call(helper, vec![a.node, b.node], Type::Any, span),
+                        ty: Ty::Any,
+                    }
                 } else {
                     let x = self.boxed(a);
                     let y = self.boxed(b);
