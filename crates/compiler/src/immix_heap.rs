@@ -1,0 +1,1182 @@
+//! An Immix-style heap behind the host-heap seam.
+//!
+//! `ZYNTAX_HOST_HEAP=immix` runs a program on it: every allocation comes
+//! from one reservation of address space carved into 32 KiB blocks of
+//! 128-byte lines, and a conservative mark-sweep reclaims it. Nothing
+//! moves, and nothing is released but by a collection, so a `free` of a
+//! small block is a hint the heap ignores.
+//!
+//! An object of up to a line is bump-allocated and packed at 16 bytes,
+//! straddling a line boundary where it falls; a larger one owns whole
+//! lines up to [`MEDIUM_MAX`]; anything
+//! bigger is a block of its own from the system allocator. Object starts,
+//! span lengths and line marks live in side tables, so any address inside
+//! an allocation resolves to its start. A sweep frees blocks with no
+//! marked line and hands runs of unmarked lines back as bump regions.
+//!
+//! Collections run on the thread that claimed the heap, from an
+//! allocation, and only while no other thread has allocated: another
+//! thread's stack is never read.
+
+use std::alloc::Layout;
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use crate::host_heap::{HeapKind, HostHeap, SpanReader};
+
+const BLOCK: usize = 32 * 1024;
+const LINE: usize = 128;
+const QUANTUM: usize = 16;
+const LINES: usize = BLOCK / LINE;
+const QUANTA_PER_LINE: usize = LINE / QUANTUM;
+/// The most quanta a small object takes.
+const SMALL_QUANTA: usize = LINE / QUANTUM;
+const QUANTA: usize = BLOCK / QUANTUM;
+const MARK_WORDS: usize = LINES / 64;
+
+/// Largest request served from lines; above it the system allocator.
+const MEDIUM_MAX: usize = 16 * 1024;
+
+/// Start byte of a span; 1..=8 is a small object's size in quanta.
+const SPAN: u8 = 9;
+/// Start-byte bit of an object the open collection reached.
+const MARK: u8 = 0x80;
+const CODE: u8 = 0x7f;
+const MARKS_OF_EIGHT: u64 = 0x8080_8080_8080_8080;
+
+const FREE: u8 = 0;
+const USED: u8 = 1;
+
+const DEFAULT_HEAP_MB: usize = 8 * 1024;
+/// Allocation volume before the first collection, as the pool's
+/// collector waits.
+const DEFAULT_FLOOR_KB: usize = 32 * 1024;
+const MAX_GROWTH: usize = 4;
+const DEFAULT_GROWTH: usize = 2;
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
+/// A bump region: allocation proceeds from `cur` to `limit`.
+#[derive(Clone, Copy)]
+struct Region {
+    start: usize,
+    cur: usize,
+    limit: usize,
+}
+
+impl Region {
+    const EMPTY: Region = Region {
+        start: 0,
+        cur: 0,
+        limit: 0,
+    };
+}
+
+thread_local! {
+    static SMALL: Cell<Region> = const { Cell::new(Region::EMPTY) };
+    static MEDIUM: Cell<Region> = const { Cell::new(Region::EMPTY) };
+    /// This thread claimed the heap and runs its collections.
+    static OWNER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A thread claimed the heap.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+/// A thread other than the owner has allocated.
+static FOREIGN: AtomicBool = AtomicBool::new(false);
+/// Whether a spent budget starts a collection.
+static AUTOMATIC: AtomicBool = AtomicBool::new(true);
+
+struct Pool {
+    /// Blocks handed out so far; the rest of the reservation was never
+    /// touched and reads as zero.
+    cursor: usize,
+    /// Blocks every line of which died; their bytes are stale.
+    free_blocks: Vec<u32>,
+    /// Runs of dead lines in blocks with live ones: block, first line,
+    /// line count.
+    holes: Vec<(u32, u16, u16)>,
+}
+
+struct Large {
+    size: usize,
+    held: bool,
+}
+
+enum Root {
+    Range(usize),
+    Spans { word: usize, reader: SpanReader },
+}
+
+pub struct Heap {
+    base: usize,
+    blocks: usize,
+    /// Bytes of the reservation that hold blocks.
+    span: usize,
+    /// One byte per quantum: 0, a small size in quanta, or [`SPAN`],
+    /// with [`MARK`] set once reached.
+    starts: *mut u8,
+    /// The line count of the span starting at each line.
+    spans: *mut u16,
+    /// A bit per line, per block, set when a reached object covers it.
+    marks: *mut u64,
+    state: *mut u8,
+    has_span: *mut u8,
+    pool: Mutex<Pool>,
+    large: Mutex<BTreeMap<usize, Large>>,
+    roots: Mutex<BTreeMap<usize, Root>>,
+    since_gc: AtomicUsize,
+    threshold: AtomicUsize,
+    floor: usize,
+    growth: usize,
+    stress: bool,
+    live: AtomicUsize,
+    collections: AtomicUsize,
+}
+
+// SAFETY: the tables are plain memory indexed by block; the pool, the
+// large set and the roots sit behind locks, and a collection runs on one
+// thread with the others kept out of every shared structure.
+unsafe impl Send for Heap {}
+unsafe impl Sync for Heap {}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The process's heap, once installed.
+static HEAP: OnceLock<&'static Heap> = OnceLock::new();
+
+pub fn active() -> bool {
+    HEAP.get().is_some()
+}
+
+/// Make the calling thread the one that collects. A second thread
+/// claiming it ends collection for the process: two runtimes' stacks
+/// cannot both be read.
+pub fn claim_owner() {
+    if !active() {
+        return;
+    }
+    if CLAIMED.swap(true, Relaxed) && !OWNER.with(|o| o.get()) {
+        FOREIGN.store(true, Relaxed);
+        return;
+    }
+    OWNER.with(|o| o.set(true));
+}
+
+/// Note an allocation by a thread that does not own the heap.
+#[inline]
+fn note_allocator() {
+    if CLAIMED.load(Relaxed) && !OWNER.with(|o| o.get()) {
+        FOREIGN.store(true, Relaxed);
+    }
+}
+
+pub fn set_automatic(on: bool) {
+    AUTOMATIC.store(on, Relaxed);
+}
+
+pub fn collecting_here() -> bool {
+    active() && OWNER.with(|o| o.get())
+}
+
+/// A collection, if the calling thread may run one, whose deepest live
+/// stack word is at `sp`.
+pub fn collect_from_sp(sp: usize) {
+    if let Some(h) = HEAP.get()
+        && OWNER.with(|o| o.get())
+        && !FOREIGN.load(Relaxed)
+    {
+        h.collect_from(sp);
+    }
+}
+
+/// Bytes the calling thread has taken from its open regions.
+fn open_bytes() -> usize {
+    let used = |c: &Cell<Region>| {
+        let r = c.get();
+        r.cur - r.start
+    };
+    SMALL.with(used) + MEDIUM.with(used)
+}
+
+pub fn stats() -> crate::collector::Stats {
+    match HEAP.get() {
+        Some(h) => crate::collector::Stats {
+            collections: h.collections.load(Relaxed),
+            live: h.live.load(Relaxed),
+            // Regions are charged when they are retired; the calling
+            // thread's open ones count as far as they are used.
+            allocated: h.since_gc.load(Relaxed) + open_bytes(),
+        },
+        None => crate::collector::Stats::default(),
+    }
+}
+
+/// Reserve address space that reads as zero and costs nothing until
+/// touched.
+fn reserve(bytes: usize) -> *mut u8 {
+    // SAFETY: an anonymous private mapping of no particular address.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        std::ptr::null_mut()
+    } else {
+        p as *mut u8
+    }
+}
+
+impl Heap {
+    pub fn new(heap_bytes: usize) -> Option<Heap> {
+        let blocks = heap_bytes / BLOCK;
+        let raw = reserve(blocks * BLOCK + BLOCK);
+        let starts = reserve(blocks * QUANTA);
+        let spans = reserve(blocks * LINES * 2);
+        let marks = reserve(blocks * MARK_WORDS * 8);
+        let state = reserve(blocks);
+        let has_span = reserve(blocks);
+        if [raw, starts, spans, marks, state, has_span]
+            .iter()
+            .any(|p| p.is_null())
+        {
+            return None;
+        }
+        let floor = env_usize("ZYNTAX_IMMIX_FLOOR_KB").unwrap_or(DEFAULT_FLOOR_KB) << 10;
+        let stress = std::env::var_os("ZYNTAX_IMMIX_STRESS").is_some();
+        Some(Heap {
+            base: (raw as usize).next_multiple_of(BLOCK),
+            blocks,
+            span: blocks * BLOCK,
+            starts,
+            spans: spans as *mut u16,
+            marks: marks as *mut u64,
+            state,
+            has_span,
+            pool: Mutex::new(Pool {
+                cursor: 0,
+                free_blocks: Vec::new(),
+                holes: Vec::new(),
+            }),
+            large: Mutex::new(BTreeMap::new()),
+            roots: Mutex::new(BTreeMap::new()),
+            since_gc: AtomicUsize::new(0),
+            threshold: AtomicUsize::new(if stress { 0 } else { floor }),
+            floor,
+            growth: env_usize("ZYNTAX_IMMIX_GROWTH").unwrap_or(0),
+            stress,
+            live: AtomicUsize::new(0),
+            collections: AtomicUsize::new(0),
+        })
+    }
+
+    #[inline]
+    fn in_range(&self, a: usize) -> bool {
+        a.wrapping_sub(self.base) < self.span
+    }
+
+    #[inline]
+    fn block_addr(&self, b: usize) -> usize {
+        self.base + b * BLOCK
+    }
+
+    #[inline]
+    fn start_at(&self, quantum: usize) -> *mut u8 {
+        // SAFETY: the table covers every quantum of the reservation.
+        unsafe { self.starts.add(quantum) }
+    }
+
+    // -- Allocation ---------------------------------------------------
+
+    fn alloc_small(&self, size: usize) -> *mut u8 {
+        let quanta = size.div_ceil(QUANTUM);
+        let bytes = quanta * QUANTUM;
+        SMALL.with(|cell| {
+            let mut r = cell.get();
+            loop {
+                let p = r.cur;
+                if p + bytes <= r.limit {
+                    r.cur = p + bytes;
+                    cell.set(r);
+                    // SAFETY: `p` lies in a region of this heap.
+                    unsafe { *self.start_at((p - self.base) / QUANTUM) = quanta as u8 };
+                    return p as *mut u8;
+                }
+                r = self.next_region(r, 1);
+                cell.set(r);
+                if r.limit == 0 {
+                    return std::ptr::null_mut();
+                }
+            }
+        })
+    }
+
+    fn alloc_medium(&self, size: usize) -> *mut u8 {
+        let lines = size.div_ceil(LINE);
+        MEDIUM.with(|cell| {
+            let mut r = cell.get();
+            loop {
+                let p = (r.cur + LINE - 1) & !(LINE - 1);
+                if p + lines * LINE <= r.limit {
+                    r.cur = p + lines * LINE;
+                    cell.set(r);
+                    let q = (p - self.base) / QUANTUM;
+                    let line = (p - self.base) / LINE;
+                    let block = (p - self.base) / BLOCK;
+                    // SAFETY: `p` lies in a region of this heap.
+                    unsafe {
+                        *self.start_at(q) = SPAN;
+                        *self.spans.add(line) = lines as u16;
+                        *self.has_span.add(block) = 1;
+                    }
+                    return p as *mut u8;
+                }
+                r = self.next_region(r, lines);
+                cell.set(r);
+                if r.limit == 0 {
+                    return std::ptr::null_mut();
+                }
+            }
+        })
+    }
+
+    fn due(&self) -> bool {
+        self.since_gc.load(Relaxed) >= self.threshold.load(Relaxed)
+    }
+
+    /// A region of at least `lines` lines in place of `old`, which is
+    /// charged for what it handed out: a hole a sweep left, else a
+    /// block. Empty once the reservation is spent.
+    #[inline(never)]
+    fn next_region(&self, old: Region, lines: usize) -> Region {
+        note_allocator();
+        self.since_gc.fetch_add(old.cur - old.start, Relaxed);
+        if self.due() {
+            self.collect_now();
+        }
+        for attempt in 0..2 {
+            if let Some(r) = self.take_region(lines) {
+                return r;
+            }
+            if attempt == 0 {
+                self.collect_now();
+            }
+        }
+        Region::EMPTY
+    }
+
+    fn take_region(&self, lines: usize) -> Option<Region> {
+        let mut pool = lock(&self.pool);
+        let (block, first, count, dirty) = if let Some(i) = pool
+            .holes
+            .iter()
+            .rposition(|&(_, _, n)| n as usize >= lines)
+        {
+            let (b, f, n) = pool.holes.swap_remove(i);
+            (b as usize, f as usize, n as usize, true)
+        } else if let Some(b) = pool.free_blocks.pop() {
+            self.state_set(b as usize, USED);
+            (b as usize, 0, LINES, true)
+        } else if pool.cursor < self.blocks {
+            let b = pool.cursor;
+            pool.cursor += 1;
+            self.state_set(b, USED);
+            (b, 0, LINES, false)
+        } else {
+            return None;
+        };
+        drop(pool);
+        let lo = self.block_addr(block) + first * LINE;
+        let len = count * LINE;
+        if dirty {
+            // SAFETY: the run is dead lines of this heap.
+            unsafe { std::ptr::write_bytes(lo as *mut u8, 0, len) };
+        }
+        Some(Region {
+            start: lo,
+            cur: lo,
+            limit: lo + len,
+        })
+    }
+
+    fn state_set(&self, block: usize, v: u8) {
+        // SAFETY: one byte per block.
+        unsafe { *self.state.add(block) = v };
+    }
+
+    fn state_of(&self, block: usize) -> u8 {
+        // SAFETY: one byte per block.
+        unsafe { *self.state.add(block) }
+    }
+
+    fn alloc_large(&self, size: usize, held: bool) -> *mut u8 {
+        if !held {
+            note_allocator();
+            self.since_gc.fetch_add(size, Relaxed);
+            if self.due() {
+                self.collect_now();
+            }
+        }
+        let Ok(layout) = Layout::from_size_align(size, 16) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: a non-zero layout.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        if !p.is_null() {
+            lock(&self.large).insert(p as usize, Large { size, held });
+        }
+        p
+    }
+
+    // -- Address resolution -------------------------------------------
+
+    /// The size in bytes of the allocation starting at quantum `q`.
+    #[inline]
+    fn bytes_at(&self, q: usize, code: u8) -> usize {
+        if code == SPAN {
+            // SAFETY: the span table has an entry per line.
+            unsafe { *self.spans.add(q / QUANTA_PER_LINE) as usize * LINE }
+        } else {
+            code as usize * QUANTUM
+        }
+    }
+
+    /// The start and size of the heap allocation holding `a`.
+    fn containing(&self, a: usize) -> Option<(usize, usize)> {
+        if !self.in_range(a) {
+            return None;
+        }
+        let off = a - self.base;
+        let block = off / BLOCK;
+        let q = off / QUANTUM;
+        let floor = q.saturating_sub(SMALL_QUANTA - 1);
+        let mut i = q;
+        loop {
+            // SAFETY: `i` is a quantum of this heap.
+            let code = unsafe { *self.start_at(i) } & CODE;
+            if code != 0 {
+                let bytes = self.bytes_at(i, code);
+                return (q < i + bytes / QUANTUM).then(|| (self.base + i * QUANTUM, bytes));
+            }
+            if i == floor {
+                break;
+            }
+            i -= 1;
+        }
+        // SAFETY: one flag per block.
+        if unsafe { *self.has_span.add(block) } == 0 {
+            return None;
+        }
+        let mut line = off / LINE;
+        let first_line = block * LINES;
+        loop {
+            // SAFETY: the span table has an entry per line.
+            let n = unsafe { *self.spans.add(line) } as usize;
+            if n != 0 {
+                let sq = line * QUANTA_PER_LINE;
+                // SAFETY: `sq` is a quantum of this heap.
+                let is_span = unsafe { *self.start_at(sq) } & CODE == SPAN;
+                return (is_span && off / LINE < line + n)
+                    .then(|| (self.base + line * LINE, n * LINE));
+            }
+            if line == first_line {
+                return None;
+            }
+            line -= 1;
+        }
+    }
+
+    // -- Collection ---------------------------------------------------
+
+    /// An automatic collection: when one is allowed.
+    fn collect_now(&self) {
+        if AUTOMATIC.load(Relaxed) {
+            self.collect_explicit();
+        }
+    }
+
+    /// A collection on request. Only the thread that claimed the heap
+    /// runs one, and only while no other thread allocates.
+    fn collect_explicit(&self) {
+        if !OWNER.with(|o| o.get()) || FOREIGN.load(Relaxed) {
+            return;
+        }
+        let mut regs = [0usize; 12];
+        crate::collector::spill_callee_saved(&mut regs);
+        self.collect_from(regs.as_ptr() as usize);
+        std::hint::black_box(&regs);
+    }
+
+    #[inline(never)]
+    fn collect_from(&self, sp: usize) {
+        let host_top = crate::collector::host_stack_top();
+        let backend = crate::fiber_backend::installed_fiber_backend();
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        match backend {
+            Some(b) => b.stack_windows(sp, host_top, &mut |lo, hi| windows.push((lo, hi))),
+            None => windows.push((sp, host_top)),
+        }
+        if !windows.iter().any(|&(lo, hi)| hi == host_top && lo < hi) {
+            return;
+        }
+        let windows = crate::collector::without_hidden(windows);
+        self.collect_windows(&windows, backend);
+    }
+
+    /// Mark from the stack `windows`, the registered roots and what the
+    /// fiber backend holds, then sweep.
+    fn collect_windows(
+        &self,
+        windows: &[(usize, usize)],
+        backend: Option<&dyn crate::fiber_backend::FiberCfg>,
+    ) {
+        let began = std::time::Instant::now();
+        SMALL.with(|c| c.set(Region::EMPTY));
+        MEDIUM.with(|c| c.set(Region::EMPTY));
+
+        let mut pool = lock(&self.pool);
+        let mut large = lock(&self.large);
+        let roots = lock(&self.roots);
+
+        let mut m = Marker {
+            h: self,
+            stack: Vec::new(),
+            marked: 0,
+            large: large.iter().map(|(&a, l)| (a, l.size, l.held)).collect(),
+            large_marked: vec![false; large.len()],
+        };
+        let (hooks, sweepers) = crate::collector::weak_registry();
+        for h in &hooks {
+            (h.hold)(&mut |a| m.hold(a));
+        }
+        for &(lo, hi) in windows {
+            m.scan(lo, hi);
+        }
+        for (&a, root) in roots.iter() {
+            match root {
+                Root::Range(len) => {
+                    if crate::collector::mapped(a, a + len) {
+                        m.scan(a, a + len);
+                    }
+                }
+                Root::Spans { word, reader } => {
+                    // SAFETY: the reader is the runtime's, called with
+                    // the word it was registered with.
+                    unsafe {
+                        reader(
+                            a as *const u8,
+                            *word,
+                            visit_span,
+                            &mut m as *mut _ as *mut c_void,
+                        )
+                    };
+                }
+            }
+        }
+        for i in 0..m.large.len() {
+            let (a, size, held) = m.large[i];
+            if held {
+                m.large_marked[i] = true;
+                m.scan(a, a + size);
+            }
+        }
+        if let Some(b) = backend {
+            b.held_addresses(&mut |a| m.consider(a));
+        }
+        m.drain();
+        if !hooks.is_empty() {
+            crate::collector::settle_weak(&mut m, &hooks);
+        }
+        if !sweepers.is_empty() {
+            let reached = |a: usize| m.is_marked(a);
+            for f in &sweepers {
+                f(&reached);
+            }
+        }
+        let marked_at = began.elapsed();
+
+        let live = m.marked;
+        let large_marked = std::mem::take(&mut m.large_marked);
+        let large_snapshot = std::mem::take(&mut m.large);
+        drop(m);
+        let mut freed = self.sweep(&mut pool);
+        for (i, &(a, size, _)) in large_snapshot.iter().enumerate() {
+            if !large_marked[i] {
+                if let Ok(layout) = Layout::from_size_align(size, 16) {
+                    // SAFETY: allocated with this layout, unreached.
+                    unsafe { std::alloc::dealloc(a as *mut u8, layout) };
+                }
+                large.remove(&a);
+                freed += size;
+            }
+        }
+        drop(roots);
+        drop(large);
+        drop(pool);
+
+        self.live.store(live, Relaxed);
+        self.collections.fetch_add(1, Relaxed);
+        let growth = if self.growth != 0 {
+            self.growth
+        } else if freed * 8 < live {
+            MAX_GROWTH
+        } else {
+            DEFAULT_GROWTH
+        };
+        self.since_gc.store(0, Relaxed);
+        self.threshold.store(
+            if self.stress {
+                0
+            } else {
+                (live * growth).max(self.floor)
+            },
+            Relaxed,
+        );
+        if std::env::var_os("ZYNTAX_IMMIX_TRACE").is_some() {
+            eprintln!(
+                "[immix] #{}: {} KB reached, {} KB freed, next after {} KB, mark {:.2} ms, total {:.2} ms",
+                self.collections.load(Relaxed),
+                live >> 10,
+                freed >> 10,
+                self.threshold.load(Relaxed) >> 10,
+                marked_at.as_secs_f64() * 1e3,
+                began.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        crate::collector::run_after_collection();
+    }
+
+    /// Free what no mark reached: blocks wholly dead return to the pool,
+    /// the dead line runs of the rest become regions. Returns the bytes
+    /// freed.
+    fn sweep(&self, pool: &mut Pool) -> usize {
+        pool.holes.clear();
+        let mut freed = 0usize;
+        for b in 0..pool.cursor {
+            if self.state_of(b) != USED {
+                continue;
+            }
+            // SAFETY: a block of this heap's tables.
+            let marks = unsafe {
+                std::slice::from_raw_parts_mut(self.marks.add(b * MARK_WORDS), MARK_WORDS)
+            };
+            let starts = unsafe { self.starts.add(b * QUANTA) } as *mut u64;
+            if marks.iter().all(|w| *w == 0) {
+                // SAFETY: the block's own table entries.
+                unsafe {
+                    std::ptr::write_bytes(starts as *mut u8, 0, QUANTA);
+                    std::ptr::write_bytes(self.spans.add(b * LINES), 0, LINES);
+                    *self.has_span.add(b) = 0;
+                }
+                self.state_set(b, FREE);
+                pool.free_blocks.push(b as u32);
+                freed += BLOCK;
+                continue;
+            }
+            let mut run_start = 0usize;
+            let mut in_run = false;
+            for l in 0..LINES {
+                let marked = marks[l / 64] & (1u64 << (l % 64)) != 0;
+                // SAFETY: eight start bytes of line `l`.
+                unsafe {
+                    let w = starts.add(l);
+                    if marked {
+                        *w &= !MARKS_OF_EIGHT;
+                    } else {
+                        *w = 0;
+                        *self.spans.add(b * LINES + l) = 0;
+                    }
+                }
+                if marked {
+                    if in_run {
+                        pool.holes
+                            .push((b as u32, run_start as u16, (l - run_start) as u16));
+                        freed += (l - run_start) * LINE;
+                        in_run = false;
+                    }
+                } else if !in_run {
+                    in_run = true;
+                    run_start = l;
+                }
+            }
+            if in_run {
+                pool.holes
+                    .push((b as u32, run_start as u16, (LINES - run_start) as u16));
+                freed += (LINES - run_start) * LINE;
+            }
+            marks.fill(0);
+        }
+        freed
+    }
+}
+
+impl crate::collector::Marking for Marker<'_> {
+    fn is_marked(&self, a: usize) -> bool {
+        Marker::is_marked(self, a)
+    }
+
+    fn mark(&mut self, a: usize) {
+        self.consider(a);
+        self.drain();
+    }
+}
+
+impl crate::collector::Tracing for Marker<'_> {
+    fn reached_bytes(&self) -> usize {
+        self.marked
+    }
+
+    fn follow(&mut self) {
+        self.drain();
+    }
+}
+
+unsafe extern "C" fn visit_span(cx: *mut c_void, lo: usize, hi: usize) {
+    // SAFETY: `cx` is the marker that called the reader.
+    let m = unsafe { &mut *(cx as *mut Marker<'_>) };
+    m.scan(lo, hi);
+}
+
+struct Marker<'h> {
+    h: &'h Heap,
+    stack: Vec<(usize, usize)>,
+    marked: usize,
+    /// The system-allocated blocks, in address order.
+    large: Vec<(usize, usize, bool)>,
+    large_marked: Vec<bool>,
+}
+
+impl Marker<'_> {
+    fn scan(&mut self, lo: usize, hi: usize) {
+        let mut p = lo.next_multiple_of(8);
+        while p + 8 <= hi {
+            // SAFETY: the caller names memory it holds; a racing write
+            // can only make a word stale.
+            let w = unsafe { std::ptr::read_volatile(p as *const usize) };
+            self.consider(w);
+            p += 8;
+        }
+    }
+
+    fn consider(&mut self, a: usize) {
+        let h = self.h;
+        let off = a.wrapping_sub(h.base);
+        if off < h.span {
+            let q = off / QUANTUM;
+            let floor = q.saturating_sub(SMALL_QUANTA - 1);
+            let mut i = q;
+            loop {
+                // SAFETY: `i` is a quantum of the heap.
+                let b = unsafe { *h.starts.add(i) };
+                if b & CODE != 0 {
+                    if b & MARK == 0 {
+                        let bytes = h.bytes_at(i, b & CODE);
+                        if q < i + bytes / QUANTUM {
+                            self.mark_at(i, bytes);
+                        }
+                    }
+                    return;
+                }
+                if i == floor {
+                    break;
+                }
+                i -= 1;
+            }
+            // An address inside a span, past its first line.
+            if let Some((start, bytes)) = h.containing(a) {
+                let q = (start - h.base) / QUANTUM;
+                // SAFETY: `q` is a quantum of the heap.
+                if unsafe { *h.starts.add(q) } & MARK == 0 {
+                    self.mark_at(q, bytes);
+                }
+            }
+            return;
+        }
+        if self.large.is_empty() {
+            return;
+        }
+        let i = self.large.partition_point(|&(s, _, _)| s <= a);
+        if i == 0 {
+            return;
+        }
+        let (s, size, _) = self.large[i - 1];
+        if a < s + size.max(1) && !self.large_marked[i - 1] {
+            self.large_marked[i - 1] = true;
+            self.marked += size;
+            self.stack.push((s, size));
+        }
+    }
+
+    /// Claim the allocation of `bytes` starting at quantum `q`, to be
+    /// scanned.
+    fn mark_at(&mut self, q: usize, bytes: usize) {
+        self.claim(q, bytes);
+        self.stack.push((self.h.base + q * QUANTUM, bytes));
+    }
+
+    /// Take the allocation of `bytes` starting at quantum `q` as
+    /// reached, without scanning it.
+    fn claim(&mut self, q: usize, bytes: usize) {
+        let h = self.h;
+        // SAFETY: `q` is a quantum of the heap.
+        unsafe { *h.starts.add(q) |= MARK };
+        let block = q / QUANTA;
+        let in_block = (q % QUANTA) * QUANTUM;
+        let first = in_block / LINE;
+        let last = (in_block + bytes - 1) / LINE;
+        for l in first..=last {
+            // SAFETY: a mark word of the block.
+            unsafe {
+                *h.marks.add(block * MARK_WORDS + l / 64) |= 1u64 << (l % 64);
+            }
+        }
+        self.marked += bytes;
+    }
+
+    /// Take the allocation `a` lands in as reached without reading it:
+    /// its words are a weak-reference hook's to follow.
+    fn hold(&mut self, a: usize) {
+        let h = self.h;
+        if let Some((start, bytes)) = h.containing(a) {
+            let q = (start - h.base) / QUANTUM;
+            // SAFETY: `q` is a quantum of the heap.
+            if unsafe { *h.starts.add(q) } & MARK == 0 {
+                self.claim(q, bytes);
+            }
+            return;
+        }
+        if let Some(i) = self.large_at(a)
+            && !self.large_marked[i]
+        {
+            self.large_marked[i] = true;
+            self.marked += self.large[i].1;
+        }
+    }
+
+    /// The system-allocated block `a` lands in.
+    fn large_at(&self, a: usize) -> Option<usize> {
+        let i = self.large.partition_point(|&(s, _, _)| s <= a);
+        let (s, size, _) = *self.large.get(i.checked_sub(1)?)?;
+        (a < s + size.max(1)).then_some(i - 1)
+    }
+
+    /// Whether what `a` lands in is reached. What the heap does not
+    /// manage counts as reached, so it is never taken for dead.
+    fn is_marked(&self, a: usize) -> bool {
+        let h = self.h;
+        if h.in_range(a) {
+            return match h.containing(a) {
+                Some((start, _)) => {
+                    // SAFETY: the start of an allocation of this heap.
+                    let byte = unsafe { *h.starts.add((start - h.base) / QUANTUM) };
+                    byte & MARK != 0
+                }
+                None => true,
+            };
+        }
+        match self.large_at(a) {
+            Some(i) => self.large_marked[i],
+            None => true,
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some((s, bytes)) = self.stack.pop() {
+            self.scan(s, s + bytes);
+        }
+    }
+}
+
+// -- The host-heap table ------------------------------------------------
+
+unsafe extern "C" fn alloc(cx: *mut c_void, size: usize, kind: HeapKind) -> *mut u8 {
+    // SAFETY: the context is the heap this table was made for.
+    let h = unsafe { &*(cx as *const Heap) };
+    let size = size.max(1);
+    if kind == HeapKind::Held || size > MEDIUM_MAX {
+        h.alloc_large(size, kind == HeapKind::Held)
+    } else if size <= LINE {
+        h.alloc_small(size)
+    } else {
+        h.alloc_medium(size)
+    }
+}
+
+unsafe extern "C" fn free(cx: *mut c_void, ptr: *mut u8) {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    if h.in_range(ptr as usize) {
+        return;
+    }
+    let mut large = lock(&h.large);
+    if let Some(l) = large.remove(&(ptr as usize))
+        && let Ok(layout) = Layout::from_size_align(l.size, 16)
+    {
+        // SAFETY: allocated with this layout and just forgotten.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+}
+
+unsafe extern "C" fn realloc(cx: *mut c_void, ptr: *mut u8, size: usize) -> *mut u8 {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    let (old, held) = if let Some((s, bytes)) = h.containing(ptr as usize) {
+        if s == ptr as usize && size <= bytes {
+            return ptr;
+        }
+        (bytes, false)
+    } else {
+        match lock(&h.large).get(&(ptr as usize)) {
+            Some(l) => (l.size, l.held),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    let kind = if held {
+        HeapKind::Held
+    } else {
+        HeapKind::Collected
+    };
+    // SAFETY: as in `alloc`.
+    let fresh = unsafe { alloc(cx, size, kind) };
+    if !fresh.is_null() {
+        // SAFETY: both blocks are at least `old.min(size)` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, fresh, old.min(size));
+            free(cx, ptr);
+        }
+    }
+    fresh
+}
+
+unsafe extern "C" fn owns(cx: *mut c_void, ptr: *const u8) -> bool {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    let a = ptr as usize;
+    if h.in_range(a) {
+        return true;
+    }
+    lock(&h.large)
+        .range(..=a)
+        .next_back()
+        .is_some_and(|(s, l)| a < s + l.size.max(1))
+}
+
+unsafe extern "C" fn add_root_range(cx: *mut c_void, start: *const u8, len: usize) {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    lock(&h.roots).insert(start as usize, Root::Range(len));
+}
+
+unsafe extern "C" fn add_root_spans(
+    cx: *mut c_void,
+    start: *const u8,
+    word: usize,
+    reader: SpanReader,
+) {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    lock(&h.roots).insert(start as usize, Root::Spans { word, reader });
+}
+
+unsafe extern "C" fn remove_root_range(cx: *mut c_void, start: *const u8) {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    lock(&h.roots).remove(&(start as usize));
+}
+
+unsafe extern "C" fn thread_enter(_cx: *mut c_void, _top: *const u8) {}
+
+unsafe extern "C" fn thread_leave(_cx: *mut c_void) {}
+
+/// Reserve the heap and make it the process's. `None` when the address
+/// space is not available or one is already installed.
+pub fn table() -> Option<HostHeap> {
+    let mb = env_usize("ZYNTAX_IMMIX_HEAP_MB").unwrap_or(DEFAULT_HEAP_MB);
+    let heap: &'static Heap = Box::leak(Box::new(Heap::new(mb << 20)?));
+    HEAP.set(heap).ok()?;
+    Some(HostHeap {
+        version: crate::host_heap::HOST_HEAP_VERSION,
+        size: std::mem::size_of::<HostHeap>() as u32,
+        context: heap as *const Heap as *mut c_void,
+        alloc,
+        free,
+        realloc,
+        owns,
+        add_root_range,
+        add_root_spans,
+        remove_root_range,
+        thread_enter,
+        thread_leave,
+        type_header: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heap() -> Heap {
+        OWNER.with(|o| o.set(true));
+        Heap::new(64 << 20).expect("a reservation")
+    }
+
+    fn make(h: &Heap, size: usize) -> usize {
+        // SAFETY: the context is this heap.
+        unsafe { alloc(h as *const Heap as *mut c_void, size, HeapKind::Collected) as usize }
+    }
+
+    /// Roots as a boxed array of addresses the heap reads.
+    fn root(h: &Heap, words: &mut Vec<usize>) {
+        lock(&h.roots).insert(words.as_ptr() as usize, Root::Range(words.len() * 8));
+    }
+
+    fn collect(h: &Heap) {
+        h.collect_windows(&[], None);
+    }
+
+    #[test]
+    fn small_objects_are_aligned_zeroed_and_packed() {
+        let h = heap();
+        let mut last = 0;
+        for size in [1, 16, 24, 40, 72, 100, 128] {
+            for _ in 0..200 {
+                let p = make(&h, size);
+                assert_eq!(p % 16, 0);
+                let bytes = size.div_ceil(16) * 16;
+                // SAFETY: the allocation is `bytes` long.
+                assert!(
+                    unsafe { std::slice::from_raw_parts(p as *const u8, bytes) }
+                        .iter()
+                        .all(|b| *b == 0)
+                );
+                if last != 0 && (p - h.base) / BLOCK == (last - h.base) / BLOCK {
+                    assert!(p - last <= 128, "a gap of {} between objects", p - last);
+                }
+                last = p;
+            }
+        }
+    }
+
+    #[test]
+    fn an_object_across_a_line_boundary_is_found_from_every_word() {
+        let h = heap();
+        let a = make(&h, 72);
+        let b = make(&h, 72);
+        assert_eq!(b, a + 80);
+        for off in (0..72).step_by(8) {
+            assert_eq!(h.containing(b + off).map(|x| x.0), Some(b), "word {off}");
+        }
+    }
+
+    #[test]
+    fn an_interior_address_finds_its_allocation_and_one_past_does_not() {
+        let h = heap();
+        let a = make(&h, 48);
+        let b = make(&h, 1000);
+        assert_eq!(h.containing(a + 47).map(|x| x.0), Some(a));
+        assert_eq!(h.containing(b + 999).map(|x| x.0), Some(b));
+        assert_eq!(h.containing(b + 1023).map(|x| x.0), Some(b));
+        assert_ne!(h.containing(a + 48).map(|x| x.0), Some(a));
+        assert_eq!(h.containing(b + 1024), None);
+    }
+
+    #[test]
+    fn what_a_root_reaches_survives_and_the_rest_is_reclaimed() {
+        let h = heap();
+        let kept = make(&h, 64);
+        let behind = make(&h, 64);
+        let dead = make(&h, 64);
+        let medium = make(&h, 3000);
+        let dead_medium = make(&h, 3000);
+        // SAFETY: `kept` is 64 bytes.
+        unsafe { *(kept as *mut usize) = behind };
+        let mut roots = vec![kept, medium + 100];
+        root(&h, &mut roots);
+        collect(&h);
+        assert!(h.containing(kept).is_some());
+        assert!(h.containing(behind).is_some(), "reached through an object");
+        assert!(
+            h.containing(medium).is_some(),
+            "reached through an interior word"
+        );
+        assert!(h.containing(dead_medium).is_none());
+        assert!(h.containing(dead).is_none() || h.containing(dead).map(|x| x.0) != Some(dead));
+    }
+
+    #[test]
+    fn a_dead_line_is_reused_and_comes_back_zeroed() {
+        let h = heap();
+        let mut keep = Vec::new();
+        let mut all = Vec::new();
+        for i in 0..4000 {
+            let p = make(&h, 64);
+            // SAFETY: 64 bytes.
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0xAB, 64) };
+            all.push(p);
+            if i % 50 == 0 {
+                keep.push(p);
+            }
+        }
+        root(&h, &mut keep);
+        collect(&h);
+        let before = h.pool.lock().unwrap().cursor;
+        for _ in 0..3000 {
+            let p = make(&h, 64);
+            // SAFETY: 64 bytes.
+            assert!(
+                unsafe { std::slice::from_raw_parts(p as *const u8, 64) }
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+            assert!(!keep.contains(&p), "a live object was handed out again");
+        }
+        assert_eq!(h.pool.lock().unwrap().cursor, before, "took fresh blocks");
+    }
+
+    #[test]
+    fn large_and_held_blocks_follow_their_rules() {
+        let h = heap();
+        let cx = &h as *const Heap as *mut c_void;
+        let big = make(&h, 100_000);
+        let dead_big = make(&h, 100_000);
+        // SAFETY: the context is this heap.
+        let held = unsafe { alloc(cx, 64, HeapKind::Held) } as usize;
+        let behind = make(&h, 64);
+        // SAFETY: 64 bytes.
+        unsafe { *(held as *mut usize) = behind };
+        let mut roots = vec![big + 5000];
+        root(&h, &mut roots);
+        collect(&h);
+        // SAFETY: as above.
+        assert!(unsafe { owns(cx, big as *const u8) });
+        assert!(!unsafe { owns(cx, dead_big as *const u8) });
+        assert!(h.containing(behind).is_some(), "a held block is a root");
+        unsafe { free(cx, held as *mut u8) };
+        collect(&h);
+        assert!(h.containing(behind).is_none());
+    }
+
+    #[test]
+    fn a_collection_with_nothing_left_frees_every_block() {
+        let h = heap();
+        for _ in 0..2000 {
+            make(&h, 100);
+        }
+        collect(&h);
+        let pool = h.pool.lock().unwrap();
+        assert_eq!(pool.free_blocks.len(), pool.cursor);
+        assert!(pool.holes.is_empty());
+    }
+}

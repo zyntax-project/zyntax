@@ -69,6 +69,8 @@ pub mod hir_builder; // HIR Builder API for direct HIR construction
 pub mod hir_dump; // CLIF-inspired HIR text dump for debugging
 pub mod hir_interp; // HIR bytecode interpreter (universal Tier 0; always available)
 pub mod host_heap; // A host's heap and collector behind the allocation entry points
+#[cfg(unix)]
+pub mod immix_heap; // An Immix-style heap behind the host-heap seam
 pub mod inline;
 pub mod interned; // The boxes every program shares
 pub mod jump_thread; // Branches on a phi of constants, taken by the predecessors

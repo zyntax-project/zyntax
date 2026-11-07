@@ -587,8 +587,20 @@ pub fn type_header(descriptor: &crate::object_header::TypeDescriptor) -> u64 {
 
 /// `ZYNTAX_HOST_HEAP=reference` runs the program on [`reference`]'s
 /// table: everything through the seam, nothing collected. Safe; slower.
+/// `=immix` runs it on [`crate::immix_heap`]. Safe; changes memory use
+/// and speed.
 pub fn install_from_env() {
-    if std::env::var("ZYNTAX_HOST_HEAP").as_deref() == Ok("reference") {
-        let _ = unsafe { install(&reference::table()) };
+    match std::env::var("ZYNTAX_HOST_HEAP").as_deref() {
+        Ok("reference") => {
+            let _ = unsafe { install(&reference::table()) };
+        }
+        #[cfg(unix)]
+        Ok("immix") => match crate::immix_heap::table() {
+            Some(table) => {
+                let _ = unsafe { install(&table) };
+            }
+            None => eprintln!("ZYNTAX_HOST_HEAP=immix: the heap could not be reserved"),
+        },
+        _ => {}
     }
 }

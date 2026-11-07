@@ -272,7 +272,12 @@ fn disabled_by_env() -> bool {
 /// forgotten: they belonged to whatever enabled it last.
 pub fn enable() {
     // With a host's heap the host's collector reclaims, and this one stays off.
-    if disabled_by_env() || crate::host_heap::is_installed() {
+    if crate::host_heap::is_installed() {
+        #[cfg(unix)]
+        crate::immix_heap::claim_owner();
+        return;
+    }
+    if disabled_by_env() {
         return;
     }
     let mut owner = OWNER.lock().unwrap_or_else(|e| e.into_inner());
@@ -421,6 +426,10 @@ pub(crate) fn note_spent(bytes: usize) {
 /// Whether this collector runs and the calling thread is the one it
 /// belongs to.
 pub fn collecting_here() -> bool {
+    #[cfg(unix)]
+    if crate::immix_heap::collecting_here() {
+        return true;
+    }
     is_enabled() && on_owner_thread()
 }
 
@@ -454,6 +463,8 @@ pub(crate) fn wants_collection() -> bool {
 /// Whether a spent budget starts a collection. Off, the heap grows
 /// until [`collect`] is called or it is turned on again.
 pub fn set_automatic(on: bool) {
+    #[cfg(unix)]
+    crate::immix_heap::set_automatic(on);
     AUTOMATIC.store(on, Ordering::Relaxed);
 }
 
@@ -516,6 +527,10 @@ pub struct Stats {
 }
 
 pub fn stats() -> Stats {
+    #[cfg(unix)]
+    if crate::immix_heap::active() {
+        return crate::immix_heap::stats();
+    }
     let allocated = local().spent;
     let r = registry();
     Stats {
@@ -688,7 +703,7 @@ pub fn show_stack(key: usize) {
 }
 
 /// `windows` less the hidden ranges.
-fn without_hidden(windows: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn without_hidden(windows: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     let hidden: Vec<(usize, usize)> =
         HIDDEN.with(|h| h.borrow().iter().map(|&(_, lo, hi)| (lo, hi)).collect());
     let mut out = windows;
@@ -1590,35 +1605,74 @@ fn symbol_at(a: usize) -> String {
     format!("{a:#x}")
 }
 
+/// A marking the weak-reference rounds can drive: how much it has
+/// reached, and a way to follow what it has reached.
+pub(crate) trait Tracing: Marking {
+    fn reached_bytes(&self) -> usize;
+    fn follow(&mut self);
+}
+
+impl Tracing for Marker<'_> {
+    fn reached_bytes(&self) -> usize {
+        self.marked_bytes
+    }
+
+    fn follow(&mut self) {
+        self.drain();
+    }
+}
+
 /// Run the weak-reference hooks over a marking that has drained: trace
 /// to a fixpoint, settle, and again while settling reaches anything.
-fn settle_weak(marker: &mut Marker<'_>, hooks: &[WeakHooks]) {
+pub(crate) fn settle_weak<M: Tracing>(marker: &mut M, hooks: &[WeakHooks]) {
     loop {
         loop {
-            let before = marker.marked_bytes;
+            let before = marker.reached_bytes();
             for h in hooks {
                 (h.trace)(marker);
             }
-            marker.drain();
-            if marker.marked_bytes == before {
+            marker.follow();
+            if marker.reached_bytes() == before {
                 break;
             }
         }
-        let before = marker.marked_bytes;
+        let before = marker.reached_bytes();
         for h in hooks {
             (h.settle)(marker);
         }
-        marker.drain();
-        if marker.marked_bytes == before {
+        marker.follow();
+        if marker.reached_bytes() == before {
             break;
         }
+    }
+}
+
+/// The registered weak hooks and sweepers, as a collection takes them.
+pub(crate) fn weak_registry() -> (Vec<WeakHooks>, Vec<fn(&dyn Fn(usize) -> bool)>) {
+    let hooks = WEAK_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sweepers = WEAK_SWEEPERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    (hooks, sweepers)
+}
+
+/// Run the registered after-collection functions, with no collector
+/// lock held.
+pub(crate) fn run_after_collection() {
+    let after = AFTER_COLLECTION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for f in after {
+        f();
     }
 }
 
 /// Whether every page of `[lo, hi)` is mapped. `msync` refuses a range
 /// with a hole in it.
 #[cfg(unix)]
-fn mapped(lo: usize, hi: usize) -> bool {
+pub(crate) fn mapped(lo: usize, hi: usize) -> bool {
     static PAGE: OnceLock<usize> = OnceLock::new();
     // SAFETY: a query with no side effect.
     let page = *PAGE.get_or_init(|| unsafe {
@@ -1651,7 +1705,7 @@ pub fn stack_room() -> Option<usize> {
 }
 
 /// The highest address of the calling thread's stack.
-fn host_stack_top() -> usize {
+pub(crate) fn host_stack_top() -> usize {
     host_stack().1
 }
 
@@ -1771,10 +1825,28 @@ fn query_stack() -> (usize, usize) {
 /// the rest.
 #[inline(never)]
 pub fn collect() {
+    #[cfg(unix)]
+    if crate::immix_heap::active() {
+        let mut regs = [0usize; 12];
+        spill_callee_saved(&mut regs);
+        crate::immix_heap::collect_from_sp(regs.as_ptr() as usize);
+        std::hint::black_box(&regs);
+        return;
+    }
     if !is_enabled() || !on_owner_thread() || local().collecting {
         return;
     }
     let mut regs = [0usize; 12];
+    spill_callee_saved(&mut regs);
+    let sp = regs.as_ptr() as usize;
+    collect_from(sp);
+    std::hint::black_box(&regs);
+}
+
+/// Store the callee-saved registers in `regs`, so a pointer held only
+/// in one lies in the stack range a collection reads.
+#[inline(always)]
+pub(crate) fn spill_callee_saved(regs: &mut [usize; 12]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: twelve words of the local array are written.
     unsafe {
@@ -1803,9 +1875,6 @@ pub fn collect() {
             options(nostack, preserves_flags)
         );
     }
-    let sp = regs.as_ptr() as usize;
-    collect_from(sp);
-    std::hint::black_box(&regs);
 }
 
 /// A collection whose deepest live stack word is at `sp`.
@@ -1840,11 +1909,7 @@ fn collect_from(sp: usize) {
     let carved = local().spent;
     update(|l| l.spent = 0);
 
-    let hooks = WEAK_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let sweepers = WEAK_SWEEPERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let (hooks, sweepers) = weak_registry();
 
     let (live, freed_blocks, freed_bytes, free_bytes, large_freed) = {
         let mut marker = Marker::new(&reg);
@@ -1998,11 +2063,5 @@ fn collect_from(sp: usize) {
     }
     drop(reg);
     update(|l| l.collecting = false);
-    let after = AFTER_COLLECTION
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    for f in after {
-        f();
-    }
+    run_after_collection();
 }
