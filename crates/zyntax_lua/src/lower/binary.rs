@@ -89,8 +89,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             plain: plain_divisor,
             pow2: pow2_divisor,
         };
+        // A float operand makes the result a float whatever the other
+        // number is, so only comparisons and the operators with an
+        // integer result still need the other's kind.
+        let float_result_op = matches!(
+            op,
+            BinOp::Plus(_)
+                | BinOp::Minus(_)
+                | BinOp::Star(_)
+                | BinOp::DoubleSlash(_)
+                | BinOp::Percent(_)
+        ) && (a.ty == Ty::Float || b.ty == Ty::Float);
         // A number whose kind is not known decides it at run time.
-        if numbers && (a.ty == Ty::Number || b.ty == Ty::Number) && takes_number_path(op) {
+        if numbers
+            && !float_result_op
+            && (a.ty == Ty::Number || b.ty == Ty::Number)
+            && takes_number_path(op)
+        {
             return Ok(self.number_binary(op, a, b, divisor, span));
         }
         // A scalar that may not be a number: arithmetic and ordering
