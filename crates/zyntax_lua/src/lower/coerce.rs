@@ -48,7 +48,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         prim(PrimitiveType::I64),
                         span,
                     );
-                    number_of_int(payload, span)
+                    self.int_number(payload, span)
                 } else {
                     let payload = call(
                         "zb_box_payload_f64",
@@ -86,7 +86,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             (Ty::Nil, Ty::Any) => v.node,
             (Ty::Func(_), Ty::Any) | (Ty::Any, Ty::Func(_)) | (Ty::Func(_), Ty::Func(_)) => v.node,
             (Ty::Int, Ty::Float) => cast(v.node, prim(PrimitiveType::F64), span),
-            (Ty::Int, Ty::Number) => number_of_int(v.node, span),
+            (Ty::Int, Ty::Number) => self.int_number(v.node, span),
             (Ty::Float, Ty::Number) => number_of_float(v.node, span),
             (Ty::Number, Ty::Float) => {
                 let (pre, n) = self.number_parts(v);
@@ -131,19 +131,37 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     prim(PrimitiveType::Bool),
                     span,
                 );
-                let tag = tag_of_is_int(is_int, span);
-                let int = call(
-                    "zb_box_payload_i64",
-                    vec![b.node.clone()],
-                    prim(PrimitiveType::I64),
-                    span,
-                );
+                let is_int = self
+                    .hold(
+                        Val {
+                            node: is_int,
+                            ty: Ty::Bool,
+                        },
+                        &mut pre,
+                    )
+                    .node;
+                let int = self
+                    .hold(
+                        Val {
+                            node: call(
+                                "zb_box_payload_i64",
+                                vec![b.node.clone()],
+                                prim(PrimitiveType::I64),
+                                span,
+                            ),
+                            ty: Ty::Int,
+                        },
+                        &mut pre,
+                    )
+                    .node;
                 let float = call(
                     "zb_box_payload_f64",
                     vec![b.node],
                     prim(PrimitiveType::F64),
                     span,
                 );
+                let tag = tag_of_is_int(is_int.clone(), span);
+                let float = float_word(is_int, int.clone(), float, span);
                 block_value(pre, number_value(tag, int, float, span), span)
             }
             // A number is a scalar as it is; the other scalars take
@@ -153,7 +171,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 block_value(vec![expr_stmt(v.node)], scalar_of_nil(span), span)
             }
             (Ty::Bool, Ty::Scalar) => scalar_of_bool(v.node, span),
-            (Ty::Int, Ty::Scalar) => number_of_int(v.node, span),
+            (Ty::Int, Ty::Scalar) => self.int_number(v.node, span),
             (Ty::Float, Ty::Scalar) => number_of_float(v.node, span),
             (Ty::Scalar, Ty::Any) => {
                 let (pre, n) = self.number_parts(v);
@@ -234,7 +252,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     span,
                 );
                 let as_int =
-                    number_of_int(call("zb_box_payload_i64", vec![b.node], i64_t, span), span);
+                    self.int_number(call("zb_box_payload_i64", vec![b.node], i64_t, span), span);
                 let value = if_value(
                     is_nil,
                     scalar_of_nil(span),

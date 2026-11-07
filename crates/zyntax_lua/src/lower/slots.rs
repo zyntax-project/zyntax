@@ -268,7 +268,13 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                 ));
             }
             Ty::Int => {
-                out.push(assign(int_word, value.node, span));
+                let held = self.hold(value, &mut out);
+                out.push(assign(
+                    float_word,
+                    cast(held.node.clone(), prim(PrimitiveType::F64), span),
+                    span,
+                ));
+                out.push(assign(int_word, held.node, span));
                 let bits = or(present.clone(), int_lit(slot.kmask(), span));
                 out.push(assign(present.clone(), with_mask(bits), span));
             }
@@ -307,11 +313,14 @@ impl<'m, 'a> Lowerer<'m, 'a> {
         let i64_t = prim(PrimitiveType::I64);
         let (bits, int, float) = match value.map(|v| self.slot_value(v, slot)) {
             None => (int_lit(0, span), int_lit(0, span), float_lit(0.0, span)),
-            Some(v) if v.ty == Ty::Int => (
-                int_lit(slot.mask() | slot.kmask(), span),
-                self.hold(v, pre).node,
-                float_lit(0.0, span),
-            ),
+            Some(v) if v.ty == Ty::Int => {
+                let held = self.hold(v, pre).node;
+                (
+                    int_lit(slot.mask() | slot.kmask(), span),
+                    held.clone(),
+                    cast(held, prim(PrimitiveType::F64), span),
+                )
+            }
             Some(v) if v.ty == Ty::Float => (
                 int_lit(slot.mask(), span),
                 int_lit(0, span),

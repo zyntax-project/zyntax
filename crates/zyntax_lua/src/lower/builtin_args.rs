@@ -48,8 +48,23 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     i64_t.clone(),
                     span,
                 );
+                let is_int = n.is_int(span);
                 let int = if_value(negative, negated, n.int, i64_t, span);
-                let float = call("abs", vec![n.float], f64_t, span);
+                let int = self
+                    .hold(
+                        Val {
+                            node: int,
+                            ty: Ty::Int,
+                        },
+                        pre,
+                    )
+                    .node;
+                let float = float_word(
+                    is_int,
+                    int.clone(),
+                    call("abs", vec![n.float], f64_t, span),
+                    span,
+                );
                 number_value(n.tag, int, float, span)
             }
             ("floor" | "ceil", Ty::Int) => arg().node,
@@ -245,7 +260,6 @@ impl<'m, 'a> Lowerer<'m, 'a> {
     /// An integral float as a number: the integer when it fits, else
     /// the float; `pre` takes the float, held.
     pub(super) fn number_of_integral(&mut self, r: Node, pre: &mut Vec<St>, span: Span) -> Node {
-        let f64_t = prim(PrimitiveType::F64);
         let i64_t = prim(PrimitiveType::I64);
         let bool_t = prim(PrimitiveType::Bool);
         let r = self
@@ -293,7 +307,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
             i64_t,
             span,
         );
-        let float = if_value(fits.clone(), float_lit(0.0, span), r, f64_t, span);
+        let int = self
+            .hold(
+                Val {
+                    node: int,
+                    ty: Ty::Int,
+                },
+                pre,
+            )
+            .node;
+        let float = float_word(fits.clone(), int.clone(), r, span);
         number_value(tag_of_is_int(fits, span), int, float, span)
     }
 

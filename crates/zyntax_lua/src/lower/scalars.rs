@@ -4,6 +4,20 @@ use super::*;
 
 impl<'m, 'a> Lowerer<'m, 'a> {
     /// The parts of a number, held first unless it is a plain read.
+    /// The number of integer `n`, held first when computing it twice
+    /// would repeat work.
+    pub(super) fn int_number(&mut self, n: Node, span: Span) -> Node {
+        let mut pre = Vec::new();
+        let held = self.hold(
+            Val {
+                node: n,
+                ty: Ty::Int,
+            },
+            &mut pre,
+        );
+        block_value(pre, number_of_int(held.node, span), span)
+    }
+
     pub(super) fn number_parts(&mut self, v: Val) -> (Vec<St>, NumberParts) {
         let mut pre = Vec::new();
         let parts = self.number_parts_into(v, &mut pre);

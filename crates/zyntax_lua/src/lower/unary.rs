@@ -46,6 +46,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                             span,
                         ));
                     }
+                    let is_int = n.is_int(span);
                     let int = binary(
                         BinaryOp::Sub,
                         int_lit(0, span),
@@ -53,7 +54,21 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         prim(PrimitiveType::I64),
                         span,
                     );
-                    let float = unary(UnaryOp::Minus, n.float, prim(PrimitiveType::F64), span);
+                    let int = self
+                        .hold(
+                            Val {
+                                node: int,
+                                ty: Ty::Int,
+                            },
+                            &mut pre,
+                        )
+                        .node;
+                    let float = float_word(
+                        is_int,
+                        int.clone(),
+                        unary(UnaryOp::Minus, n.float, prim(PrimitiveType::F64), span),
+                        span,
+                    );
                     Val {
                         node: block_value(pre, number_value(n.tag, int, float, span), span),
                         ty: Ty::Number,

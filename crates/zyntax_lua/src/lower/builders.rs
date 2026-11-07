@@ -341,8 +341,27 @@ pub(super) fn number_value(tag: Node, int: Node, float: Node, span: Span) -> Nod
     )
 }
 
+/// The tuple of integer `n`, which is read twice: a variable or a
+/// literal. An integer's float word holds its value as a double, so
+/// the float of any number is its float word.
 pub(super) fn number_of_int(n: Node, span: Span) -> Node {
-    number_value(int_lit(TAG_INT, span), n, float_lit(0.0, span), span)
+    let float = match &n.node {
+        TypedExpression::Literal(TypedLiteral::Integer(k)) => float_lit(*k as i64 as f64, span),
+        _ => cast(n.clone(), prim(PrimitiveType::F64), span),
+    };
+    number_value(int_lit(TAG_INT, span), n, float, span)
+}
+
+/// The float word of an integer-or-float result: the integer's value
+/// as a double when it is the integer, else `float`.
+pub(super) fn float_word(is_int: Node, int: Node, float: Node, span: Span) -> Node {
+    if_value(
+        is_int,
+        cast(int, prim(PrimitiveType::F64), span),
+        float,
+        prim(PrimitiveType::F64),
+        span,
+    )
 }
 
 pub(super) fn number_of_float(f: Node, span: Span) -> Node {
@@ -465,16 +484,10 @@ impl NumberParts {
         )
     }
 
-    /// The value as a float, whichever number it holds: both arms are
-    /// plain reads, so this is a select.
-    pub(super) fn as_float(&self, span: Span) -> Node {
-        if_value(
-            self.is_int(span),
-            cast(self.int.clone(), prim(PrimitiveType::F64), span),
-            self.float.clone(),
-            prim(PrimitiveType::F64),
-            span,
-        )
+    /// The value as a float, whichever number it holds: an integer's
+    /// float word is its value.
+    pub(super) fn as_float(&self, _span: Span) -> Node {
+        self.float.clone()
     }
 }
 

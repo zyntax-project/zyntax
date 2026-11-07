@@ -270,10 +270,27 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     BinOp::Minus(_) => BinaryOp::Sub,
                     _ => BinaryOp::Mul,
                 };
-                // Both paths are pure, so both run and the tag picks.
+                // Both paths are pure, so both run and the tag picks;
+                // an integer result carries its value as the float.
+                let mut pre = pre;
                 let int = binary(bop, x.int.clone(), y.int.clone(), i64_t, span);
-                let float = binary(bop, x.as_float(span), y.as_float(span), f64_t, span);
-                number(pre, int, float, both_int(&x, &y))
+                let int = self
+                    .hold(
+                        Val {
+                            node: int,
+                            ty: Ty::Int,
+                        },
+                        &mut pre,
+                    )
+                    .node;
+                let is_int = both_int(&x, &y);
+                let float = float_word(
+                    is_int.clone(),
+                    int.clone(),
+                    binary(bop, x.as_float(span), y.as_float(span), f64_t, span),
+                    span,
+                );
+                number(pre, int, float, is_int)
             }
             BinOp::Slash(_) | BinOp::Caret(_) => {
                 let (l, r) = (x.as_float(span), y.as_float(span));
@@ -303,6 +320,16 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                     _ => call(fi, vec![x.int.clone(), y.int.clone()], i64_t.clone(), span),
                 };
                 let int = if_value(is_int.clone(), int_part, int_lit(0, span), i64_t, span);
+                let mut pre = pre;
+                let int = self
+                    .hold(
+                        Val {
+                            node: int,
+                            ty: Ty::Int,
+                        },
+                        &mut pre,
+                    )
+                    .node;
                 let float_part = match (op, divisor.pow2) {
                     (BinOp::Percent(_), Some(n)) => self.float_mod_pow2(x.as_float(span), n, span),
                     _ => call(
@@ -312,13 +339,7 @@ impl<'m, 'a> Lowerer<'m, 'a> {
                         span,
                     ),
                 };
-                let float = if_value(
-                    is_int.clone(),
-                    float_lit(0.0, span),
-                    float_part,
-                    f64_t,
-                    span,
-                );
+                let float = float_word(is_int.clone(), int.clone(), float_part, span);
                 // The call is below the value, where the check after a
                 // call would not find it.
                 let v = number(pre, int, float, is_int);
