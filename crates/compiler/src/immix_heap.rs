@@ -19,13 +19,21 @@
 //! Collections run on the thread that claimed the heap, from an
 //! allocation, and only while no other thread has allocated: another
 //! thread's stack is never read.
+//!
+//! With `ZYNTAX_IMMIX_THREADS=1` any thread that allocates can collect.
+//! It stops the others at their next slow-path allocation or inside a
+//! [`blocking`] region, each of which publishes its own stack windows
+//! first, and it gives up after a short wait if one does not answer.
+//! Off by default: a pointer held only where no collection reads, such
+//! as a spawned thread's start-up arguments, is not kept alive.
 
 use std::alloc::Layout;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::host_heap::{HeapKind, HostHeap, SpanReader};
 
@@ -59,6 +67,11 @@ const DEFAULT_FLOOR_KB: usize = 32 * 1024;
 const MAX_GROWTH: usize = 4;
 const DEFAULT_GROWTH: usize = 2;
 
+fn tracing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZYNTAX_IMMIX_TRACE").is_some())
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
@@ -84,6 +97,10 @@ thread_local! {
     static MEDIUM: Cell<Region> = const { Cell::new(Region::EMPTY) };
     /// This thread claimed the heap and runs its collections.
     static OWNER: Cell<bool> = const { Cell::new(false) };
+    /// The calling thread's place among the threads that can collect.
+    static MINE: RefCell<Option<Mine>> = const { RefCell::new(None) };
+    /// Depth of the calling thread's [`blocking`] regions.
+    static NATIVE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// A thread claimed the heap.
@@ -92,6 +109,9 @@ static CLAIMED: AtomicBool = AtomicBool::new(false);
 static FOREIGN: AtomicBool = AtomicBool::new(false);
 /// Whether a spent budget starts a collection.
 static AUTOMATIC: AtomicBool = AtomicBool::new(true);
+/// A collection ran on a thread that may not run the after-collection
+/// functions; the owner runs them at its next refill.
+static AFTER_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct Pool {
     /// Blocks handed out so far; the rest of the reservation was never
@@ -113,6 +133,94 @@ struct Large {
 enum Root {
     Range(usize),
     Spans { word: usize, reader: SpanReader },
+}
+
+/// How long a collection waits for the other threads to stop. A thread
+/// that computes without allocating answers late, so the wait is short.
+const STOP_WAIT: Duration = Duration::from_millis(20);
+/// The wait of a collection the program asked for.
+const EXPLICIT_WAIT: Duration = Duration::from_secs(1);
+/// A cancelled stop backs the next attempt off by one floor of
+/// allocation, doubled per failure up to `1 << MAX_BACKOFF`.
+const MAX_BACKOFF: u32 = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Running,
+    /// Waiting inside a slow-path allocation for a collection to end.
+    Parked,
+    /// Inside a [`blocking`] region: it touches no heap object.
+    Native,
+}
+
+/// One thread that can take part in a collection.
+struct Thread {
+    id: u64,
+    name: String,
+    state: State,
+    /// What the thread published before it stopped: its stack windows and
+    /// the addresses its runtime holds. Read only while it is stopped.
+    windows: Vec<(usize, usize)>,
+    held: Vec<usize>,
+}
+
+struct Threads {
+    next_id: u64,
+    list: Vec<Thread>,
+    /// A thread has begun a collection and not yet ended it.
+    collecting: bool,
+    /// Collections completed.
+    epoch: u64,
+    /// Stops cancelled since the last collection.
+    failures: u32,
+    /// Stops cancelled in all.
+    cancelled: u64,
+}
+
+struct World {
+    /// A collection wants the other threads to stop. Read on slow paths.
+    stop: AtomicBool,
+    inner: Mutex<Threads>,
+    /// A thread stopped, or left.
+    quiet: Condvar,
+    /// A collection ended or was cancelled.
+    resume: Condvar,
+}
+
+impl World {
+    fn new() -> World {
+        World {
+            stop: AtomicBool::new(false),
+            inner: Mutex::new(Threads {
+                next_id: 1,
+                list: Vec::new(),
+                collecting: false,
+                epoch: 0,
+                failures: 0,
+                cancelled: 0,
+            }),
+            quiet: Condvar::new(),
+            resume: Condvar::new(),
+        }
+    }
+}
+
+/// The calling thread's registration; dropping it, when the thread
+/// leaves or exits, removes the thread from the world.
+struct Mine {
+    world: Arc<World>,
+    id: u64,
+    /// The collection count this thread's open regions belong to.
+    epoch: u64,
+}
+
+impl Drop for Mine {
+    fn drop(&mut self) {
+        let mut g = lock(&self.world.inner);
+        g.list.retain(|t| t.id != self.id);
+        drop(g);
+        self.world.quiet.notify_all();
+    }
 }
 
 pub struct Heap {
@@ -137,6 +245,9 @@ pub struct Heap {
     floor: usize,
     growth: usize,
     stress: bool,
+    /// Several threads may allocate and collect.
+    threads: bool,
+    world: Arc<World>,
     live: AtomicUsize,
     collections: AtomicUsize,
 }
@@ -162,7 +273,16 @@ pub fn active() -> bool {
 /// claiming it ends collection for the process: two runtimes' stacks
 /// cannot both be read.
 pub fn claim_owner() {
-    if !active() {
+    let Some(h) = HEAP.get() else {
+        return;
+    };
+    if h.threads {
+        // Every thread can collect; the first claimer owns the work that
+        // must run on the program's own thread.
+        if !CLAIMED.swap(true, Relaxed) {
+            OWNER.with(|o| o.set(true));
+        }
+        h.register();
         return;
     }
     if CLAIMED.swap(true, Relaxed) && !OWNER.with(|o| o.get()) {
@@ -174,7 +294,7 @@ pub fn claim_owner() {
 
 /// Note an allocation by a thread that does not own the heap.
 #[inline]
-fn note_allocator() {
+fn note_foreign() {
     if CLAIMED.load(Relaxed) && !OWNER.with(|o| o.get()) {
         FOREIGN.store(true, Relaxed);
     }
@@ -191,11 +311,26 @@ pub fn collecting_here() -> bool {
 /// A collection, if the calling thread may run one, whose deepest live
 /// stack word is at `sp`.
 pub fn collect_from_sp(sp: usize) {
-    if let Some(h) = HEAP.get()
-        && OWNER.with(|o| o.get())
-        && !FOREIGN.load(Relaxed)
-    {
+    let Some(h) = HEAP.get() else {
+        return;
+    };
+    if h.threads {
+        h.collect_threads(sp, EXPLICIT_WAIT, true);
+    } else if OWNER.with(|o| o.get()) && !FOREIGN.load(Relaxed) {
         h.collect_from(sp);
+    }
+}
+
+/// Run `f`, which blocks or waits and touches no heap object, with the
+/// calling thread counted as stopped: a collection does not wait for it.
+/// What the caller holds is still read, but a heap pointer kept only in
+/// `f`'s own frames is not. A plain call to `f` when the heap does not
+/// collect across threads.
+#[inline]
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match HEAP.get() {
+        Some(h) if h.threads => h.blocking(f),
+        _ => f(),
     }
 }
 
@@ -244,6 +379,12 @@ fn reserve(bytes: usize) -> *mut u8 {
 
 impl Heap {
     pub fn new(heap_bytes: usize) -> Option<Heap> {
+        let floor = env_usize("ZYNTAX_IMMIX_FLOOR_KB").unwrap_or(DEFAULT_FLOOR_KB) << 10;
+        let threads = std::env::var_os("ZYNTAX_IMMIX_THREADS").is_some_and(|v| v == "1");
+        Heap::with(heap_bytes, floor, threads)
+    }
+
+    fn with(heap_bytes: usize, floor: usize, threads: bool) -> Option<Heap> {
         let blocks = heap_bytes / BLOCK;
         let raw = reserve(blocks * BLOCK + BLOCK);
         let starts = reserve(blocks * QUANTA);
@@ -257,7 +398,6 @@ impl Heap {
         {
             return None;
         }
-        let floor = env_usize("ZYNTAX_IMMIX_FLOOR_KB").unwrap_or(DEFAULT_FLOOR_KB) << 10;
         let stress = std::env::var_os("ZYNTAX_IMMIX_STRESS").is_some();
         Some(Heap {
             base: (raw as usize).next_multiple_of(BLOCK),
@@ -280,6 +420,8 @@ impl Heap {
             floor,
             growth: env_usize("ZYNTAX_IMMIX_GROWTH").unwrap_or(0),
             stress,
+            threads,
+            world: Arc::new(World::new()),
             live: AtomicUsize::new(0),
             collections: AtomicUsize::new(0),
         })
@@ -407,17 +549,17 @@ impl Heap {
     /// block. Empty once the reservation is spent.
     #[inline(never)]
     fn next_region(&self, old: Region, lines: usize) -> Region {
-        note_allocator();
+        self.enter_slow_path();
         self.since_gc.fetch_add(old.cur - old.start, Relaxed);
         if self.due() {
-            self.collect_now();
+            self.collect_now(STOP_WAIT);
         }
         for attempt in 0..2 {
             if let Some(r) = self.take_region(lines) {
                 return r;
             }
             if attempt == 0 {
-                self.collect_now();
+                self.collect_now(EXPLICIT_WAIT);
             }
         }
         Region::EMPTY
@@ -464,10 +606,10 @@ impl Heap {
 
     fn alloc_large(&self, size: usize, held: bool) -> *mut u8 {
         if !held {
-            note_allocator();
+            self.enter_slow_path();
             self.since_gc.fetch_add(size, Relaxed);
             if self.due() {
-                self.collect_now();
+                self.collect_now(STOP_WAIT);
             }
         }
         let Ok(layout) = Layout::from_size_align(size, 16) else {
@@ -570,27 +712,38 @@ impl Heap {
 
     // -- Collection ---------------------------------------------------
 
-    /// An automatic collection: when one is allowed.
-    fn collect_now(&self) {
-        if AUTOMATIC.load(Relaxed) {
-            self.collect_explicit();
-        }
-    }
-
-    /// A collection on request. Only the thread that claimed the heap
-    /// runs one, and only while no other thread allocates.
-    fn collect_explicit(&self) {
-        if !OWNER.with(|o| o.get()) || FOREIGN.load(Relaxed) {
+    /// An automatic collection, when one is allowed. Other threads get
+    /// `wait` to stop.
+    fn collect_now(&self, wait: Duration) {
+        if !AUTOMATIC.load(Relaxed) {
             return;
         }
         let mut regs = [0usize; 12];
         crate::collector::spill_callee_saved(&mut regs);
-        self.collect_from(regs.as_ptr() as usize);
+        let sp = regs.as_ptr() as usize;
+        if self.threads {
+            self.collect_threads(sp, wait, false);
+        } else if OWNER.with(|o| o.get()) && !FOREIGN.load(Relaxed) {
+            self.collect_from(sp);
+        }
         std::hint::black_box(&regs);
     }
 
+    /// A collection on the calling thread alone, whose deepest live
+    /// stack word is at `sp`.
     #[inline(never)]
     fn collect_from(&self, sp: usize) {
+        let Some((windows, held)) = self.own_roots(sp) else {
+            return;
+        };
+        self.collect_windows(&windows, &held);
+        crate::collector::run_after_collection();
+    }
+
+    /// The calling thread's roots: its stack windows, with the fiber
+    /// stacks it runs and without the hidden ranges, and the addresses
+    /// its runtime holds. `None` when its stack's extent is unknown.
+    fn own_roots(&self, sp: usize) -> Option<(Vec<(usize, usize)>, Vec<usize>)> {
         let host_top = crate::collector::host_stack_top();
         let backend = crate::fiber_backend::installed_fiber_backend();
         let mut windows: Vec<(usize, usize)> = Vec::new();
@@ -599,19 +752,312 @@ impl Heap {
             None => windows.push((sp, host_top)),
         }
         if !windows.iter().any(|&(lo, hi)| hi == host_top && lo < hi) {
-            return;
+            return None;
         }
         let windows = crate::collector::without_hidden(windows);
-        self.collect_windows(&windows, backend);
+        let mut held = Vec::new();
+        if let Some(b) = backend {
+            b.held_addresses(&mut |a| held.push(a));
+        }
+        Some((windows, held))
     }
 
-    /// Mark from the stack `windows`, the registered roots and what the
-    /// fiber backend holds, then sweep.
-    fn collect_windows(
-        &self,
-        windows: &[(usize, usize)],
-        backend: Option<&dyn crate::fiber_backend::FiberCfg>,
+    // -- Threads ------------------------------------------------------
+
+    /// What every slow-path allocation does first: count the thread among
+    /// those that collect, or stop for a collection under way.
+    #[inline]
+    fn enter_slow_path(&self) {
+        if !self.threads {
+            note_foreign();
+            return;
+        }
+        debug_assert_eq!(
+            NATIVE.with(|n| n.get()),
+            0,
+            "a heap allocation inside a blocking region"
+        );
+        self.register();
+        if self.world.stop.load(Relaxed) {
+            self.park_here();
+        }
+        if AFTER_PENDING.load(Relaxed)
+            && OWNER.with(|o| o.get())
+            && AFTER_PENDING.swap(false, Relaxed)
+        {
+            crate::collector::run_after_collection();
+        }
+    }
+
+    /// The calling thread's id in this heap's world; it joins on first
+    /// use.
+    fn register(&self) -> u64 {
+        MINE.with(|m| {
+            let mut m = m.borrow_mut();
+            if let Some(me) = m.as_ref()
+                && Arc::ptr_eq(&me.world, &self.world)
+            {
+                return me.id;
+            }
+            *m = None;
+            if crate::collector::host_stack_top() == 0 {
+                // Its stack cannot be bounded, so no collection can read it.
+                FOREIGN.store(true, Relaxed);
+            }
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string();
+            let mut g = lock(&self.world.inner);
+            let id = g.next_id;
+            g.next_id += 1;
+            g.list.push(Thread {
+                id,
+                name,
+                state: State::Running,
+                windows: Vec::new(),
+                held: Vec::new(),
+            });
+            let epoch = g.epoch;
+            drop(g);
+            *m = Some(Mine {
+                world: self.world.clone(),
+                id,
+                epoch,
+            });
+            id
+        })
+    }
+
+    /// The calling thread leaves the world; its open regions go back to
+    /// the next collection.
+    fn leave_thread(&self) {
+        self.since_gc.fetch_add(open_bytes(), Relaxed);
+        SMALL.with(|c| c.set(Region::EMPTY));
+        MEDIUM.with(|c| c.set(Region::EMPTY));
+        MINE.with(|m| m.borrow_mut().take());
+    }
+
+    /// After a wait that may have spanned a collection: the thread's open
+    /// regions are stale if one ran, as its sweep treats every line they
+    /// have not filled as free.
+    fn resync(&self, epoch: u64) {
+        let stale = MINE.with(|m| match m.borrow_mut().as_mut() {
+            Some(me) if me.epoch != epoch => {
+                me.epoch = epoch;
+                true
+            }
+            _ => false,
+        });
+        if stale {
+            SMALL.with(|c| c.set(Region::EMPTY));
+            MEDIUM.with(|c| c.set(Region::EMPTY));
+        }
+    }
+
+    fn set_state(
+        g: &mut Threads,
+        id: u64,
+        state: State,
+        windows: Vec<(usize, usize)>,
+        held: Vec<usize>,
     ) {
+        if let Some(t) = g.list.iter_mut().find(|t| t.id == id) {
+            t.state = state;
+            t.windows = windows;
+            t.held = held;
+        }
+    }
+
+    /// Stop here until the collection in progress ends.
+    #[inline(never)]
+    fn park_here(&self) {
+        let mut regs = [0usize; 12];
+        crate::collector::spill_callee_saved(&mut regs);
+        self.park(regs.as_ptr() as usize);
+        std::hint::black_box(&regs);
+    }
+
+    /// Publish this thread's roots, whose deepest live word is at `sp`,
+    /// and wait for the collection in progress to end.
+    fn park(&self, sp: usize) {
+        let me = self.register();
+        let Some((windows, held)) = self.own_roots(sp) else {
+            FOREIGN.store(true, Relaxed);
+            return;
+        };
+        let mut g = lock(&self.world.inner);
+        if !g.collecting {
+            return;
+        }
+        Self::set_state(&mut g, me, State::Parked, windows, held);
+        self.world.quiet.notify_all();
+        while g.collecting {
+            g = self.world.resume.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        Self::set_state(&mut g, me, State::Running, Vec::new(), Vec::new());
+        let epoch = g.epoch;
+        drop(g);
+        self.resync(epoch);
+    }
+
+    #[inline(never)]
+    fn blocking<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Leave<'a>(&'a Heap);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                self.0.native_leave();
+            }
+        }
+        let mut regs = [0usize; 12];
+        crate::collector::spill_callee_saved(&mut regs);
+        self.native_enter(regs.as_ptr() as usize);
+        let leave = Leave(self);
+        let r = f();
+        std::hint::black_box(&regs);
+        drop(leave);
+        r
+    }
+
+    /// Count this thread as stopped, its roots published from `sp` up.
+    fn native_enter(&self, sp: usize) {
+        let depth = NATIVE.with(|n| n.get());
+        NATIVE.with(|n| n.set(depth + 1));
+        if depth > 0 {
+            return;
+        }
+        let me = self.register();
+        let Some((windows, held)) = self.own_roots(sp) else {
+            FOREIGN.store(true, Relaxed);
+            return;
+        };
+        let mut g = lock(&self.world.inner);
+        Self::set_state(&mut g, me, State::Native, windows, held);
+        drop(g);
+        self.world.quiet.notify_all();
+    }
+
+    /// The thread runs again, after any collection in progress.
+    fn native_leave(&self) {
+        let depth = NATIVE.with(|n| n.get());
+        if depth == 0 {
+            return;
+        }
+        NATIVE.with(|n| n.set(depth - 1));
+        if depth > 1 {
+            return;
+        }
+        let me = self.register();
+        let mut g = lock(&self.world.inner);
+        while g.collecting
+            && g.list
+                .iter()
+                .any(|t| t.id == me && t.state == State::Native)
+        {
+            g = self.world.resume.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        Self::set_state(&mut g, me, State::Running, Vec::new(), Vec::new());
+        let epoch = g.epoch;
+        drop(g);
+        self.resync(epoch);
+    }
+
+    /// A collection that stops every other thread first. `wait` bounds
+    /// the stop. A program's own request waits out another thread's
+    /// collection and then runs one, and does not back later attempts
+    /// off when it fails.
+    #[inline(never)]
+    fn collect_threads(&self, sp: usize, wait: Duration, explicit: bool) {
+        if FOREIGN.load(Relaxed) {
+            return;
+        }
+        let me = self.register();
+        let world = &*self.world;
+        let mut g = lock(&world.inner);
+        while g.collecting {
+            drop(g);
+            self.park(sp);
+            if !explicit {
+                return;
+            }
+            g = lock(&world.inner);
+        }
+        g.collecting = true;
+        world.stop.store(true, Relaxed);
+        let deadline = Instant::now() + wait;
+        while g
+            .list
+            .iter()
+            .any(|t| t.id != me && t.state == State::Running)
+        {
+            let now = Instant::now();
+            if now >= deadline {
+                self.cancel_stop(g, me, !explicit);
+                return;
+            }
+            g = world
+                .quiet
+                .wait_timeout(g, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        let Some((mut windows, mut held)) = self.own_roots(sp) else {
+            self.end_stop(g);
+            return;
+        };
+        for t in g.list.iter().filter(|t| t.id != me) {
+            windows.extend_from_slice(&t.windows);
+            held.extend_from_slice(&t.held);
+        }
+        self.collect_windows(&windows, &held);
+        g.epoch += 1;
+        g.failures = 0;
+        let epoch = g.epoch;
+        self.end_stop(g);
+        self.resync(epoch);
+        if OWNER.with(|o| o.get()) || !CLAIMED.load(Relaxed) {
+            crate::collector::run_after_collection();
+        } else {
+            AFTER_PENDING.store(true, Relaxed);
+        }
+    }
+
+    /// Give up a stop that was not answered in time, and wait longer
+    /// before the next.
+    fn cancel_stop(&self, mut g: MutexGuard<'_, Threads>, me: u64, back_off: bool) {
+        let late: Vec<String> = g
+            .list
+            .iter()
+            .filter(|t| t.id != me && t.state == State::Running)
+            .map(|t| format!("{} ({})", t.id, t.name))
+            .collect();
+        g.cancelled += 1;
+        if back_off {
+            g.failures = (g.failures + 1).min(MAX_BACKOFF);
+            let more = self.floor << g.failures;
+            self.threshold
+                .store(self.since_gc.load(Relaxed) + more, Relaxed);
+        }
+        if tracing() {
+            eprintln!(
+                "[immix] stop cancelled: no answer from thread {}",
+                late.join(", ")
+            );
+        }
+        self.end_stop(g);
+    }
+
+    /// End the stop and wake the threads waiting on it.
+    fn end_stop(&self, mut g: MutexGuard<'_, Threads>) {
+        g.collecting = false;
+        self.world.stop.store(false, Relaxed);
+        drop(g);
+        self.world.resume.notify_all();
+    }
+
+    /// Mark from the stack `windows`, the registered roots and the
+    /// `held` addresses, then sweep.
+    fn collect_windows(&self, windows: &[(usize, usize)], held: &[usize]) {
         let began = std::time::Instant::now();
         SMALL.with(|c| c.set(Region::EMPTY));
         MEDIUM.with(|c| c.set(Region::EMPTY));
@@ -670,8 +1116,8 @@ impl Heap {
                 m.scan(a, a + size);
             }
         }
-        if let Some(b) = backend {
-            b.held_addresses(&mut |a| m.consider(a));
+        for &a in held {
+            m.consider(a);
         }
         m.drain();
         if !hooks.is_empty() {
@@ -722,7 +1168,7 @@ impl Heap {
             },
             Relaxed,
         );
-        if std::env::var_os("ZYNTAX_IMMIX_TRACE").is_some() {
+        if tracing() {
             eprintln!(
                 "[immix] #{}: {} KB reached, {} KB freed, next after {} KB, mark {:.2} ms, total {:.2} ms",
                 self.collections.load(Relaxed),
@@ -733,7 +1179,6 @@ impl Heap {
                 began.elapsed().as_secs_f64() * 1e3
             );
         }
-        crate::collector::run_after_collection();
     }
 
     /// Free what no mark reached: blocks wholly dead return to the pool,
@@ -1060,6 +1505,11 @@ unsafe extern "C" fn free(cx: *mut c_void, ptr: *mut u8) {
 unsafe extern "C" fn realloc(cx: *mut c_void, ptr: *mut u8, size: usize) -> *mut u8 {
     // SAFETY: as in `alloc`.
     let h = unsafe { &*(cx as *const Heap) };
+    if h.threads {
+        // The size lookup below reads tables a collection rewrites; a
+        // registered thread is stopped before one runs.
+        h.register();
+    }
     if size > MEDIUM_MAX && !h.in_range(ptr as usize) {
         // SAFETY: the block is the caller's, from this heap.
         if let Some(p) = unsafe { h.resize_large(ptr, size) } {
@@ -1130,9 +1580,17 @@ unsafe extern "C" fn remove_root_range(cx: *mut c_void, start: *const u8) {
     lock(&h.roots).remove(&(start as usize));
 }
 
+/// A thread joins the world at its first slow-path allocation, so a
+/// thread that never allocates is never waited for.
 unsafe extern "C" fn thread_enter(_cx: *mut c_void, _top: *const u8) {}
 
-unsafe extern "C" fn thread_leave(_cx: *mut c_void) {}
+unsafe extern "C" fn thread_leave(cx: *mut c_void) {
+    // SAFETY: as in `alloc`.
+    let h = unsafe { &*(cx as *const Heap) };
+    if h.threads {
+        h.leave_thread();
+    }
+}
 
 /// Reserve the heap and make it the process's. `None` when the address
 /// space is not available or one is already installed.
@@ -1177,7 +1635,7 @@ mod tests {
     }
 
     fn collect(h: &Heap) {
-        h.collect_windows(&[], None);
+        h.collect_windows(&[], &[]);
     }
 
     #[test]
@@ -1458,5 +1916,265 @@ mod tests {
         let pool = h.pool.lock().unwrap();
         assert_eq!(pool.free_blocks.len(), pool.cursor);
         assert!(pool.holes.is_empty());
+    }
+
+    // -- Several threads -----------------------------------------------
+
+    const MAGIC: usize = 0x5eed_0000;
+
+    fn threaded(floor_kb: usize) -> &'static Heap {
+        watchdog();
+        Box::leak(Box::new(
+            Heap::with(256 << 20, floor_kb << 10, true).expect("a reservation"),
+        ))
+    }
+
+    /// A test that hangs ends the process instead of the run.
+    fn watchdog() {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(120));
+            eprintln!("a threaded heap test hung");
+            std::process::abort();
+        });
+    }
+
+    fn fill(p: usize, size: usize) {
+        // SAFETY: the allocation is `size` bytes.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0xAA, size) };
+    }
+
+    /// A list of `n` nodes in the heap; the caller's stack holds the head.
+    fn build(h: &Heap, n: usize) -> usize {
+        let mut head = 0usize;
+        for i in 0..n {
+            let node = make(h, 32);
+            // SAFETY: the node is 32 bytes.
+            unsafe {
+                *(node as *mut usize) = head;
+                *(node as *mut usize).add(1) = MAGIC + i;
+            }
+            head = node;
+        }
+        head
+    }
+
+    /// The length of the list at `head`, which stops at the first node
+    /// that does not carry the tag.
+    fn walk(mut head: usize) -> usize {
+        let mut n = 0;
+        while head != 0 {
+            // SAFETY: a node of the list, or memory the heap owns.
+            let (next, tag) = unsafe { (*(head as *const usize), *(head as *const usize).add(1)) };
+            if tag & !0xffff != MAGIC {
+                break;
+            }
+            n += 1;
+            head = next;
+        }
+        n
+    }
+
+    /// How many nodes of the list at `head` the heap still holds.
+    fn held_nodes(h: &Heap, mut head: usize) -> usize {
+        let mut n = 0;
+        while head != 0 && h.containing(head) == Some((head, 32)) {
+            n += 1;
+            // SAFETY: a node the heap holds.
+            head = unsafe { *(head as *const usize) };
+        }
+        n
+    }
+
+    #[inline(never)]
+    fn collect_all(h: &Heap) {
+        let mut regs = [0usize; 12];
+        crate::collector::spill_callee_saved(&mut regs);
+        h.collect_threads(regs.as_ptr() as usize, EXPLICIT_WAIT, true);
+        std::hint::black_box(&regs);
+    }
+
+    fn cancelled(h: &Heap) -> u64 {
+        lock(&h.world.inner).cancelled
+    }
+
+    fn registered(h: &Heap) -> usize {
+        lock(&h.world.inner).list.len()
+    }
+
+    #[test]
+    fn a_collection_reads_the_stack_of_a_thread_it_stopped() {
+        let h = threaded(1 << 20);
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (ready, stop) = (ready.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let head = build(h, 100);
+                ready.store(true, Relaxed);
+                while !stop.load(Relaxed) {
+                    fill(make(h, 3000), 3000);
+                    for _ in 0..40 {
+                        fill(make(h, 32), 32);
+                    }
+                }
+                assert_eq!(walk(std::hint::black_box(head)), 100);
+                assert_eq!(held_nodes(h, head), 100, "the heap dropped a node");
+                h.leave_thread();
+            })
+        };
+        while !ready.load(Relaxed) {
+            std::thread::yield_now();
+        }
+        for _ in 0..20 {
+            collect_all(h);
+        }
+        stop.store(true, Relaxed);
+        worker.join().unwrap();
+        assert!(h.collections.load(Relaxed) >= 20);
+        assert_eq!(cancelled(h), 0);
+    }
+
+    #[test]
+    fn eight_threads_keep_their_lists_through_automatic_collections() {
+        let h = threaded(256);
+        let workers: Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let head = build(h, 3000);
+                    for i in 0..20_000 {
+                        fill(make(h, 200), 200);
+                        if i % 50 == 0 {
+                            fill(make(h, 4000), 4000);
+                        }
+                        if i % 2000 == 0 {
+                            assert_eq!(walk(std::hint::black_box(head)), 3000, "thread {t}");
+                        }
+                        if t < 2 && i % 4000 == 0 {
+                            collect_all(h);
+                        }
+                    }
+                    assert_eq!(walk(std::hint::black_box(head)), 3000, "thread {t}");
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(h.collections.load(Relaxed) > 4);
+        let live = h.live.load(Relaxed);
+        assert!(live < 8 << 20, "{live} bytes stayed live");
+    }
+
+    #[test]
+    fn a_thread_in_a_blocking_region_does_not_hold_up_a_collection() {
+        let h = threaded(1 << 20);
+        let entered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let entered = entered.clone();
+            std::thread::spawn(move || {
+                let head = build(h, 100);
+                h.blocking(|| {
+                    entered.store(true, Relaxed);
+                    rx.recv().unwrap();
+                });
+                assert_eq!(held_nodes(h, std::hint::black_box(head)), 100);
+                for _ in 0..2000 {
+                    fill(make(h, 100), 100);
+                }
+                assert_eq!(walk(std::hint::black_box(head)), 100);
+                assert_eq!(held_nodes(h, head), 100);
+                h.leave_thread();
+            })
+        };
+        while !entered.load(Relaxed) {
+            std::thread::yield_now();
+        }
+        for _ in 0..10 {
+            collect_all(h);
+            for _ in 0..200 {
+                fill(make(h, 500), 500);
+            }
+        }
+        assert_eq!(cancelled(h), 0, "a native thread was waited for");
+        tx.send(()).unwrap();
+        worker.join().unwrap();
+        collect_all(h);
+    }
+
+    #[test]
+    fn a_thread_that_never_answers_cancels_the_stop_and_backs_off() {
+        let h = threaded(1 << 10);
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinner = {
+            let (ready, stop) = (ready.clone(), stop.clone());
+            std::thread::spawn(move || {
+                fill(make(h, 32), 32);
+                ready.store(true, Relaxed);
+                while !stop.load(Relaxed) {
+                    std::hint::spin_loop();
+                }
+                h.leave_thread();
+            })
+        };
+        while !ready.load(Relaxed) {
+            std::thread::yield_now();
+        }
+        make(h, 64);
+        let began = Instant::now();
+        let mut regs = [0usize; 12];
+        crate::collector::spill_callee_saved(&mut regs);
+        h.collect_threads(regs.as_ptr() as usize, STOP_WAIT, false);
+        std::hint::black_box(&regs);
+        let took = began.elapsed();
+        assert!(
+            took >= STOP_WAIT && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert_eq!(cancelled(h), 1);
+        assert_eq!(h.collections.load(Relaxed), 0);
+        assert!(!h.world.stop.load(Relaxed), "the stop was left on");
+        assert!(h.threshold.load(Relaxed) >= h.floor << 1, "no back-off");
+        stop.store(true, Relaxed);
+        spinner.join().unwrap();
+        collect_all(h);
+        assert_eq!(h.collections.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn threads_that_start_and_exit_during_collections_do_not_stall_them() {
+        let h = threaded(64);
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Relaxed) {
+                    collect_all(h);
+                    fill(make(h, 300), 300);
+                }
+                h.leave_thread();
+            })
+        };
+        let workers: Vec<_> = (0..200)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let head = build(h, 50);
+                    for _ in 0..500 {
+                        fill(make(h, 100), 100);
+                    }
+                    assert_eq!(walk(std::hint::black_box(head)), 50);
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        done.store(true, Relaxed);
+        collector.join().unwrap();
+        assert_eq!(registered(h), 0, "an exited thread stayed registered");
+        // A thread descheduled for the stop's wait costs one cancelled
+        // collection, so only progress is asserted.
+        assert!(h.collections.load(Relaxed) > 10);
     }
 }
