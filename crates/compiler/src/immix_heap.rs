@@ -456,6 +456,35 @@ impl Heap {
         p
     }
 
+    /// A system-allocated block resized by the system, which can move
+    /// its pages in place of copying them. `None` when `ptr` is not one.
+    ///
+    /// # Safety
+    /// `ptr` must not be used again if this returns a block.
+    unsafe fn resize_large(&self, ptr: *mut u8, size: usize) -> Option<*mut u8> {
+        let mut large = lock(&self.large);
+        let &Large { size: old, held } = large.get(&(ptr as usize))?;
+        let old_layout = Layout::from_size_align(old, 16).ok()?;
+        Layout::from_size_align(size, 16).ok()?;
+        // SAFETY: `ptr` was allocated here with `old_layout`; `size` is
+        // not zero and makes a valid layout.
+        let p = unsafe { std::alloc::realloc(ptr, old_layout, size) };
+        if p.is_null() {
+            return Some(p);
+        }
+        large.remove(&(ptr as usize));
+        large.insert(p as usize, Large { size, held });
+        if held {
+            if size > old {
+                // SAFETY: the new tail lies inside the block.
+                unsafe { std::ptr::write_bytes(p.add(old), 0, size - old) };
+            }
+        } else {
+            self.since_gc.fetch_add(size, Relaxed);
+        }
+        Some(p)
+    }
+
     // -- Address resolution -------------------------------------------
 
     /// The size in bytes of the allocation starting at quantum `q`.
@@ -1005,6 +1034,12 @@ unsafe extern "C" fn free(cx: *mut c_void, ptr: *mut u8) {
 unsafe extern "C" fn realloc(cx: *mut c_void, ptr: *mut u8, size: usize) -> *mut u8 {
     // SAFETY: as in `alloc`.
     let h = unsafe { &*(cx as *const Heap) };
+    if size > MEDIUM_MAX && !h.in_range(ptr as usize) {
+        // SAFETY: the block is the caller's, from this heap.
+        if let Some(p) = unsafe { h.resize_large(ptr, size) } {
+            return p;
+        }
+    }
     let (old, held) = if let Some((s, bytes)) = h.containing(ptr as usize) {
         if s == ptr as usize && size <= bytes {
             return ptr;
@@ -1294,6 +1329,35 @@ mod tests {
         unsafe { free(cx, held as *mut u8) };
         collect(&h);
         assert!(h.containing(behind).is_none());
+    }
+
+    #[test]
+    fn a_large_block_resized_keeps_its_contents_and_stays_owned() {
+        let h = heap();
+        let cx = &h as *const Heap as *mut c_void;
+        let a = make(&h, 40_000);
+        for i in 0..40_000 / 8 {
+            // SAFETY: inside the block.
+            unsafe { *(a as *mut usize).add(i) = i };
+        }
+        // SAFETY: the context is this heap, and `a` is its block.
+        let b = unsafe { realloc(cx, a as *mut u8, 300_000) } as usize;
+        assert_ne!(b, 0);
+        for i in 0..40_000 / 8 {
+            // SAFETY: inside the block.
+            assert_eq!(unsafe { *(b as *const usize).add(i) }, i);
+        }
+        assert!(unsafe { owns(cx, b as *const u8) });
+        assert!(unsafe { owns(cx, (b + 299_999) as *const u8) });
+        // SAFETY: as above.
+        let c = unsafe { realloc(cx, b as *mut u8, 20_000) } as usize;
+        assert_ne!(c, 0);
+        assert_eq!(unsafe { *(c as *const usize).add(7) }, 7);
+        assert!(unsafe { owns(cx, c as *const u8) });
+        let mut roots = vec![c];
+        root(&h, &mut roots);
+        collect(&h);
+        assert!(unsafe { owns(cx, c as *const u8) });
     }
 
     #[test]
