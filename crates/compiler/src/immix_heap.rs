@@ -95,7 +95,8 @@ struct Pool {
     /// Blocks handed out so far; the rest of the reservation was never
     /// touched and reads as zero.
     cursor: usize,
-    /// Blocks every line of which died; their bytes are stale.
+    /// Blocks every line of which died; their bytes are stale, and
+    /// allocation does not clear them.
     free_blocks: Vec<u32>,
     /// Runs of dead lines in blocks with live ones: block, first line,
     /// line count.
@@ -311,7 +312,12 @@ impl Heap {
                     r.cur = p + bytes;
                     cell.set(r);
                     // SAFETY: `p` lies in a region of this heap.
-                    unsafe { *self.start_at((p - self.base) / QUANTUM) = quanta as u8 };
+                    unsafe {
+                        *self.start_at((p - self.base) / QUANTUM) = quanta as u8;
+                        // Recycled memory is not cleared; the bytes past the
+                        // request are, as the marker reads to the end.
+                        std::ptr::write_bytes((p + bytes - QUANTUM) as *mut u8, 0, QUANTUM);
+                    }
                     return p as *mut u8;
                 }
                 r = self.next_region(r, 1);
@@ -340,6 +346,8 @@ impl Heap {
                         *self.start_at(q) = SPAN;
                         *self.spans.add(line) = lines as u16;
                         *self.has_span.add(block) = 1;
+                        let from = p + size.next_multiple_of(8);
+                        std::ptr::write_bytes(from as *mut u8, 0, p + lines * LINE - from);
                     }
                     return p as *mut u8;
                 }
@@ -379,35 +387,30 @@ impl Heap {
 
     fn take_region(&self, lines: usize) -> Option<Region> {
         let mut pool = lock(&self.pool);
-        let (block, first, count, dirty) = if let Some(i) = pool
+        let (block, first, count) = if let Some(i) = pool
             .holes
             .iter()
             .rposition(|&(_, _, n)| n as usize >= lines)
         {
             let (b, f, n) = pool.holes.swap_remove(i);
-            (b as usize, f as usize, n as usize, true)
+            (b as usize, f as usize, n as usize)
         } else if let Some(b) = pool.free_blocks.pop() {
             self.state_set(b as usize, USED);
-            (b as usize, 0, LINES, true)
+            (b as usize, 0, LINES)
         } else if pool.cursor < self.blocks {
             let b = pool.cursor;
             pool.cursor += 1;
             self.state_set(b, USED);
-            (b, 0, LINES, false)
+            (b, 0, LINES)
         } else {
             return None;
         };
         drop(pool);
         let lo = self.block_addr(block) + first * LINE;
-        let len = count * LINE;
-        if dirty {
-            // SAFETY: the run is dead lines of this heap.
-            unsafe { std::ptr::write_bytes(lo as *mut u8, 0, len) };
-        }
         Some(Region {
             start: lo,
             cur: lo,
-            limit: lo + len,
+            limit: lo + count * LINE,
         })
     }
 
@@ -1047,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn small_objects_are_aligned_zeroed_and_packed() {
+    fn small_objects_are_aligned_slack_cleared_and_packed() {
         let h = heap();
         let mut last = 0;
         for size in [1, 16, 24, 40, 72, 100, 128] {
@@ -1057,7 +1060,7 @@ mod tests {
                 let bytes = size.div_ceil(16) * 16;
                 // SAFETY: the allocation is `bytes` long.
                 assert!(
-                    unsafe { std::slice::from_raw_parts(p as *const u8, bytes) }
+                    unsafe { std::slice::from_raw_parts((p + size) as *const u8, bytes - size) }
                         .iter()
                         .all(|b| *b == 0)
                 );
@@ -1116,15 +1119,17 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_line_is_reused_and_comes_back_zeroed() {
+    fn a_dead_line_is_reused_with_its_slack_cleared() {
         let h = heap();
         let mut keep = Vec::new();
-        let mut all = Vec::new();
         for i in 0..4000 {
-            let p = make(&h, 64);
-            // SAFETY: 64 bytes.
-            unsafe { std::ptr::write_bytes(p as *mut u8, 0xAB, 64) };
-            all.push(p);
+            let p = make(&h, 60);
+            let m = make(&h, 200);
+            // SAFETY: the allocations are 64 and 256 bytes long.
+            unsafe {
+                std::ptr::write_bytes(p as *mut u8, 0xAB, 64);
+                std::ptr::write_bytes(m as *mut u8, 0xAB, 256);
+            }
             if i % 50 == 0 {
                 keep.push(p);
             }
@@ -1132,14 +1137,18 @@ mod tests {
         root(&h, &mut keep);
         collect(&h);
         let before = h.pool.lock().unwrap().cursor;
-        for _ in 0..3000 {
-            let p = make(&h, 64);
-            // SAFETY: 64 bytes.
-            assert!(
-                unsafe { std::slice::from_raw_parts(p as *const u8, 64) }
-                    .iter()
-                    .all(|b| *b == 0)
-            );
+        for _ in 0..1500 {
+            let p = make(&h, 60);
+            let m = make(&h, 200);
+            // SAFETY: the allocations are 64 and 256 bytes long.
+            let (ps, ms) = unsafe {
+                (
+                    std::slice::from_raw_parts((p + 60) as *const u8, 4),
+                    std::slice::from_raw_parts((m + 200) as *const u8, 56),
+                )
+            };
+            assert!(ps.iter().all(|b| *b == 0), "slack of a small object");
+            assert!(ms.iter().all(|b| *b == 0), "slack of a medium object");
             assert!(!keep.contains(&p), "a live object was handed out again");
         }
         assert_eq!(h.pool.lock().unwrap().cursor, before, "took fresh blocks");

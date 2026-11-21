@@ -91,10 +91,11 @@ pub type SpanReader =
 /// The host's heap, as the runtime calls it. Every slot may be called
 /// from any thread.
 ///
-/// `alloc` returns zeroed memory aligned to 16 bytes, or null when it has
-/// none; `realloc` keeps the contents and zeroes what it gains. `free` and
-/// `realloc` are only passed blocks `owns` answers for, and `free` of a
-/// block the host already reclaimed does nothing.
+/// `alloc` returns memory aligned to 16 bytes, or null when it has none.
+/// The contents are unspecified, as the runtime's own pool leaves them:
+/// the runtime writes memory before it reads it. `realloc` keeps the
+/// contents. `free` and `realloc` are only passed blocks `owns` answers
+/// for, and `free` of a block the host already reclaimed does nothing.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostHeap {
