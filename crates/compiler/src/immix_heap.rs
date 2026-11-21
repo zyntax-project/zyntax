@@ -301,32 +301,45 @@ impl Heap {
 
     // -- Allocation ---------------------------------------------------
 
-    fn alloc_small(&self, size: usize) -> *mut u8 {
-        let quanta = size.div_ceil(QUANTUM);
+    /// A small object from this thread's region, or null once the
+    /// region is spent.
+    #[inline(always)]
+    fn bump_small(&self, size: usize) -> *mut u8 {
+        let quanta = size.max(1).div_ceil(QUANTUM);
         let bytes = quanta * QUANTUM;
         SMALL.with(|cell| {
-            let mut r = cell.get();
-            loop {
-                let p = r.cur;
-                if p + bytes <= r.limit {
-                    r.cur = p + bytes;
-                    cell.set(r);
-                    // SAFETY: `p` lies in a region of this heap.
-                    unsafe {
-                        *self.start_at((p - self.base) / QUANTUM) = quanta as u8;
-                        // Recycled memory is not cleared; the bytes past the
-                        // request are, as the marker reads to the end.
-                        std::ptr::write_bytes((p + bytes - QUANTUM) as *mut u8, 0, QUANTUM);
-                    }
-                    return p as *mut u8;
-                }
-                r = self.next_region(r, 1);
-                cell.set(r);
-                if r.limit == 0 {
-                    return std::ptr::null_mut();
-                }
+            // SAFETY: the cell belongs to this thread and nothing else
+            // holds a reference into it.
+            let r = unsafe { &mut *cell.as_ptr() };
+            let p = r.cur;
+            if p + bytes > r.limit {
+                return std::ptr::null_mut();
             }
+            r.cur = p + bytes;
+            // SAFETY: `p` lies in a region of this heap.
+            unsafe {
+                *self.start_at((p - self.base) / QUANTUM) = quanta as u8;
+                // Recycled memory is not cleared; the bytes past the
+                // request are, as the marker reads to the end.
+                std::ptr::write_bytes((p + bytes - QUANTUM) as *mut u8, 0, QUANTUM);
+            }
+            p as *mut u8
         })
+    }
+
+    #[inline(never)]
+    fn alloc_small(&self, size: usize) -> *mut u8 {
+        loop {
+            let p = self.bump_small(size);
+            if !p.is_null() {
+                return p;
+            }
+            let r = self.next_region(SMALL.with(|c| c.get()), 1);
+            SMALL.with(|c| c.set(r));
+            if r.limit == 0 {
+                return std::ptr::null_mut();
+            }
+        }
     }
 
     fn alloc_medium(&self, size: usize) -> *mut u8 {
@@ -553,12 +566,20 @@ impl Heap {
         let mut large = lock(&self.large);
         let roots = lock(&self.roots);
 
+        let large_lo = large.keys().next().copied().unwrap_or(0);
+        let large_hi = large
+            .iter()
+            .map(|(&a, l)| a + l.size.max(1))
+            .max()
+            .unwrap_or(0);
         let mut m = Marker {
             h: self,
             stack: Vec::new(),
             marked: 0,
             large: large.iter().map(|(&a, l)| (a, l.size, l.held)).collect(),
             large_marked: vec![false; large.len()],
+            large_lo,
+            large_span: large_hi.wrapping_sub(large_lo),
         };
         let (hooks, sweepers) = crate::collector::weak_registry();
         for h in &hooks {
@@ -759,57 +780,94 @@ struct Marker<'h> {
     /// The system-allocated blocks, in address order.
     large: Vec<(usize, usize, bool)>,
     large_marked: Vec<bool>,
+    /// The lowest address of a system-allocated block and the distance
+    /// to the end of the highest: a word outside it names none.
+    large_lo: usize,
+    large_span: usize,
 }
 
 impl Marker<'_> {
     fn scan(&mut self, lo: usize, hi: usize) {
+        let (base, span) = (self.h.base, self.h.span);
+        let (large_lo, large_span) = (self.large_lo, self.large_span);
         let mut p = lo.next_multiple_of(8);
         while p + 8 <= hi {
             // SAFETY: the caller names memory it holds; a racing write
             // can only make a word stale.
             let w = unsafe { std::ptr::read_volatile(p as *const usize) };
-            self.consider(w);
+            if w.wrapping_sub(base) < span {
+                self.consider_heap(w);
+            } else if w.wrapping_sub(large_lo) < large_span {
+                self.consider_large(w);
+            }
             p += 8;
         }
     }
 
     fn consider(&mut self, a: usize) {
+        if a.wrapping_sub(self.h.base) < self.h.span {
+            self.consider_heap(a);
+        } else if a.wrapping_sub(self.large_lo) < self.large_span {
+            self.consider_large(a);
+        }
+    }
+
+    /// The start nearest at or below quantum `q`, within the longest
+    /// small object: its quantum and size byte.
+    #[inline(always)]
+    fn start_below(&self, q: usize) -> Option<(usize, u8)> {
+        let starts = self.h.starts;
+        if q >= SMALL_QUANTA - 1 {
+            // SAFETY: the eight bytes ending at quantum `q` are in the
+            // table, which has a byte per quantum.
+            let w =
+                unsafe { std::ptr::read_unaligned(starts.add(q + 1 - SMALL_QUANTA) as *const u64) };
+            // Bit 7 of each byte whose size code is not zero.
+            let set = ((w & !MARKS_OF_EIGHT).wrapping_add(!MARKS_OF_EIGHT)) & MARKS_OF_EIGHT;
+            if set == 0 {
+                return None;
+            }
+            let back = (set.leading_zeros() / 8) as usize;
+            let i = q - back;
+            return Some((i, (w >> (8 * (SMALL_QUANTA - 1 - back))) as u8));
+        }
+        let mut i = q;
+        loop {
+            // SAFETY: `i` is a quantum of the heap.
+            let b = unsafe { *starts.add(i) };
+            if b & CODE != 0 {
+                return Some((i, b));
+            }
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+
+    fn consider_heap(&mut self, a: usize) {
         let h = self.h;
-        let off = a.wrapping_sub(h.base);
-        if off < h.span {
-            let q = off / QUANTUM;
-            let floor = q.saturating_sub(SMALL_QUANTA - 1);
-            let mut i = q;
-            loop {
-                // SAFETY: `i` is a quantum of the heap.
-                let b = unsafe { *h.starts.add(i) };
-                if b & CODE != 0 {
-                    if b & MARK == 0 {
-                        let bytes = h.bytes_at(i, b & CODE);
-                        if q < i + bytes / QUANTUM {
-                            self.mark_at(i, bytes);
-                        }
-                    }
-                    return;
-                }
-                if i == floor {
-                    break;
-                }
-                i -= 1;
-            }
-            // An address inside a span, past its first line.
-            if let Some((start, bytes)) = h.containing(a) {
-                let q = (start - h.base) / QUANTUM;
-                // SAFETY: `q` is a quantum of the heap.
-                if unsafe { *h.starts.add(q) } & MARK == 0 {
-                    self.mark_at(q, bytes);
+        let q = (a - h.base) / QUANTUM;
+        if let Some((i, b)) = self.start_below(q) {
+            if b & MARK == 0 {
+                let bytes = h.bytes_at(i, b & CODE);
+                if q < i + bytes / QUANTUM {
+                    self.mark_at(i, bytes);
                 }
             }
             return;
         }
-        if self.large.is_empty() {
-            return;
+        // An address inside a span, past its first line.
+        if let Some((start, bytes)) = h.containing(a) {
+            let q = (start - h.base) / QUANTUM;
+            // SAFETY: `q` is a quantum of the heap.
+            if unsafe { *h.starts.add(q) } & MARK == 0 {
+                self.mark_at(q, bytes);
+            }
         }
+    }
+
+    fn consider_large(&mut self, a: usize) {
         let i = self.large.partition_point(|&(s, _, _)| s <= a);
         if i == 0 {
             return;
@@ -907,6 +965,18 @@ impl Marker<'_> {
 unsafe extern "C" fn alloc(cx: *mut c_void, size: usize, kind: HeapKind) -> *mut u8 {
     // SAFETY: the context is the heap this table was made for.
     let h = unsafe { &*(cx as *const Heap) };
+    if kind == HeapKind::Collected && size <= LINE {
+        let p = h.bump_small(size);
+        if !p.is_null() {
+            return p;
+        }
+    }
+    alloc_general(h, size, kind)
+}
+
+/// Every allocation the bump of a small object does not serve.
+#[inline(never)]
+fn alloc_general(h: &Heap, size: usize, kind: HeapKind) -> *mut u8 {
     let size = size.max(1);
     if kind == HeapKind::Held || size > MEDIUM_MAX {
         h.alloc_large(size, kind == HeapKind::Held)
@@ -1047,6 +1117,55 @@ mod tests {
 
     fn collect(h: &Heap) {
         h.collect_windows(&[], None);
+    }
+
+    #[test]
+    fn the_nearest_start_below_matches_a_byte_walk() {
+        let h = heap();
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let n = 4096;
+        for q in 0..n {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let code = match seed % 7 {
+                0 => (seed >> 8) % 8 + 1,
+                1 => SPAN as u64,
+                _ => 0,
+            } as u8;
+            let mark = if code != 0 && (seed >> 20) % 3 == 0 {
+                MARK
+            } else {
+                0
+            };
+            // SAFETY: a quantum of the heap.
+            unsafe { *h.starts.add(q) = code | mark };
+        }
+        let m = Marker {
+            h: &h,
+            stack: Vec::new(),
+            marked: 0,
+            large: Vec::new(),
+            large_marked: Vec::new(),
+            large_lo: 0,
+            large_span: 0,
+        };
+        for q in 0..n {
+            let floor = q.saturating_sub(SMALL_QUANTA - 1);
+            let mut i = q;
+            let want = loop {
+                // SAFETY: a quantum of the heap.
+                let b = unsafe { *h.starts.add(i) };
+                if b & CODE != 0 {
+                    break Some((i, b));
+                }
+                if i == floor {
+                    break None;
+                }
+                i -= 1;
+            };
+            assert_eq!(m.start_below(q), want, "quantum {q}");
+        }
     }
 
     #[test]
