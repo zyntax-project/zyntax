@@ -3,8 +3,10 @@
 //! `ZYNTAX_HOST_HEAP=immix` runs a program on it: every allocation comes
 //! from one reservation of address space carved into 32 KiB blocks of
 //! 128-byte lines, and a conservative mark-sweep reclaims it. Nothing
-//! moves, and nothing is released but by a collection, so a `free` of a
-//! small block is a hint the heap ignores.
+//! moves, and nothing is released but by a collection, except that a
+//! `free` of the last small object a thread allocated gives its bytes
+//! back to the thread's region. Any other `free` is a hint the heap
+//! ignores.
 //!
 //! An object of up to a line is bump-allocated and packed at 16 bytes,
 //! straddling a line boundary where it falls; a larger one owns whole
@@ -300,6 +302,29 @@ impl Heap {
     }
 
     // -- Allocation ---------------------------------------------------
+
+    /// Takes `a` back when it is the last small object this thread
+    /// bumped from its open region: the next allocation reuses its bytes.
+    /// Any other block is left to a collection.
+    #[inline]
+    fn release_top(&self, a: usize) {
+        SMALL.with(|cell| {
+            // SAFETY: the cell belongs to this thread and nothing else
+            // holds a reference into it.
+            let r = unsafe { &mut *cell.as_ptr() };
+            if a.wrapping_sub(r.start) >= r.cur - r.start {
+                return;
+            }
+            let q = (a - self.base) / QUANTUM;
+            // SAFETY: `a` lies in the open region of this heap.
+            let code = unsafe { *self.start_at(q) } & CODE;
+            if (1..=SMALL_QUANTA as u8).contains(&code) && a + code as usize * QUANTUM == r.cur {
+                // SAFETY: as above.
+                unsafe { *self.start_at(q) = 0 };
+                r.cur = a;
+            }
+        })
+    }
 
     /// A small object from this thread's region, or null once the
     /// region is spent.
@@ -1020,6 +1045,7 @@ unsafe extern "C" fn free(cx: *mut c_void, ptr: *mut u8) {
     // SAFETY: as in `alloc`.
     let h = unsafe { &*(cx as *const Heap) };
     if h.in_range(ptr as usize) {
+        h.release_top(ptr as usize);
         return;
     }
     let mut large = lock(&h.large);
@@ -1306,6 +1332,68 @@ mod tests {
             assert!(!keep.contains(&p), "a live object was handed out again");
         }
         assert_eq!(h.pool.lock().unwrap().cursor, before, "took fresh blocks");
+    }
+
+    #[test]
+    fn a_freed_last_small_object_is_reused_and_others_are_not() {
+        let h = heap();
+        let cx = &h as *const Heap as *mut c_void;
+        let a = make(&h, 48);
+        let b = make(&h, 48);
+        // SAFETY: the context is this heap and the blocks are its own.
+        unsafe { free(cx, a as *mut u8) };
+        let c = make(&h, 48);
+        assert_ne!(c, a, "a block under a later one stays allocated");
+        // SAFETY: as above.
+        unsafe { free(cx, c as *mut u8) };
+        let d = make(&h, 48);
+        assert_eq!(d, c, "the last block is handed out again");
+        assert_ne!(d, b);
+        // A second free of the same block, and one of an interior
+        // address, change nothing.
+        unsafe {
+            free(cx, d as *mut u8);
+            free(cx, d as *mut u8);
+            free(cx, (b + 16) as *mut u8);
+        }
+        let e = make(&h, 16);
+        assert_eq!(e, d);
+        let f = make(&h, 16);
+        assert_eq!(f, e + 16, "a repeated free took back one block only");
+    }
+
+    #[test]
+    fn a_reused_small_block_has_its_slack_cleared_and_its_own_size() {
+        let h = heap();
+        let cx = &h as *const Heap as *mut c_void;
+        let a = make(&h, 64);
+        // SAFETY: the block is 64 bytes.
+        unsafe { std::ptr::write_bytes(a as *mut u8, 0xff, 64) };
+        // SAFETY: the context is this heap.
+        unsafe { free(cx, a as *mut u8) };
+        let b = make(&h, 40);
+        assert_eq!(b, a);
+        // SAFETY: the last quantum of a 48-byte block.
+        let slack = unsafe { std::slice::from_raw_parts((b + 32) as *const u8, 16) };
+        assert!(slack.iter().all(|x| *x == 0));
+        assert_eq!(h.containing(b), Some((b, 48)));
+        let c = make(&h, 16);
+        assert_eq!(c, b + 48);
+    }
+
+    #[test]
+    fn a_free_with_no_open_region_changes_nothing() {
+        let h = heap();
+        let cx = &h as *const Heap as *mut c_void;
+        let a = make(&h, 32);
+        collect(&h);
+        // The collection closed the region; `a` died with it.
+        // SAFETY: the context is this heap.
+        unsafe { free(cx, a as *mut u8) };
+        let b = make(&h, 32);
+        let c = make(&h, 32);
+        assert_eq!(c, b + 32);
+        assert_eq!(h.containing(b), Some((b, 32)));
     }
 
     #[test]
