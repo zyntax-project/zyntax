@@ -16,18 +16,17 @@
 //! an allocation resolves to its start. A sweep frees blocks with no
 //! marked line and hands runs of unmarked lines back as bump regions.
 //!
-//! Collections run on the thread that claimed the heap, from an
-//! allocation, and only while no other thread has allocated: another
-//! thread's stack is never read.
+//! Any thread that allocates can collect. It stops the others at their
+//! next slow-path allocation, inside a [`blocking`] region or at a
+//! [`safepoint`], each of which publishes its own stack windows first,
+//! and it gives up after a short wait if one does not answer. A thread
+//! that runs program code calls [`attach`] before it takes a pointer,
+//! and a pointer kept where no collection reads is held with
+//! `host_heap::hold`. Plugins reach all of these through `zrtl::heap`.
 //!
-//! With `ZYNTAX_IMMIX_THREADS=1` any thread that allocates can collect.
-//! It stops the others at their next slow-path allocation, inside a
-//! [`blocking`] region or at a [`safepoint`], each of which publishes
-//! its own stack windows first, and it gives up after a short wait if
-//! one does not answer. A thread that runs program code calls [`attach`]
-//! before it takes a pointer, and a pointer kept where no collection
-//! reads is held with `host_heap::hold`. Plugins reach all of these
-//! through `zrtl::heap`. Off by default.
+//! `ZYNTAX_IMMIX_THREADS=0` limits collection to the thread that claimed
+//! the heap, and only while no other thread has allocated: another
+//! thread's stack is never read.
 
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
@@ -409,10 +408,15 @@ fn reserve(bytes: usize) -> *mut u8 {
     }
 }
 
+/// Several threads may collect unless the setting is `0`.
+fn threads_enabled(setting: Option<&std::ffi::OsStr>) -> bool {
+    setting.is_none_or(|v| v != "0")
+}
+
 impl Heap {
     pub fn new(heap_bytes: usize) -> Option<Heap> {
         let floor = env_usize("ZYNTAX_IMMIX_FLOOR_KB").unwrap_or(DEFAULT_FLOOR_KB) << 10;
-        let threads = std::env::var_os("ZYNTAX_IMMIX_THREADS").is_some_and(|v| v == "1");
+        let threads = threads_enabled(std::env::var_os("ZYNTAX_IMMIX_THREADS").as_deref());
         Heap::with(heap_bytes, floor, threads)
     }
 
@@ -2248,6 +2252,99 @@ mod tests {
         assert_eq!(registered(h), 0, "an exited thread stayed registered");
         // A thread descheduled for the stop's wait costs one cancelled
         // collection, so only progress is asserted.
+        assert!(h.collections.load(Relaxed) > 10);
+    }
+
+    #[test]
+    fn several_threads_collect_unless_the_setting_is_zero() {
+        use std::ffi::OsStr;
+        assert!(threads_enabled(None));
+        assert!(threads_enabled(Some(OsStr::new("1"))));
+        assert!(threads_enabled(Some(OsStr::new(""))));
+        assert!(!threads_enabled(Some(OsStr::new("0"))));
+    }
+
+    /// A heap that collects at every refill, as ZYNTAX_IMMIX_STRESS does.
+    fn stressed() -> &'static Heap {
+        watchdog();
+        let mut h = Heap::with(256 << 20, 0, true).expect("a reservation");
+        h.stress = true;
+        h.threshold = AtomicUsize::new(0);
+        Box::leak(Box::new(h))
+    }
+
+    #[test]
+    fn eight_growing_lists_survive_a_collection_at_every_refill() {
+        let h = stressed();
+        let workers: Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let mut head = 0usize;
+                    let mut len = 0usize;
+                    for round in 0..300 {
+                        for _ in 0..10 {
+                            let node = make(h, 32);
+                            // SAFETY: the node is 32 bytes.
+                            unsafe {
+                                *(node as *mut usize) = head;
+                                *(node as *mut usize).add(1) = MAGIC + len;
+                            }
+                            head = node;
+                            len += 1;
+                        }
+                        for _ in 0..40 {
+                            fill(make(h, 200), 200);
+                        }
+                        if round % 25 == 0 {
+                            assert_eq!(walk(std::hint::black_box(head)), len, "thread {t}");
+                        }
+                    }
+                    assert_eq!(walk(std::hint::black_box(head)), len, "thread {t}");
+                    assert_eq!(held_nodes(h, head), len, "thread {t}");
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(h.collections.load(Relaxed) > 100, "too few collections");
+        let live = h.live.load(Relaxed);
+        assert!(live < 8 << 20, "{live} bytes stayed live");
+    }
+
+    #[test]
+    fn ten_thousand_threads_start_allocate_and_exit_during_collections() {
+        let h = threaded(64);
+        let done = Arc::new(AtomicBool::new(false));
+        let collector = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Relaxed) {
+                    collect_all(h);
+                    fill(make(h, 300), 300);
+                }
+                h.leave_thread();
+            })
+        };
+        for _ in 0..100 {
+            let wave: Vec<_> = (0..100)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        let head = build(h, 20);
+                        for _ in 0..100 {
+                            fill(make(h, 100), 100);
+                        }
+                        assert_eq!(walk(std::hint::black_box(head)), 20);
+                    })
+                })
+                .collect();
+            for w in wave {
+                w.join().unwrap();
+            }
+        }
+        done.store(true, Relaxed);
+        collector.join().unwrap();
+        assert_eq!(registered(h), 0, "an exited thread stayed registered");
         assert!(h.collections.load(Relaxed) > 10);
     }
 }
