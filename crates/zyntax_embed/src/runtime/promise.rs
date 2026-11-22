@@ -440,7 +440,7 @@ impl ZyntaxPromise {
             match self.poll() {
                 PromiseState::Pending => {
                     // Yield to allow other work
-                    std::thread::yield_now();
+                    wait_yield();
                 }
                 PromiseState::Ready(value) => {
                     return T::from_zyntax(value).map_err(RuntimeError::from);
@@ -705,6 +705,13 @@ impl ZyntaxPromise {
     }
 }
 
+/// One turn of a wait that polls: stop for a collection that waits for
+/// this thread, then yield.
+fn wait_yield() {
+    zyntax_compiler::immix_heap::safepoint();
+    std::thread::yield_now();
+}
+
 impl Clone for ZyntaxPromise {
     fn clone(&self) -> Self {
         Self {
@@ -793,7 +800,7 @@ pub(crate) fn drive_until(
                     if td > dl {
                         let now = web_time::Instant::now();
                         if dl > now {
-                            std::thread::sleep(dl - now);
+                            zyntax_compiler::immix_heap::blocking(|| std::thread::sleep(dl - now));
                         }
                         return false;
                     }
@@ -820,7 +827,7 @@ pub(crate) fn drive_until(
                         poll_task(i, p);
                     }
                 }
-                std::thread::yield_now();
+                wait_yield();
             }
         }
     }
@@ -1179,7 +1186,7 @@ impl PromiseAll {
                     )));
                 }
                 match self.poll() {
-                    PromiseAllState::Pending => std::thread::yield_now(),
+                    PromiseAllState::Pending => wait_yield(),
                     PromiseAllState::AllReady(values) => return Ok(values),
                     PromiseAllState::Failed(err) => return Err(RuntimeError::Promise(err)),
                 }
@@ -1338,7 +1345,7 @@ impl PromiseRace {
             }
             match self.poll() {
                 PromiseRaceState::Pending => {
-                    std::thread::yield_now();
+                    wait_yield();
                 }
                 PromiseRaceState::Winner(index, value) => {
                     return Ok((index, value));
@@ -1453,7 +1460,7 @@ impl PromiseAllSettled {
             if let Some(results) = self.poll() {
                 return results;
             }
-            std::thread::yield_now();
+            wait_yield();
         }
     }
 
@@ -1473,7 +1480,7 @@ impl PromiseAllSettled {
             if let Some(results) = self.poll() {
                 return Ok(results);
             }
-            std::thread::yield_now();
+            wait_yield();
         }
     }
 

@@ -462,6 +462,27 @@ fn slot_bytes(class: usize) -> usize {
     (class + 1) * STEP
 }
 
+/// Run `call(data)` as a blocking region of the program's heap: a
+/// collection on another thread does not wait for this one until `call`
+/// returns. `call` touches no heap object.
+///
+/// # Safety
+/// `call` must be callable with `data`.
+pub unsafe extern "C" fn zyntax_blocking(
+    call: unsafe extern "C" fn(*mut std::ffi::c_void),
+    data: *mut std::ffi::c_void,
+) {
+    crate::immix_heap::blocking(|| unsafe { call(data) })
+}
+
+/// Stop here while a collection on another thread waits for this one.
+///
+/// # Safety
+/// Always safe to call from a thread the heap may scan.
+pub unsafe extern "C" fn zyntax_safepoint() {
+    crate::immix_heap::safepoint()
+}
+
 /// Allocate `size` bytes. Never returns null for a request libc could
 /// have served.
 ///

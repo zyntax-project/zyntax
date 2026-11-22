@@ -1185,6 +1185,21 @@ impl ZrtlPlugin {
                     crate::pool_alloc::zyntax_free,
                 );
             }
+            // And the blocking region and safepoint of the collector, so
+            // a wait in the plugin does not hold up a collection.
+            type SetBlocking = unsafe extern "C" fn(
+                unsafe extern "C" fn(
+                    unsafe extern "C" fn(*mut std::ffi::c_void),
+                    *mut std::ffi::c_void,
+                ),
+                unsafe extern "C" fn(),
+            );
+            if let Ok(set) = library.get::<SetBlocking>(b"_zrtl_set_blocking\0") {
+                set(
+                    crate::pool_alloc::zyntax_blocking,
+                    crate::pool_alloc::zyntax_safepoint,
+                );
+            }
             // And hands out the host's immortal strings, which the
             // host's release recognises, rather than its own copy's.
             type SetImmortals = unsafe extern "C" fn(*const ::zrtl::string::ImmortalTable);
@@ -2534,7 +2549,7 @@ impl BandPool {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 let _heap = crate::host_heap::ThreadGuard::enter();
-                while let Ok(job) = recv.recv() {
+                while let Ok(job) = crate::immix_heap::blocking(|| recv.recv()) {
                     run_bands(&job);
                     // The last thread out wakes whoever is waiting.
                     if job.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -2631,10 +2646,12 @@ impl BandPool {
         // watch for it would take one away from whoever is still
         // working.
         let (lock, cv) = &*self.done;
-        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while job.remaining.load(Ordering::Acquire) > 0 {
-            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
+        crate::immix_heap::blocking(|| {
+            let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while job.remaining.load(Ordering::Acquire) > 0 {
+                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+        });
     }
 }
 

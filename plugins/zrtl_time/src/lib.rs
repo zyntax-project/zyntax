@@ -94,25 +94,25 @@ pub extern "C" fn time_monotonic_nanos() -> u64 {
 /// Sleep for N seconds
 #[no_mangle]
 pub extern "C" fn time_sleep_secs(secs: u64) {
-    std::thread::sleep(Duration::from_secs(secs));
+    zrtl::heap::blocking(|| std::thread::sleep(Duration::from_secs(secs)));
 }
 
 /// Sleep for N milliseconds
 #[no_mangle]
 pub extern "C" fn time_sleep_millis(millis: u64) {
-    std::thread::sleep(Duration::from_millis(millis));
+    zrtl::heap::blocking(|| std::thread::sleep(Duration::from_millis(millis)));
 }
 
 /// Sleep for N microseconds
 #[no_mangle]
 pub extern "C" fn time_sleep_micros(micros: u64) {
-    std::thread::sleep(Duration::from_micros(micros));
+    zrtl::heap::blocking(|| std::thread::sleep(Duration::from_micros(micros)));
 }
 
 /// Sleep for N nanoseconds
 #[no_mangle]
 pub extern "C" fn time_sleep_nanos(nanos: u64) {
-    std::thread::sleep(Duration::from_nanos(nanos));
+    zrtl::heap::blocking(|| std::thread::sleep(Duration::from_nanos(nanos)));
 }
 
 // ============================================================================

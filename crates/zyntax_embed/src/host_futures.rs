@@ -342,7 +342,7 @@ pub fn drive_next_timer() -> Option<ResolveOutcome> {
     let (deadline, handle) = entry;
     let now = web_time::Instant::now();
     if deadline > now {
-        std::thread::sleep(deadline - now);
+        zyntax_compiler::immix_heap::blocking(|| std::thread::sleep(deadline - now));
     }
     Some(resolve_future(handle, 0))
 }
@@ -372,7 +372,7 @@ pub fn drive_next_timer_with_task() -> Option<(i64, ResolveOutcome)> {
     set_current_task_id(task_id);
     let now = web_time::Instant::now();
     if deadline > now {
-        std::thread::sleep(deadline - now);
+        zyntax_compiler::immix_heap::blocking(|| std::thread::sleep(deadline - now));
     }
     // Bracket the SM drive with the task's handler-stack segment so a
     // `with`-block it opened across the suspend is re-pushed for this step
@@ -433,7 +433,7 @@ pub fn drive_own_timer(task_id: i64) -> Option<ResolveOutcome> {
     let (deadline, handle) = entry;
     let now = web_time::Instant::now();
     if deadline > now {
-        std::thread::sleep(deadline - now);
+        zyntax_compiler::immix_heap::blocking(|| std::thread::sleep(deadline - now));
     }
     Some(resolve_future(handle, 0))
 }

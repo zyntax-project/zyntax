@@ -44,10 +44,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::sync::mpsc::{self, Sender, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
+use zrtl::heap::{blocking, safepoint};
 use zrtl::{zrtl_plugin, ZrtlClosure, DynamicBox};
 
 // ============================================================================
@@ -74,9 +75,18 @@ fn next_handle() -> u64 {
     HANDLE_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Lock `m`. A wait for it counts as blocking, so a collection on
+/// another thread does not wait for this one.
+fn lock_wait<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
+    if let Ok(guard) = m.try_lock() {
+        return guard;
+    }
+    blocking(|| m.lock().unwrap())
+}
+
 macro_rules! get_map {
     ($static:ident, $type:ty) => {{
-        let mut guard = $static.lock().unwrap();
+        let mut guard = lock_wait(&$static);
         if guard.is_none() {
             *guard = Some(HashMap::new());
         }
@@ -304,12 +314,7 @@ pub extern "C" fn thread_join(handle: u64) -> i64 {
     };
 
     match join_handle {
-        Some(jh) => {
-            match jh.join() {
-                Ok(result) => result,
-                Err(_) => i64::MIN,
-            }
-        }
+        Some(jh) => blocking(|| jh.join()).unwrap_or(i64::MIN),
         None => i64::MIN,
     }
 }
@@ -331,13 +336,14 @@ pub extern "C" fn thread_current_id() -> u64 {
 /// Yield execution to other threads
 #[no_mangle]
 pub extern "C" fn thread_yield_now() {
+    safepoint();
     thread::yield_now();
 }
 
 /// Park the current thread until unparked
 #[no_mangle]
 pub extern "C" fn thread_park() {
-    thread::park();
+    blocking(thread::park);
 }
 
 /// Unpark a thread by handle
@@ -386,6 +392,7 @@ pub extern "C" fn atomic_new(initial: i64) -> u64 {
 /// Load value from atomic
 #[no_mangle]
 pub extern "C" fn atomic_load(handle: u64) -> i64 {
+    safepoint();
     let atomics = get_map!(ATOMICS, AtomicMap);
     if let Some(ref m) = *atomics {
         if let Some(atomic) = m.get(&handle) {
@@ -448,6 +455,7 @@ pub extern "C" fn atomic_swap(handle: u64, value: i64) -> i64 {
 /// Otherwise returns 0 and leaves value unchanged.
 #[no_mangle]
 pub extern "C" fn atomic_compare_exchange(handle: u64, expected: i64, new_value: i64) -> i32 {
+    safepoint();
     let atomics = get_map!(ATOMICS, AtomicMap);
     if let Some(ref m) = *atomics {
         if let Some(atomic) = m.get(&handle) {
@@ -514,14 +522,18 @@ pub extern "C" fn mutex_lock(handle: u64) -> i32 {
         Some(m) => {
             // This is a simplified implementation - in practice you'd want
             // to properly manage the guard lifetime
-            match m.lock() {
-                Ok(_guard) => {
+            let acquired = match m.try_lock() {
+                Err(TryLockError::WouldBlock) => blocking(|| m.lock()).ok(),
+                other => other.ok(),
+            };
+            match acquired {
+                Some(_guard) => {
                     // Guard is dropped here, but we've signaled lock acquisition
                     // A real implementation would need to store the guard
                     std::mem::forget(_guard);
                     0
                 }
-                Err(_) => -1,
+                None => -1,
             }
         }
         None => -1,
@@ -703,7 +715,7 @@ pub extern "C" fn channel_recv(receiver_handle: u64) -> i64 {
     let receivers = get_map!(RECEIVERS, ReceiverMap);
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
-            match receiver.recv() {
+            match blocking(|| receiver.recv()) {
                 Ok(value) => return value,
                 Err(_) => return i64::MIN,  // Sender disconnected
             }
@@ -769,7 +781,7 @@ pub extern "C" fn channel_recv_timeout(receiver_handle: u64, timeout_ms: u64) ->
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             let timeout = Duration::from_millis(timeout_ms);
-            match receiver.recv_timeout(timeout) {
+            match blocking(|| receiver.recv_timeout(timeout)) {
                 Ok(value) => return value,
                 Err(_) => return i64::MIN,
             }
@@ -797,7 +809,7 @@ pub extern "C" fn channel_recv_timeout_status(receiver_handle: u64, timeout_ms: 
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             let timeout = Duration::from_millis(timeout_ms);
-            match receiver.recv_timeout(timeout) {
+            match blocking(|| receiver.recv_timeout(timeout)) {
                 Ok(value) => return RecvTimeoutResult { value, status: 0 },
                 Err(RecvTimeoutError::Timeout) => return RecvTimeoutResult { value: 0, status: 1 },
                 Err(RecvTimeoutError::Disconnected) => return RecvTimeoutResult { value: 0, status: -1 },
@@ -940,8 +952,68 @@ zrtl_plugin! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
     use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::AtomicUsize;
     use zrtl::zrtl_closure_from_fn;
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_run(call: unsafe extern "C" fn(*mut c_void), data: *mut c_void) {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        unsafe { call(data) };
+    }
+
+    unsafe extern "C" fn count_poll() {
+        POLLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn seven(_: i64) -> i64 {
+        7
+    }
+
+    extern "C" fn park_then_seven(_: i64) -> i64 {
+        thread_park();
+        7
+    }
+
+    #[test]
+    fn a_wait_runs_in_the_hosts_blocking_region() {
+        zrtl::heap::set_blocking(count_run, count_poll);
+
+        let before = RUNS.load(Ordering::SeqCst);
+        assert_eq!(thread_join(thread_spawn(seven, 0)), 7);
+        assert!(RUNS.load(Ordering::SeqCst) > before, "join did not block");
+
+        let pair = channel_new();
+        let before = RUNS.load(Ordering::SeqCst);
+        assert_eq!(channel_send(pair.sender, 41), 0);
+        assert_eq!(channel_recv(pair.receiver), 41);
+        assert!(RUNS.load(Ordering::SeqCst) > before, "recv did not block");
+
+        let before = RUNS.load(Ordering::SeqCst);
+        let late = channel_recv_timeout_status(pair.receiver, 1);
+        assert_eq!(late.status, 1);
+        assert!(RUNS.load(Ordering::SeqCst) > before, "recv_timeout did not block");
+
+        let before = RUNS.load(Ordering::SeqCst);
+        let waiter = thread_spawn(park_then_seven, 0);
+        assert_eq!(thread_unpark(waiter), 0);
+        assert_eq!(thread_join(waiter), 7);
+        assert!(RUNS.load(Ordering::SeqCst) > before, "park did not block");
+    }
+
+    #[test]
+    fn a_spin_on_an_atomic_polls_the_safepoint() {
+        zrtl::heap::set_blocking(count_run, count_poll);
+        let handle = atomic_new(1);
+        let before = POLLS.load(Ordering::SeqCst);
+        atomic_load(handle);
+        atomic_compare_exchange(handle, 1, 2);
+        thread_yield_now();
+        assert!(POLLS.load(Ordering::SeqCst) >= before + 3);
+    }
 
     #[test]
     fn test_atomic_operations() {

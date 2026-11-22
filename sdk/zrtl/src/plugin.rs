@@ -772,6 +772,18 @@ macro_rules! zrtl_plugin {
             $crate::heap::set_allocator(alloc, free);
         }
 
+        /// The loader hands the host's blocking region and safepoint to
+        /// this copy of the SDK, so a wait in the plugin does not hold up
+        /// the host's collector.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _zrtl_set_blocking(
+            run: $crate::heap::BlockingFn,
+            poll: $crate::heap::PollFn,
+        ) {
+            $crate::heap::set_blocking(run, poll);
+        }
+
         /// The loader hands the host's immortal strings to this copy of
         /// the SDK, so the process has one table of them.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]

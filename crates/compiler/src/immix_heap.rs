@@ -21,9 +21,10 @@
 //! thread's stack is never read.
 //!
 //! With `ZYNTAX_IMMIX_THREADS=1` any thread that allocates can collect.
-//! It stops the others at their next slow-path allocation or inside a
-//! [`blocking`] region, each of which publishes its own stack windows
-//! first, and it gives up after a short wait if one does not answer.
+//! It stops the others at their next slow-path allocation, inside a
+//! [`blocking`] region or at a [`safepoint`], each of which publishes
+//! its own stack windows first, and it gives up after a short wait if
+//! one does not answer. Plugins reach the last two through `zrtl::heap`.
 //! Off by default: a pointer held only where no collection reads, such
 //! as a spawned thread's start-up arguments, is not kept alive.
 
@@ -304,6 +305,11 @@ pub fn set_automatic(on: bool) {
     AUTOMATIC.store(on, Relaxed);
 }
 
+/// Stops cancelled so far because a thread did not answer in time.
+pub fn cancelled_stops() -> u64 {
+    HEAP.get().map_or(0, |h| lock(&h.world.inner).cancelled)
+}
+
 pub fn collecting_here() -> bool {
     active() && OWNER.with(|o| o.get())
 }
@@ -331,6 +337,16 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     match HEAP.get() {
         Some(h) if h.threads => h.blocking(f),
         _ => f(),
+    }
+}
+
+/// Stop here while a collection waits for this thread. Called by a loop
+/// that neither allocates nor blocks, so that it does not hold one up.
+/// One relaxed load when no collection is waiting.
+#[inline]
+pub fn safepoint() {
+    if let Some(h) = HEAP.get() {
+        h.safepoint();
     }
 }
 
@@ -866,6 +882,13 @@ impl Heap {
             t.state = state;
             t.windows = windows;
             t.held = held;
+        }
+    }
+
+    #[inline]
+    fn safepoint(&self) {
+        if self.threads && self.world.stop.load(Relaxed) {
+            self.park_here();
         }
     }
 
@@ -2099,6 +2122,40 @@ mod tests {
         assert_eq!(cancelled(h), 0, "a native thread was waited for");
         tx.send(()).unwrap();
         worker.join().unwrap();
+        collect_all(h);
+    }
+
+    #[test]
+    fn a_loop_that_polls_the_safepoint_does_not_hold_up_a_collection() {
+        let h = threaded(1 << 20);
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinner = {
+            let (ready, stop) = (ready.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let head = build(h, 100);
+                ready.store(true, Relaxed);
+                while !stop.load(Relaxed) {
+                    h.safepoint();
+                    std::hint::spin_loop();
+                }
+                assert_eq!(held_nodes(h, std::hint::black_box(head)), 100);
+                assert_eq!(walk(std::hint::black_box(head)), 100);
+                h.leave_thread();
+            })
+        };
+        while !ready.load(Relaxed) {
+            std::thread::yield_now();
+        }
+        for _ in 0..10 {
+            collect_all(h);
+            for _ in 0..200 {
+                fill(make(h, 500), 500);
+            }
+        }
+        assert_eq!(cancelled(h), 0, "a polling thread was waited for");
+        stop.store(true, Relaxed);
+        spinner.join().unwrap();
         collect_all(h);
     }
 

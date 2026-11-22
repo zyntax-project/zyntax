@@ -184,6 +184,13 @@ impl PollResult {
 // Promise Types (C ABI Compatible)
 // ============================================================================
 
+/// One turn of a wait that polls: stop for a collection that waits for
+/// this thread, then pause.
+fn spin() {
+    crate::heap::safepoint();
+    std::hint::spin_loop();
+}
+
 /// Promise layout for Zyntax async ABI
 ///
 /// This struct is passed by pointer to/from async functions.
@@ -231,7 +238,7 @@ impl ZrtlPromise {
             match result {
                 PollResult::Pending => {
                     // Could add a yield here for better CPU usage
-                    std::hint::spin_loop();
+                    spin();
                 }
                 PollResult::Ready(value) => return Ok(value),
                 PollResult::Failed(code) => return Err(code),
@@ -249,7 +256,7 @@ impl ZrtlPromise {
                     if start.elapsed() > timeout {
                         return Err(PromiseError::Timeout);
                     }
-                    std::hint::spin_loop();
+                    spin();
                 }
                 PollResult::Ready(value) => return Ok(value),
                 PollResult::Failed(code) => return Err(PromiseError::Failed(code)),
@@ -522,7 +529,7 @@ impl PromiseAll {
         loop {
             match self.poll() {
                 PollResult::Pending => {
-                    std::hint::spin_loop();
+                    spin();
                 }
                 PollResult::Ready(_) => {
                     return Ok(self.results.iter().filter_map(|r| *r).collect());
@@ -543,7 +550,7 @@ impl PromiseAll {
                     if start.elapsed() > timeout {
                         return Err(PromiseError::Timeout);
                     }
-                    std::hint::spin_loop();
+                    spin();
                 }
                 PollResult::Ready(_) => {
                     return Ok(self.results.iter().filter_map(|r| *r).collect());
@@ -608,7 +615,7 @@ impl PromiseRace {
         loop {
             match self.poll() {
                 PollResult::Pending => {
-                    std::hint::spin_loop();
+                    spin();
                 }
                 PollResult::Ready(_) => {
                     return Ok(self.winner.unwrap());
@@ -684,7 +691,7 @@ impl PromiseAllSettled {
     /// Block until all promises settle
     pub fn block_on(&mut self) -> Vec<SettledResult> {
         while !self.poll() {
-            std::hint::spin_loop();
+            spin();
         }
         self.results.iter().filter_map(|r| r.clone()).collect()
     }
