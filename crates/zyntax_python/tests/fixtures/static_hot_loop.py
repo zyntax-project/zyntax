@@ -1,5 +1,5 @@
 # A loop whose bound is a constant, a million times round: the function
-# is compiled before its first call, which runs its native code.
+# starts in the interpreter and its running loop transfers to native code.
 class Bag:
     def __init__(self, payload):
         self.payload = payload

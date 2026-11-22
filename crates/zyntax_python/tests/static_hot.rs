@@ -1,13 +1,16 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// `zypy` on the fixture with the compile workers off, so the order of
+/// what happens does not depend on how fast code is made.
 fn run(disable: bool) -> Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/static_hot_loop.py");
     let mut command = Command::new(env!("CARGO_BIN_EXE_zypy"));
     command
         .arg("run")
         .arg(script)
-        .env("ZYPY_LLVM", "1")
+        .env_remove("ZYPY_LLVM")
+        .env("ZYNTAX_DISABLE_WARM_UP", "1")
         .env("ZYNTAX_OSR_TRACE", "1")
         .env("ZYNTAX_TRACE_INTERP", "1");
     if disable {
@@ -16,32 +19,27 @@ fn run(disable: bool) -> Output {
     command.output().expect("zypy starts")
 }
 
-/// A function whose loop runs a constant number of times is compiled
-/// before its first call: the interpreter hands that call to native
-/// code, and no frame of it leaves the interpreter through a resume
-/// point.
+/// A function whose loop runs a constant number of times starts in the
+/// interpreter, as every function does: its first call does not wait
+/// for code. The running loop asks for native code and the frame
+/// transfers to it.
 #[test]
-fn a_constant_bound_loop_is_never_interpreted() {
+fn a_constant_bound_loop_starts_interpreted_and_transfers_its_running_frame() {
     let output = run(false);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stdout.trim(), "1500000", "{stderr}");
-    assert!(!stderr.contains("outlined resume point"), "{stderr}");
-    assert!(!stderr.contains("[interp] transfer site="), "{stderr}");
-    assert!(!stderr.contains("Interpreted {"), "{stderr}");
-    assert_eq!(stderr.matches("(main) at tier 0").count(), 1, "{stderr}");
-    // The optimizing tier compiles the function once, not a region of it.
-    assert!(stderr.matches("(main) at tier 1").count() <= 1, "{stderr}");
-    assert!(!stderr.contains("main$resume"), "{stderr}");
-    let call = stderr.find("[interp] call main(").expect("main is called");
-    // The next thing the interpreter does is call the native code.
-    let after = stderr[call..]
-        .lines()
-        .skip(1)
-        .find(|l| l.starts_with("[interp] "))
-        .unwrap_or_default();
-    assert!(after.starts_with("[interp] native"), "{stderr}");
+    let entered = stderr
+        .find("[interp] call main(")
+        .expect("main is interpreted");
+    let asked = stderr
+        .find("[interp] asks at site=")
+        .expect("the running loop asks for code");
+    let transferred = stderr
+        .find("[interp] transfer site=")
+        .expect("the frame transfers to native code");
+    assert!(entered < asked && asked < transferred, "{stderr}");
 }
 
 /// `ZYNTAX_DISABLE_STATIC_HOT=1` leaves the function to the interpreter
