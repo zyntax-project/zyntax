@@ -15,6 +15,11 @@
 //! installs [`set_blocking`]. A plugin wraps each wait in [`blocking`]
 //! and polls [`safepoint`] in each loop that waits without blocking, so
 //! that a collection does not wait for a thread that cannot answer.
+//!
+//! The same host installs [`set_roots`]. A plugin [`attach`]es each
+//! thread it starts before the thread takes a heap pointer, and
+//! [`hold`]s a pointer it keeps where no collector reads, such as a
+//! queue or a table of its own, until it gives the pointer back.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,11 +35,18 @@ pub type BlockingFn =
     unsafe extern "C" fn(call: unsafe extern "C" fn(*mut c_void), data: *mut c_void);
 /// Stop here while a collection waits for the calling thread.
 pub type PollFn = unsafe extern "C" fn();
+/// Count the calling thread among those a collection reads.
+pub type AttachFn = unsafe extern "C" fn();
+/// Keep, or stop keeping, the heap block that `address` points into.
+pub type HoldFn = unsafe extern "C" fn(address: *const u8);
 
 static ALLOC: AtomicUsize = AtomicUsize::new(0);
 static FREE: AtomicUsize = AtomicUsize::new(0);
 static BLOCKING: AtomicUsize = AtomicUsize::new(0);
 static POLL: AtomicUsize = AtomicUsize::new(0);
+static ATTACH: AtomicUsize = AtomicUsize::new(0);
+static HOLD: AtomicUsize = AtomicUsize::new(0);
+static UNHOLD: AtomicUsize = AtomicUsize::new(0);
 
 /// Route every string and box allocation through `alloc` and `free`.
 pub fn set_allocator(alloc: AllocFn, free: FreeFn) {
@@ -133,6 +145,70 @@ pub fn safepoint() {
     }
 }
 
+/// Install the host's thread attachment and holds.
+pub fn set_roots(attach: AttachFn, hold: HoldFn, unhold: HoldFn) {
+    ATTACH.store(attach as usize, Ordering::SeqCst);
+    HOLD.store(hold as usize, Ordering::SeqCst);
+    UNHOLD.store(unhold as usize, Ordering::SeqCst);
+}
+
+/// Count the calling thread among those a collection reads, from now on.
+/// A thread this plugin starts calls it first thing, before it takes a
+/// heap pointer another thread made: until then a collection does not
+/// see what the thread holds. Does nothing without a host.
+pub fn attach() {
+    let attach = ATTACH.load(Ordering::Relaxed);
+    if attach != 0 {
+        // SAFETY: `attach` came from `set_roots`.
+        let attach: AttachFn = unsafe { std::mem::transmute(attach) };
+        unsafe { attach() };
+    }
+}
+
+/// Keep the block `address` points into alive until [`unhold`], for a
+/// pointer that sits where no collector reads: a queue, a table, a
+/// thread's start-up arguments. Each hold needs its own unhold. A null
+/// address is ignored, and so is everything without a host.
+pub fn hold(address: *const u8) {
+    let hold = HOLD.load(Ordering::Relaxed);
+    if hold != 0 {
+        // SAFETY: `hold` came from `set_roots`.
+        let hold: HoldFn = unsafe { std::mem::transmute(hold) };
+        unsafe { hold(address) };
+    }
+}
+
+/// Give up one [`hold`] of `address`.
+pub fn unhold(address: *const u8) {
+    let unhold = UNHOLD.load(Ordering::Relaxed);
+    if unhold != 0 {
+        // SAFETY: `unhold` came from `set_roots`.
+        let unhold: HoldFn = unsafe { std::mem::transmute(unhold) };
+        unsafe { unhold(address) };
+    }
+}
+
+/// One [`hold`] of a word that may be a heap pointer, given up when the
+/// guard drops.
+pub struct Hold(*const u8);
+
+// SAFETY: a hold names an address and owns no memory behind it.
+unsafe impl Send for Hold {}
+
+impl Hold {
+    pub fn new(word: i64) -> Hold {
+        let address = word as usize as *const u8;
+        hold(address);
+        Hold(address)
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        unhold(self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +216,21 @@ mod tests {
 
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static ATTACHES: AtomicUsize = AtomicUsize::new(0);
+    static HOLDS: AtomicUsize = AtomicUsize::new(0);
+    static UNHOLDS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn attached() {
+        ATTACHES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn held(_address: *const u8) {
+        HOLDS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn unheld(_address: *const u8) {
+        UNHOLDS.fetch_add(1, Ordering::SeqCst);
+    }
 
     unsafe extern "C" fn run(call: unsafe extern "C" fn(*mut c_void), data: *mut c_void) {
         RUNS.fetch_add(1, Ordering::SeqCst);
@@ -162,6 +253,24 @@ mod tests {
         safepoint();
         assert!(POLLS.load(Ordering::SeqCst) > polls);
         assert_eq!(held, "kept");
+    }
+
+    #[test]
+    fn attach_and_holds_reach_the_host() {
+        set_roots(attached, held, unheld);
+        let (a, h, u) = (
+            ATTACHES.load(Ordering::SeqCst),
+            HOLDS.load(Ordering::SeqCst),
+            UNHOLDS.load(Ordering::SeqCst),
+        );
+        attach();
+        assert!(ATTACHES.load(Ordering::SeqCst) > a);
+        {
+            let _kept = Hold::new(0x1000);
+            assert!(HOLDS.load(Ordering::SeqCst) > h);
+            assert_eq!(UNHOLDS.load(Ordering::SeqCst), u);
+        }
+        assert!(UNHOLDS.load(Ordering::SeqCst) > u);
     }
 
     #[test]

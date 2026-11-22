@@ -24,9 +24,10 @@
 //! It stops the others at their next slow-path allocation, inside a
 //! [`blocking`] region or at a [`safepoint`], each of which publishes
 //! its own stack windows first, and it gives up after a short wait if
-//! one does not answer. Plugins reach the last two through `zrtl::heap`.
-//! Off by default: a pointer held only where no collection reads, such
-//! as a spawned thread's start-up arguments, is not kept alive.
+//! one does not answer. A thread that runs program code calls [`attach`]
+//! before it takes a pointer, and a pointer kept where no collection
+//! reads is held with `host_heap::hold`. Plugins reach all of these
+//! through `zrtl::heap`. Off by default.
 
 use std::alloc::Layout;
 use std::cell::{Cell, RefCell};
@@ -337,6 +338,21 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     match HEAP.get() {
         Some(h) if h.threads => h.blocking(f),
         _ => f(),
+    }
+}
+
+/// Count the calling thread among those a collection reads from now on,
+/// where it would otherwise join at its first allocation. A thread that
+/// runs program code calls it before it takes a pointer another thread
+/// made, because a thread that has not joined holds pointers no
+/// collection sees. A collection then waits for it at its next
+/// allocation, wait or safepoint. Does nothing unless the heap collects
+/// across threads.
+pub fn attach() {
+    if let Some(h) = HEAP.get()
+        && h.threads
+    {
+        h.register();
     }
 }
 

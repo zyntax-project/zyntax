@@ -784,6 +784,19 @@ macro_rules! zrtl_plugin {
             $crate::heap::set_blocking(run, poll);
         }
 
+        /// The loader hands the host's thread attachment and holds to this
+        /// copy of the SDK, so a thread the plugin starts is read by the
+        /// host's collector and a pointer it queues stays alive.
+        #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _zrtl_set_roots(
+            attach: $crate::heap::AttachFn,
+            hold: $crate::heap::HoldFn,
+            unhold: $crate::heap::HoldFn,
+        ) {
+            $crate::heap::set_roots(attach, hold, unhold);
+        }
+
         /// The loader hands the host's immortal strings to this copy of
         /// the SDK, so the process has one table of them.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "linked-into-host")))]

@@ -1200,6 +1200,20 @@ impl ZrtlPlugin {
                     crate::pool_alloc::zyntax_safepoint,
                 );
             }
+            // And the thread attachment and holds, so a thread the plugin
+            // starts is read and a pointer it queues stays alive.
+            type SetRoots = unsafe extern "C" fn(
+                unsafe extern "C" fn(),
+                unsafe extern "C" fn(*const u8),
+                unsafe extern "C" fn(*const u8),
+            );
+            if let Ok(set) = library.get::<SetRoots>(b"_zrtl_set_roots\0") {
+                set(
+                    crate::pool_alloc::zyntax_attach,
+                    crate::pool_alloc::zyntax_hold,
+                    crate::pool_alloc::zyntax_unhold,
+                );
+            }
             // And hands out the host's immortal strings, which the
             // host's release recognises, rather than its own copy's.
             type SetImmortals = unsafe extern "C" fn(*const ::zrtl::string::ImmortalTable);
@@ -2549,6 +2563,9 @@ impl BandPool {
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 let _heap = crate::host_heap::ThreadGuard::enter();
+                // Bands run program code, so a collection reads this
+                // thread before its first job, not at its first allocation.
+                crate::immix_heap::attach();
                 while let Ok(job) = crate::immix_heap::blocking(|| recv.recv()) {
                     run_bands(&job);
                     // The last thread out wakes whoever is waiting.

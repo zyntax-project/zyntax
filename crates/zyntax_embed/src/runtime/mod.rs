@@ -35,6 +35,11 @@ pub(crate) fn install_sdk_allocator() {
             zyntax_compiler::pool_alloc::zyntax_blocking,
             zyntax_compiler::pool_alloc::zyntax_safepoint,
         );
+        zrtl::heap::set_roots(
+            zyntax_compiler::pool_alloc::zyntax_attach,
+            zyntax_compiler::pool_alloc::zyntax_hold,
+            zyntax_compiler::pool_alloc::zyntax_unhold,
+        );
     });
 }
 

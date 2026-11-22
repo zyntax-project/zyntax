@@ -626,6 +626,8 @@ impl ZyntaxPromise {
                 let source_state = source.lock().unwrap().state.clone();
                 match source_state {
                     PromiseState::Ready(value) => {
+                        // The callback runs program code.
+                        zyntax_compiler::immix_heap::attach();
                         let result = f(value);
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;
@@ -684,12 +686,14 @@ impl ZyntaxPromise {
                         break;
                     }
                     PromiseState::Failed(err) => {
+                        zyntax_compiler::immix_heap::attach();
                         let result = f(err);
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;
                     }
                     PromiseState::Cancelled => {
                         // For catch, treat cancellation as an error to recover from
+                        zyntax_compiler::immix_heap::attach();
                         let result = f("Promise was cancelled".to_string());
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;

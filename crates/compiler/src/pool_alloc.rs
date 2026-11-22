@@ -483,6 +483,30 @@ pub unsafe extern "C" fn zyntax_safepoint() {
     crate::immix_heap::safepoint()
 }
 
+/// Count the calling thread among those a collection reads.
+///
+/// # Safety
+/// Always safe to call.
+pub unsafe extern "C" fn zyntax_attach() {
+    crate::immix_heap::attach()
+}
+
+/// Keep the block `address` points into alive until [`zyntax_unhold`].
+///
+/// # Safety
+/// Always safe to call; `address` need not name a block.
+pub unsafe extern "C" fn zyntax_hold(address: *const u8) {
+    crate::host_heap::hold(address)
+}
+
+/// Give up one [`zyntax_hold`] of `address`.
+///
+/// # Safety
+/// Always safe to call.
+pub unsafe extern "C" fn zyntax_unhold(address: *const u8) {
+    crate::host_heap::unhold(address)
+}
+
 /// Allocate `size` bytes. Never returns null for a request libc could
 /// have served.
 ///

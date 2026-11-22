@@ -104,6 +104,9 @@ sha2 = "0.10"
 env_logger = "0.11"
 criterion = "0.5"
 wasmprinter = "0.213"
+# The thread plugin's real code, for the test that hands pointers between
+# threads while the heap collects.
+zrtl_thread = { path = "../../plugins/zrtl_thread", features = ["linked-into-host"] }
 
 [build-dependencies]
 sha2 = "0.10"

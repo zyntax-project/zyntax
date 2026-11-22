@@ -48,7 +48,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
-use zrtl::heap::{blocking, safepoint};
+use zrtl::heap::{attach, blocking, hold, safepoint, unhold, Hold};
 use zrtl::{zrtl_plugin, DynamicBox, ZrtlClosure};
 
 // ============================================================================
@@ -84,6 +84,30 @@ fn lock_wait<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     blocking(|| m.lock().unwrap())
 }
 
+/// A word the program may have made from a heap pointer.
+fn address(word: i64) -> *const u8 {
+    word as usize as *const u8
+}
+
+/// A thread this plugin starts. It joins the collector's view before it
+/// takes anything, then gives up the hold on its start-up argument, now
+/// that the thread's own frames carry it. The result stays held until
+/// `thread_join` takes it, because the join handle keeps it where no
+/// collector reads.
+fn run_thread(arg: Hold, body: impl FnOnce() -> i64) -> i64 {
+    attach();
+    drop(arg);
+    let result = body();
+    hold(address(result));
+    result
+}
+
+/// A value that left a queue: it is the receiver's now.
+fn received(value: i64) -> i64 {
+    unhold(address(value));
+    value
+}
+
 macro_rules! get_map {
     ($static:ident, $type:ty) => {{
         let mut guard = lock_wait(&$static);
@@ -109,7 +133,8 @@ pub type ThreadFn = extern "C" fn(i64) -> i64;
 pub extern "C" fn thread_spawn(func: ThreadFn, arg: i64) -> u64 {
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || func(arg));
+    let start = Hold::new(arg);
+    let join_handle = thread::spawn(move || run_thread(start, || func(arg)));
 
     // Store thread reference for unpark
     {
@@ -147,9 +172,12 @@ pub unsafe extern "C" fn thread_spawn_closure(closure: *mut ZrtlClosure, arg: i6
     let closure = Box::from_raw(closure);
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || match closure.call(arg) {
-        r if r.is_ok() => r.value,
-        _ => i64::MIN,
+    let start = Hold::new(arg);
+    let join_handle = thread::spawn(move || {
+        run_thread(start, || match closure.call(arg) {
+            r if r.is_ok() => r.value,
+            _ => i64::MIN,
+        })
     });
 
     // Store thread reference for unpark
@@ -216,9 +244,11 @@ pub unsafe extern "C" fn thread_spawn_boxed(boxed: *mut DynamicBox) -> u64 {
 
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || match closure.call(0) {
-        r if r.is_ok() => r.value,
-        _ => i64::MIN,
+    let join_handle = thread::spawn(move || {
+        run_thread(Hold::new(0), || match closure.call(0) {
+            r if r.is_ok() => r.value,
+            _ => i64::MIN,
+        })
     });
 
     // Store thread reference for unpark
@@ -257,9 +287,12 @@ pub unsafe extern "C" fn thread_spawn_closure_cloned(closure: *const ZrtlClosure
     let closure = (*closure).clone();
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || match closure.call(arg) {
-        r if r.is_ok() => r.value,
-        _ => i64::MIN,
+    let start = Hold::new(arg);
+    let join_handle = thread::spawn(move || {
+        run_thread(start, || match closure.call(arg) {
+            r if r.is_ok() => r.value,
+            _ => i64::MIN,
+        })
     });
 
     // Store thread reference for unpark
@@ -306,7 +339,10 @@ pub extern "C" fn thread_join(handle: u64) -> i64 {
     };
 
     match join_handle {
-        Some(jh) => blocking(|| jh.join()).unwrap_or(i64::MIN),
+        Some(jh) => match blocking(|| jh.join()) {
+            Ok(result) => received(result),
+            Err(_) => i64::MIN,
+        },
         None => i64::MIN,
     }
 }
@@ -641,10 +677,15 @@ pub extern "C" fn channel_bounded(capacity: u64) -> ChannelPair {
 
     // Spawn a bridge thread that respects the bound
     let _bridge = thread::spawn(move || {
-        for msg in async_rx {
-            if tx.send(msg).is_err() {
+        while let Ok(msg) = async_rx.recv() {
+            if let Err(lost) = tx.send(msg) {
+                unhold(address(lost.0));
                 break;
             }
+        }
+        // Whatever is still queued will never be received.
+        while let Ok(msg) = async_rx.try_recv() {
+            unhold(address(msg));
         }
     });
 
@@ -676,9 +717,15 @@ pub extern "C" fn channel_send(sender_handle: u64, value: i64) -> i32 {
     let senders = get_map!(SENDERS, SenderMap);
     if let Some(ref m) = *senders {
         if let Some(sender) = m.get(&sender_handle) {
+            // The queue is memory no collector reads: the value stays held
+            // until a receive takes it.
+            hold(address(value));
             match sender.send(value) {
                 Ok(()) => return 0,
-                Err(_) => return -1, // Receiver disconnected
+                Err(_) => {
+                    unhold(address(value));
+                    return -1; // Receiver disconnected
+                }
             }
         }
     }
@@ -706,7 +753,7 @@ pub extern "C" fn channel_recv(receiver_handle: u64) -> i64 {
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             match blocking(|| receiver.recv()) {
-                Ok(value) => return value,
+                Ok(value) => return received(value),
                 Err(_) => return i64::MIN, // Sender disconnected
             }
         }
@@ -725,7 +772,7 @@ pub extern "C" fn channel_try_recv(receiver_handle: u64) -> i64 {
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             match receiver.try_recv() {
-                Ok(value) => return value,
+                Ok(value) => return received(value),
                 Err(_) => return i64::MIN,
             }
         }
@@ -752,7 +799,12 @@ pub extern "C" fn channel_try_recv_status(receiver_handle: u64) -> TryRecvResult
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             match receiver.try_recv() {
-                Ok(value) => return TryRecvResult { value, status: 0 },
+                Ok(value) => {
+                    return TryRecvResult {
+                        value: received(value),
+                        status: 0,
+                    }
+                }
                 Err(TryRecvError::Empty) => {
                     return TryRecvResult {
                         value: 0,
@@ -785,7 +837,7 @@ pub extern "C" fn channel_recv_timeout(receiver_handle: u64, timeout_ms: u64) ->
         if let Some(receiver) = m.get(&receiver_handle) {
             let timeout = Duration::from_millis(timeout_ms);
             match blocking(|| receiver.recv_timeout(timeout)) {
-                Ok(value) => return value,
+                Ok(value) => return received(value),
                 Err(_) => return i64::MIN,
             }
         }
@@ -816,7 +868,12 @@ pub extern "C" fn channel_recv_timeout_status(
         if let Some(receiver) = m.get(&receiver_handle) {
             let timeout = Duration::from_millis(timeout_ms);
             match blocking(|| receiver.recv_timeout(timeout)) {
-                Ok(value) => return RecvTimeoutResult { value, status: 0 },
+                Ok(value) => {
+                    return RecvTimeoutResult {
+                        value: received(value),
+                        status: 0,
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     return RecvTimeoutResult {
                         value: 0,
@@ -885,7 +942,12 @@ pub extern "C" fn channel_close_sender(sender_handle: u64) {
 pub extern "C" fn channel_close_receiver(receiver_handle: u64) {
     let mut receivers = get_map!(RECEIVERS, ReceiverMap);
     if let Some(ref mut m) = *receivers {
-        m.remove(&receiver_handle);
+        if let Some(receiver) = m.remove(&receiver_handle) {
+            // What is queued is dropped with the receiver: let it go.
+            while let Ok(value) = receiver.try_recv() {
+                unhold(address(value));
+            }
+        }
     }
 }
 
@@ -903,7 +965,8 @@ pub extern "C" fn channel_is_empty(receiver_handle: u64) -> i32 {
             match receiver.try_recv() {
                 Err(TryRecvError::Empty) => return 1,
                 Err(TryRecvError::Disconnected) => return -1,
-                Ok(_) => {
+                Ok(value) => {
+                    unhold(address(value));
                     // Oops, we consumed a value - this is why is_empty is racy
                     // We can't put it back easily. Return 0 (not empty).
                     // Note: This implementation is problematic, better to use try_recv_status
@@ -988,6 +1051,55 @@ mod tests {
         POLLS.fetch_add(1, Ordering::SeqCst);
     }
 
+    // A host that records what is held, so a test can see when the plugin
+    // holds a word and when it lets go.
+    static HELD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static WATCHED: AtomicI64 = AtomicI64::new(0);
+    static HELD_AT_ATTACH: AtomicUsize = AtomicUsize::new(0);
+    static ATTACHES: AtomicUsize = AtomicUsize::new(0);
+
+    fn held_count(word: i64) -> usize {
+        HELD.lock()
+            .unwrap()
+            .iter()
+            .filter(|a| **a == word as usize)
+            .count()
+    }
+
+    unsafe extern "C" fn fake_attach() {
+        ATTACHES.fetch_add(1, Ordering::SeqCst);
+        let watched = WATCHED.load(Ordering::SeqCst);
+        if watched != 0 && held_count(watched) > 0 {
+            HELD_AT_ATTACH.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn fake_hold(address: *const u8) {
+        if !address.is_null() {
+            HELD.lock().unwrap().push(address as usize);
+        }
+    }
+
+    unsafe extern "C" fn fake_unhold(address: *const u8) {
+        let mut held = HELD.lock().unwrap();
+        if let Some(i) = held.iter().rposition(|a| *a == address as usize) {
+            held.swap_remove(i);
+        }
+    }
+
+    fn fake_host() {
+        zrtl::heap::set_roots(fake_attach, fake_hold, fake_unhold);
+    }
+
+    const START_ARG: i64 = 0x7a00_0010;
+    const START_RESULT: i64 = 0x7a00_0020;
+    static ARG_HELD_IN_BODY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    extern "C" fn answers_with_a_pointer(arg: i64) -> i64 {
+        ARG_HELD_IN_BODY.store(held_count(arg), Ordering::SeqCst);
+        START_RESULT
+    }
+
     extern "C" fn seven(_: i64) -> i64 {
         7
     }
@@ -1024,6 +1136,117 @@ mod tests {
         assert_eq!(thread_unpark(waiter), 0);
         assert_eq!(thread_join(waiter), 7);
         assert!(RUNS.load(Ordering::SeqCst) > before, "park did not block");
+    }
+
+    #[test]
+    fn a_thread_holds_its_argument_until_it_runs_and_its_result_until_joined() {
+        fake_host();
+        WATCHED.store(START_ARG, Ordering::SeqCst);
+        let attached = HELD_AT_ATTACH.load(Ordering::SeqCst);
+
+        let handle = thread_spawn(answers_with_a_pointer, START_ARG);
+
+        // The result outlives the thread, in the join handle's packet.
+        let began = std::time::Instant::now();
+        while held_count(START_RESULT) == 0 {
+            assert!(began.elapsed() < Duration::from_secs(5), "no result hold");
+            thread::yield_now();
+        }
+        assert_eq!(thread_join(handle), START_RESULT);
+
+        assert!(
+            HELD_AT_ATTACH.load(Ordering::SeqCst) > attached,
+            "the argument was not held when the thread attached"
+        );
+        assert_eq!(
+            ARG_HELD_IN_BODY.load(Ordering::SeqCst),
+            0,
+            "the argument stayed held while the thread ran"
+        );
+        assert_eq!(held_count(START_ARG), 0);
+        assert_eq!(held_count(START_RESULT), 0);
+        WATCHED.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_closure_thread_holds_its_argument_and_result_the_same_way() {
+        fake_host();
+        const ARG: i64 = 0x7a00_0110;
+        const RESULT: i64 = 0x7a00_0120;
+        let closure = Box::into_raw(Box::new(zrtl::ZrtlClosure::new(|_| RESULT)));
+        let handle = unsafe { thread_spawn_closure(closure, ARG) };
+        let began = std::time::Instant::now();
+        while held_count(RESULT) == 0 {
+            assert!(began.elapsed() < Duration::from_secs(5), "no result hold");
+            thread::yield_now();
+        }
+        assert_eq!(held_count(ARG), 0);
+        assert_eq!(thread_join(handle), RESULT);
+        assert_eq!(held_count(RESULT), 0);
+    }
+
+    #[test]
+    fn a_queued_pointer_is_held_until_it_is_received() {
+        fake_host();
+        const MSG: i64 = 0x7a00_0210;
+        let pair = channel_new();
+
+        assert_eq!(channel_send_ptr(pair.sender, MSG as *const u8), 0);
+        assert_eq!(held_count(MSG), 1, "a queued pointer is not held");
+        assert_eq!(channel_recv(pair.receiver), MSG);
+        assert_eq!(held_count(MSG), 0);
+
+        channel_send(pair.sender, MSG);
+        assert_eq!(channel_try_recv(pair.receiver), MSG);
+        assert_eq!(held_count(MSG), 0);
+
+        channel_send(pair.sender, MSG);
+        assert_eq!(channel_try_recv_status(pair.receiver).value, MSG);
+        assert_eq!(held_count(MSG), 0);
+
+        channel_send(pair.sender, MSG);
+        assert_eq!(channel_recv_timeout(pair.receiver, 100), MSG);
+        assert_eq!(held_count(MSG), 0);
+
+        channel_send(pair.sender, MSG);
+        assert_eq!(channel_recv_timeout_status(pair.receiver, 100).value, MSG);
+        assert_eq!(held_count(MSG), 0);
+
+        // A receive that finds nothing holds nothing.
+        assert_eq!(channel_try_recv(pair.receiver), i64::MIN);
+        assert_eq!(held_count(MSG), 0);
+    }
+
+    #[test]
+    fn closing_a_receiver_lets_go_of_what_is_queued() {
+        fake_host();
+        const MSG: i64 = 0x7a00_0310;
+        let pair = channel_new();
+        channel_send(pair.sender, MSG);
+        channel_send(pair.sender, MSG);
+        assert_eq!(held_count(MSG), 2);
+
+        channel_close_receiver(pair.receiver);
+        assert_eq!(held_count(MSG), 0, "a closed channel kept its messages");
+
+        // A send to a closed channel fails and holds nothing.
+        assert_eq!(channel_send(pair.sender, MSG), -1);
+        assert_eq!(held_count(MSG), 0);
+    }
+
+    #[test]
+    fn a_bounded_channel_holds_a_pointer_through_its_bridge() {
+        fake_host();
+        const MSGS: [i64; 3] = [0x7a00_0410, 0x7a00_0420, 0x7a00_0430];
+        let pair = channel_bounded(1);
+        for m in MSGS {
+            assert_eq!(channel_send(pair.sender, m), 0);
+            assert_eq!(held_count(m), 1);
+        }
+        for m in MSGS {
+            assert_eq!(channel_recv(pair.receiver), m);
+            assert_eq!(held_count(m), 0);
+        }
     }
 
     #[test]
