@@ -44,12 +44,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
-use std::sync::mpsc::{self, Sender, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 use zrtl::heap::{blocking, safepoint};
-use zrtl::{zrtl_plugin, ZrtlClosure, DynamicBox};
+use zrtl::{zrtl_plugin, DynamicBox, ZrtlClosure};
 
 // ============================================================================
 // Handle Management
@@ -109,9 +109,7 @@ pub type ThreadFn = extern "C" fn(i64) -> i64;
 pub extern "C" fn thread_spawn(func: ThreadFn, arg: i64) -> u64 {
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || {
-        func(arg)
-    });
+    let join_handle = thread::spawn(move || func(arg));
 
     // Store thread reference for unpark
     {
@@ -149,11 +147,9 @@ pub unsafe extern "C" fn thread_spawn_closure(closure: *mut ZrtlClosure, arg: i6
     let closure = Box::from_raw(closure);
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || {
-        match closure.call(arg) {
-            r if r.is_ok() => r.value,
-            _ => i64::MIN,
-        }
+    let join_handle = thread::spawn(move || match closure.call(arg) {
+        r if r.is_ok() => r.value,
+        _ => i64::MIN,
     });
 
     // Store thread reference for unpark
@@ -220,11 +216,9 @@ pub unsafe extern "C" fn thread_spawn_boxed(boxed: *mut DynamicBox) -> u64 {
 
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || {
-        match closure.call(0) {
-            r if r.is_ok() => r.value,
-            _ => i64::MIN,
-        }
+    let join_handle = thread::spawn(move || match closure.call(0) {
+        r if r.is_ok() => r.value,
+        _ => i64::MIN,
     });
 
     // Store thread reference for unpark
@@ -263,11 +257,9 @@ pub unsafe extern "C" fn thread_spawn_closure_cloned(closure: *const ZrtlClosure
     let closure = (*closure).clone();
     let handle_id = next_handle();
 
-    let join_handle = thread::spawn(move || {
-        match closure.call(arg) {
-            r if r.is_ok() => r.value,
-            _ => i64::MIN,
-        }
+    let join_handle = thread::spawn(move || match closure.call(arg) {
+        r if r.is_ok() => r.value,
+        _ => i64::MIN,
     });
 
     // Store thread reference for unpark
@@ -555,16 +547,14 @@ pub extern "C" fn mutex_try_lock(handle: u64) -> i32 {
     };
 
     match mutex {
-        Some(m) => {
-            match m.try_lock() {
-                Ok(_guard) => {
-                    std::mem::forget(_guard);
-                    1
-                }
-                Err(std::sync::TryLockError::WouldBlock) => 0,
-                Err(_) => -1,
+        Some(m) => match m.try_lock() {
+            Ok(_guard) => {
+                std::mem::forget(_guard);
+                1
             }
-        }
+            Err(std::sync::TryLockError::WouldBlock) => 0,
+            Err(_) => -1,
+        },
         None => -1,
     }
 }
@@ -688,7 +678,7 @@ pub extern "C" fn channel_send(sender_handle: u64, value: i64) -> i32 {
         if let Some(sender) = m.get(&sender_handle) {
             match sender.send(value) {
                 Ok(()) => return 0,
-                Err(_) => return -1,  // Receiver disconnected
+                Err(_) => return -1, // Receiver disconnected
             }
         }
     }
@@ -717,7 +707,7 @@ pub extern "C" fn channel_recv(receiver_handle: u64) -> i64 {
         if let Some(receiver) = m.get(&receiver_handle) {
             match blocking(|| receiver.recv()) {
                 Ok(value) => return value,
-                Err(_) => return i64::MIN,  // Sender disconnected
+                Err(_) => return i64::MIN, // Sender disconnected
             }
         }
     }
@@ -763,12 +753,25 @@ pub extern "C" fn channel_try_recv_status(receiver_handle: u64) -> TryRecvResult
         if let Some(receiver) = m.get(&receiver_handle) {
             match receiver.try_recv() {
                 Ok(value) => return TryRecvResult { value, status: 0 },
-                Err(TryRecvError::Empty) => return TryRecvResult { value: 0, status: 1 },
-                Err(TryRecvError::Disconnected) => return TryRecvResult { value: 0, status: -1 },
+                Err(TryRecvError::Empty) => {
+                    return TryRecvResult {
+                        value: 0,
+                        status: 1,
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return TryRecvResult {
+                        value: 0,
+                        status: -1,
+                    }
+                }
             }
         }
     }
-    TryRecvResult { value: 0, status: -1 }
+    TryRecvResult {
+        value: 0,
+        status: -1,
+    }
 }
 
 /// Receive with timeout (milliseconds)
@@ -804,19 +807,35 @@ pub struct RecvTimeoutResult {
 /// Returns a RecvTimeoutResult with value and status.
 /// Status: 0 = received, 1 = timed out, -1 = disconnected
 #[no_mangle]
-pub extern "C" fn channel_recv_timeout_status(receiver_handle: u64, timeout_ms: u64) -> RecvTimeoutResult {
+pub extern "C" fn channel_recv_timeout_status(
+    receiver_handle: u64,
+    timeout_ms: u64,
+) -> RecvTimeoutResult {
     let receivers = get_map!(RECEIVERS, ReceiverMap);
     if let Some(ref m) = *receivers {
         if let Some(receiver) = m.get(&receiver_handle) {
             let timeout = Duration::from_millis(timeout_ms);
             match blocking(|| receiver.recv_timeout(timeout)) {
                 Ok(value) => return RecvTimeoutResult { value, status: 0 },
-                Err(RecvTimeoutError::Timeout) => return RecvTimeoutResult { value: 0, status: 1 },
-                Err(RecvTimeoutError::Disconnected) => return RecvTimeoutResult { value: 0, status: -1 },
+                Err(RecvTimeoutError::Timeout) => {
+                    return RecvTimeoutResult {
+                        value: 0,
+                        status: 1,
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return RecvTimeoutResult {
+                        value: 0,
+                        status: -1,
+                    }
+                }
             }
         }
     }
-    RecvTimeoutResult { value: 0, status: -1 }
+    RecvTimeoutResult {
+        value: 0,
+        status: -1,
+    }
 }
 
 /// Clone a sender to allow multiple producers
@@ -995,7 +1014,10 @@ mod tests {
         let before = RUNS.load(Ordering::SeqCst);
         let late = channel_recv_timeout_status(pair.receiver, 1);
         assert_eq!(late.status, 1);
-        assert!(RUNS.load(Ordering::SeqCst) > before, "recv_timeout did not block");
+        assert!(
+            RUNS.load(Ordering::SeqCst) > before,
+            "recv_timeout did not block"
+        );
 
         let before = RUNS.load(Ordering::SeqCst);
         let waiter = thread_spawn(park_then_seven, 0);
@@ -1101,9 +1123,7 @@ mod tests {
         let counter = Arc::new(AtomicI64::new(0));
         let counter_clone = counter.clone();
 
-        let closure = ZrtlClosure::new(move |x| {
-            counter_clone.fetch_add(x, Ordering::SeqCst)
-        });
+        let closure = ZrtlClosure::new(move |x| counter_clone.fetch_add(x, Ordering::SeqCst));
 
         unsafe {
             let closure_ptr = &closure as *const ZrtlClosure;
@@ -1128,9 +1148,7 @@ mod tests {
         let value = Arc::new(AtomicI64::new(100));
         let value_clone = value.clone();
 
-        let closure = ZrtlClosure::new(move |delta| {
-            value_clone.fetch_add(delta, Ordering::SeqCst)
-        });
+        let closure = ZrtlClosure::new(move |delta| value_clone.fetch_add(delta, Ordering::SeqCst));
 
         let closure_box = Box::new(closure);
         let closure_ptr = Box::into_raw(closure_box);
@@ -1175,14 +1193,14 @@ mod tests {
 
         // Nothing to receive yet
         let result = channel_try_recv_status(pair.receiver);
-        assert_eq!(result.status, 1);  // Empty
+        assert_eq!(result.status, 1); // Empty
 
         // Send something
         channel_send(pair.sender, 100);
 
         // Now we can receive
         let result = channel_try_recv_status(pair.receiver);
-        assert_eq!(result.status, 0);  // Success
+        assert_eq!(result.status, 0); // Success
         assert_eq!(result.value, 100);
 
         channel_close_sender(pair.sender);
@@ -1218,7 +1236,7 @@ mod tests {
 
         // Receiver should get disconnect
         let result = channel_try_recv_status(pair.receiver);
-        assert_eq!(result.status, -1);  // Disconnected
+        assert_eq!(result.status, -1); // Disconnected
 
         channel_close_receiver(pair.receiver);
     }
@@ -1252,7 +1270,7 @@ mod tests {
         }
 
         thread_join(producer_handle);
-        assert_eq!(sum, 0 + 1 + 2 + 3 + 4);
+        assert_eq!(sum, 1 + 2 + 3 + 4);
 
         channel_close_receiver(receiver);
     }
@@ -1262,8 +1280,8 @@ mod tests {
         let pair = channel_new();
 
         // Timeout on empty channel
-        let result = channel_recv_timeout_status(pair.receiver, 10);  // 10ms timeout
-        assert_eq!(result.status, 1);  // Timeout
+        let result = channel_recv_timeout_status(pair.receiver, 10); // 10ms timeout
+        assert_eq!(result.status, 1); // Timeout
 
         // Send and receive within timeout
         channel_send(pair.sender, 42);
