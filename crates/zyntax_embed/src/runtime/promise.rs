@@ -627,7 +627,7 @@ impl ZyntaxPromise {
                 match source_state {
                     PromiseState::Ready(value) => {
                         // The callback runs program code.
-                        zyntax_compiler::immix_heap::attach();
+                        zyntax_compiler::host_heap::attach();
                         let result = f(value);
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;
@@ -686,14 +686,14 @@ impl ZyntaxPromise {
                         break;
                     }
                     PromiseState::Failed(err) => {
-                        zyntax_compiler::immix_heap::attach();
+                        zyntax_compiler::host_heap::attach();
                         let result = f(err);
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;
                     }
                     PromiseState::Cancelled => {
                         // For catch, treat cancellation as an error to recover from
-                        zyntax_compiler::immix_heap::attach();
+                        zyntax_compiler::host_heap::attach();
                         let result = f("Promise was cancelled".to_string());
                         target.lock().unwrap().state = PromiseState::Ready(result);
                         break;
@@ -712,7 +712,7 @@ impl ZyntaxPromise {
 /// One turn of a wait that polls: stop for a collection that waits for
 /// this thread, then yield.
 fn wait_yield() {
-    zyntax_compiler::immix_heap::safepoint();
+    zyntax_compiler::host_heap::safepoint();
     std::thread::yield_now();
 }
 
@@ -804,7 +804,7 @@ pub(crate) fn drive_until(
                     if td > dl {
                         let now = web_time::Instant::now();
                         if dl > now {
-                            zyntax_compiler::immix_heap::blocking(|| std::thread::sleep(dl - now));
+                            zyntax_compiler::host_heap::blocking(|| std::thread::sleep(dl - now));
                         }
                         return false;
                     }

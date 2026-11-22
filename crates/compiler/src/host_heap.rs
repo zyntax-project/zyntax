@@ -409,6 +409,33 @@ pub fn unhold(address: *const u8) {
     }
 }
 
+/// Run `f` as a blocking region of the program's heap: a collection on
+/// another thread does not wait for this one until `f` returns, and `f`
+/// touches no heap object. Where there is no such heap, `f` just runs.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(unix)]
+    {
+        crate::immix_heap::blocking(f)
+    }
+    #[cfg(not(unix))]
+    {
+        f()
+    }
+}
+
+/// Stop here while a collection on another thread waits for this one.
+pub fn safepoint() {
+    #[cfg(unix)]
+    crate::immix_heap::safepoint();
+}
+
+/// Count the calling thread among those a collection reads. A thread
+/// that runs program code calls it before it takes a pointer.
+pub fn attach() {
+    #[cfg(unix)]
+    crate::immix_heap::attach();
+}
+
 /// How many holds are outstanding (diagnostics and tests).
 pub fn hold_count() -> usize {
     HOLDS

@@ -472,7 +472,7 @@ pub unsafe extern "C" fn zyntax_blocking(
     call: unsafe extern "C" fn(*mut std::ffi::c_void),
     data: *mut std::ffi::c_void,
 ) {
-    crate::immix_heap::blocking(|| unsafe { call(data) })
+    crate::host_heap::blocking(|| unsafe { call(data) })
 }
 
 /// Stop here while a collection on another thread waits for this one.
@@ -480,7 +480,7 @@ pub unsafe extern "C" fn zyntax_blocking(
 /// # Safety
 /// Always safe to call from a thread the heap may scan.
 pub unsafe extern "C" fn zyntax_safepoint() {
-    crate::immix_heap::safepoint()
+    crate::host_heap::safepoint()
 }
 
 /// Count the calling thread among those a collection reads.
@@ -488,7 +488,7 @@ pub unsafe extern "C" fn zyntax_safepoint() {
 /// # Safety
 /// Always safe to call.
 pub unsafe extern "C" fn zyntax_attach() {
-    crate::immix_heap::attach()
+    crate::host_heap::attach()
 }
 
 /// Keep the block `address` points into alive until [`zyntax_unhold`].

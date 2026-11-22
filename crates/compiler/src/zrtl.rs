@@ -2565,8 +2565,8 @@ impl BandPool {
                 let _heap = crate::host_heap::ThreadGuard::enter();
                 // Bands run program code, so a collection reads this
                 // thread before its first job, not at its first allocation.
-                crate::immix_heap::attach();
-                while let Ok(job) = crate::immix_heap::blocking(|| recv.recv()) {
+                crate::host_heap::attach();
+                while let Ok(job) = crate::host_heap::blocking(|| recv.recv()) {
                     run_bands(&job);
                     // The last thread out wakes whoever is waiting.
                     if job.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -2663,7 +2663,7 @@ impl BandPool {
         // watch for it would take one away from whoever is still
         // working.
         let (lock, cv) = &*self.done;
-        crate::immix_heap::blocking(|| {
+        crate::host_heap::blocking(|| {
             let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
             while job.remaining.load(Ordering::Acquire) > 0 {
                 g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
