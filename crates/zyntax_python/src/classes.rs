@@ -608,19 +608,30 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     out
 }
 
+/// The `shown` argument of KeyError's constructor: whether the message
+/// is already the text `str` gives.
+fn shown_flag(shown: bool, span: Span) -> Node {
+    lower::node(
+        TypedExpression::Literal(TypedLiteral::Bool(shown)),
+        Ty::Bool,
+        span,
+    )
+}
+
 /// `py$raise$Class(message)`: the instance built and left pending.
 /// Cold, so a raise is a call the caller neither inlines nor compiles
 /// ahead of its first use.
 fn raiser(module: &Module, class: &str, span: Span) -> TypedFunction {
     let mut lowerer = scratch(module);
     let k = module.class_index[class];
+    // The raiser is given what the program raises with: a KeyError's
+    // message is the key, which its constructor shows as a repr.
+    let mut args = vec![var(intern("message"), Ty::Str, span)];
+    if class == "KeyError" {
+        args.push(shown_flag(false, span));
+    }
     let instance = Val {
-        node: call(
-            &new_name(class),
-            vec![var(intern("message"), Ty::Str, span)],
-            Ty::Class(k as u16),
-            span,
-        ),
+        node: call(&new_name(class), args, Ty::Class(k as u16), span),
         ty: Ty::Class(k as u16),
     };
     let boxed = lowerer.coerce(instance, Ty::Object);
@@ -3693,8 +3704,13 @@ fn raise_hook_body(module: &Module, span: Span) -> TypedFunction {
     let mut statements = Vec::new();
     let mut store = |class: &str, message: Node| -> Option<TypedNode<TypedStatement>> {
         let &k = module.class_index.get(class)?;
+        // A KeyError's message is already the text its `str` shows.
+        let mut args = vec![message];
+        if class == "KeyError" {
+            args.push(shown_flag(true, span));
+        }
         let instance = Val {
-            node: call(&new_name(class), vec![message], Ty::Class(k as u16), span),
+            node: call(&new_name(class), args, Ty::Class(k as u16), span),
             ty: Ty::Class(k as u16),
         };
         let boxed = lowerer.coerce(instance, Ty::Object);

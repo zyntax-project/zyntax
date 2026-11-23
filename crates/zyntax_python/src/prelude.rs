@@ -41,8 +41,8 @@ class LookupError(Exception):
 class IndexError(LookupError):
     pass
 class KeyError(LookupError):
-    def __str__(self) -> str:
-        return repr(self.message)
+    def __init__(self, message="", shown=False):
+        self.message = str(message) if shown else repr(message)
 class ValueError(Exception):
     pass
 class TypeError(Exception):

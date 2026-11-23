@@ -1,0 +1,16 @@
+KeyError (1, 2)
+KeyError 7
+KeyError 'nope'
+KeyError 99
+KeyError 'zz'
+del (5, 5)
+KeyError 9
+KeyError 'b'
+KeyError 'popitem(): dictionary is empty'
+KeyError 5
+KeyError 'pop from an empty set'
+KeyError 2
+KeyError 'q'
+KeyError 2.5
+'msg'
+5

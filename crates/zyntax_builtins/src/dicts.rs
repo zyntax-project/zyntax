@@ -128,9 +128,6 @@ fn when_key_matches(stored: &Local, k: &Local, kcat: &Local, found: Expr) -> Vec
         ),
     ]
 }
-fn any_str(x: Expr) -> Expr {
-    call("zb_any_str", vec![x], string())
-}
 fn len(xs: Expr) -> Expr {
     mcall(xs, "len", vec![], i64())
 }
@@ -406,13 +403,9 @@ impl Table<'_> {
     fn recursive_keys(&self) -> bool {
         !self.key.is_scalar()
     }
-    /// A key as an error reports it.
+    /// A key as a KeyError shows it: its repr.
     fn key_text(&self, k: Expr) -> Expr {
-        match self.key {
-            Field::Any => any_str(k),
-            Field::Str => k,
-            other => other.repr(k),
-        }
+        self.key.repr(k)
     }
     fn call(&self, op: &str, args: Vec<Expr>, ret: Type) -> Expr {
         call(&self.name(op), args, ret)
@@ -1269,7 +1262,7 @@ fn dict_ops(t: &Table) -> Vec<Decl> {
             ),
             when(
                 lt(e.e(), t.first(t.ctrl(d.e()))),
-                vec![fatal("KeyError", text("popitem(): dictionary is empty"))],
+                vec![fatal("KeyError", text("'popitem(): dictionary is empty'"))],
             ),
             en.decl(t.entry(d.e(), e.e())),
             out.decl(call(
@@ -1612,10 +1605,7 @@ pub(crate) fn dict_probe_by(list_type: TypeId, probe: &Field, suffix: &str) -> V
         Field::Str => call("zb_str_to_dynamic", vec![key.e()], any()),
         other => other.boxed(key.e()),
     };
-    let key_text = || match probe {
-        Field::Str => key.e(),
-        other => other.repr(key.e()),
-    };
+    let key_text = || probe.repr(key.e());
     let mixed = || call("zb_hash_mix", vec![probe.hash(key.e())], i64());
     let mut out = Vec::new();
     out.push(define(
@@ -2077,7 +2067,7 @@ fn set_ops(t: &Table) -> Vec<Decl> {
             ),
             when(
                 lt(e.e(), t.first(t.ctrl(s.e()))),
-                vec![fatal("KeyError", text("pop from an empty set"))],
+                vec![fatal("KeyError", text("'pop from an empty set'"))],
             ),
             x.decl(t.key_of(t.entry(s.e(), e.e()))),
             t.go("delete_at", vec![s.e(), e.e()]),
@@ -2863,7 +2853,10 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 e.decl(found()),
                 when(
                     lt(e.e(), int(0)),
-                    vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                    vec![fatal(
+                        "KeyError",
+                        call("zb_any_repr", vec![k.e()], string()),
+                    )],
                 ),
                 ret(t.value_of(t.entry(d.e(), e.e()))),
             ]
@@ -2899,7 +2892,10 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 e.decl(found()),
                 when(
                     lt(e.e(), int(0)),
-                    vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                    vec![fatal(
+                        "KeyError",
+                        call("zb_any_repr", vec![k.e()], string()),
+                    )],
                 ),
                 x.decl(vf.boxed(t.value_of(t.entry(d.e(), e.e())))),
                 t.go("delete_at", vec![d.e(), e.e()]),
@@ -2911,7 +2907,10 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 e.decl(found()),
                 when(
                     lt(e.e(), int(0)),
-                    vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                    vec![fatal(
+                        "KeyError",
+                        call("zb_any_repr", vec![k.e()], string()),
+                    )],
                 ),
                 t.go("delete_at", vec![d.e(), e.e()]),
                 ret_void(),
@@ -3239,7 +3238,10 @@ fn probe_any_ops(t: &Table) -> Vec<Decl> {
                 if raises {
                     st.push(when(
                         lt(e.e(), int(0)),
-                        vec![fatal("KeyError", call("zb_any_str", vec![k.e()], string()))],
+                        vec![fatal(
+                            "KeyError",
+                            call("zb_any_repr", vec![k.e()], string()),
+                        )],
                     ));
                 } else {
                     st.push(when(lt(e.e(), int(0)), vec![ret_void()]));
