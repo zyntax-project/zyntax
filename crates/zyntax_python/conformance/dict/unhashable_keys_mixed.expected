@@ -1,0 +1,16 @@
+obj dict getitem TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict in TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict get TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict pop TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict pop default TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict setdefault TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj set in TypeError cannot use 'list' as a set element (unhashable type: 'list')
+obj set add TypeError cannot use 'list' as a set element (unhashable type: 'list')
+obj set remove TypeError cannot use 'list' as a set element (unhashable type: 'list')
+obj set discard TypeError cannot use 'list' as a set element (unhashable type: 'list')
+obj dict dict TypeError cannot use 'dict' as a dict key (unhashable type: 'dict')
+obj set set False
+frozenset ok False
+obj dict store TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+obj dict del TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+frozenset key 1

@@ -7666,6 +7666,9 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Str,
                 }),
                 Ty::Tuple(_) => self.expr(slice),
+                // A key that cannot hash stays as it is, for the table
+                // operation to raise on.
+                Ty::List(_) | Ty::Dict(_) | Ty::Set(_) => self.expr(slice),
                 _ => Ok(Val {
                     node: self.expr_as(slice, Ty::Object)?,
                     ty: Ty::Object,

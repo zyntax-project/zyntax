@@ -221,6 +221,19 @@ fn not(v: Node, span: Span) -> Node {
     )
 }
 
+/// The name of a key type that cannot hash, if `ty` is one.
+/// A set looked up in a set (`in`, `remove`, `discard`) is read as the
+/// frozenset of its elements, so `lookup_in` leaves it alone.
+fn unhashable_name(ty: Ty, lookup_in: Ty) -> Option<&'static str> {
+    match ty {
+        Ty::List(Elem::Array(_)) => Some("array.array"),
+        Ty::List(_) => Some("list"),
+        Ty::Dict(_) => Some("dict"),
+        Ty::Set(_) if !frozen(ty) && !matches!(lookup_in, Ty::Set(_)) => Some("set"),
+        _ => None,
+    }
+}
+
 impl Lowerer<'_> {
     /// A dict or set boxed by reference under its store's tag.
     pub(crate) fn box_table(&mut self, v: Val, span: Span) -> Node {
@@ -345,6 +358,25 @@ impl Lowerer<'_> {
         self.read_as(v, ty, span)
     }
 
+    /// The TypeError a table raises for a key whose type cannot hash,
+    /// after its operands run.
+    fn raise_unhashable(
+        &mut self,
+        name: &str,
+        table: Ty,
+        operands: Vec<Node>,
+        ty: Ty,
+        span: Span,
+    ) -> Node {
+        let role = if matches!(table, Ty::Dict(_)) {
+            "dict key"
+        } else {
+            "set element"
+        };
+        let message = format!("cannot use '{name}' as a {role} (unhashable type: '{name}')");
+        self.raised_value(operands, "TypeError", &message, ty, span)
+    }
+
     /// How `key` probes a typed table of type `table` (not the library's
     /// own, which [`Self::dict_key_of`] probes). A key of the stored kind
     /// is typed; a bool is the int it stands for; a string, None or an
@@ -370,6 +402,10 @@ impl Lowerer<'_> {
 
     /// `d[k]` read as `ty`.
     pub(crate) fn dict_get(&mut self, d: Val, key: Val, ty: Ty, span: Span) -> Val {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            let node = self.raise_unhashable(name, d.ty, vec![d.node, key.node], ty, span);
+            return Val { node, ty };
+        }
         let (_, sv) = dict_stored(d.ty);
         if sv == Ty::Object && key_stored(d.ty) == Ty::Object {
             let (k, by) = self.dict_key_of(key);
@@ -404,6 +440,10 @@ impl Lowerer<'_> {
 
     /// `d[k] = v`.
     pub(crate) fn dict_set(&mut self, d: Val, key: Val, value: Val, span: Span) -> Node {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            let operands = vec![d.node, key.node, value.node];
+            return self.raise_unhashable(name, d.ty, operands, Ty::None, span);
+        }
         let (sk, sv) = dict_stored(d.ty);
         if sk == Ty::Object && sv == Ty::Object {
             let (k, by) = self.dict_key_of(key);
@@ -422,6 +462,9 @@ impl Lowerer<'_> {
 
     /// `del d[k]`.
     pub(crate) fn dict_del(&mut self, d: Val, key: Val, span: Span) -> Node {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            return self.raise_unhashable(name, d.ty, vec![d.node, key.node], Ty::None, span);
+        }
         if dict_stored(d.ty) == (Ty::Object, Ty::Object) {
             let k = self.coerce(key, Ty::Object);
             return call("zb_dict_del", vec![d.node, k], Ty::None, span);
@@ -438,6 +481,10 @@ impl Lowerer<'_> {
 
     /// `k in t` for a dict or set `t`.
     pub(crate) fn table_contains(&mut self, table: Val, key: Val, span: Span) -> Node {
+        if let Some(name) = unhashable_name(key.ty, table.ty) {
+            let operands = vec![key.node, table.node];
+            return self.raise_unhashable(name, table.ty, operands, Ty::Bool, span);
+        }
         if key_stored(table.ty) == Ty::Object {
             return match table.ty {
                 Ty::Dict(_) => {
@@ -495,6 +542,11 @@ impl Lowerer<'_> {
         ty: Ty,
         span: Span,
     ) -> Val {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            let operands = vec![d.node, key.node, default.node];
+            let node = self.raise_unhashable(name, d.ty, operands, ty, span);
+            return Val { node, ty };
+        }
         let (sk, sv) = dict_stored(d.ty);
         if sk == Ty::Object && sv == Ty::Object {
             let (k, by) = self.dict_key_of(key);
@@ -575,6 +627,12 @@ impl Lowerer<'_> {
         ty: Ty,
         span: Span,
     ) -> Val {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            let mut operands = vec![d.node, key.node];
+            operands.extend(default.map(|v| v.node));
+            let node = self.raise_unhashable(name, d.ty, operands, ty, span);
+            return Val { node, ty };
+        }
         let (sk, sv) = dict_stored(d.ty);
         if sk == Ty::Object && sv == Ty::Object {
             let k = self.coerce(key, Ty::Object);
@@ -675,6 +733,11 @@ impl Lowerer<'_> {
         ty: Ty,
         span: Span,
     ) -> Val {
+        if let Some(name) = unhashable_name(key.ty, Ty::None) {
+            let operands = vec![d.node, key.node, value.node];
+            let node = self.raise_unhashable(name, d.ty, operands, ty, span);
+            return Val { node, ty };
+        }
         let (sk, sv) = dict_stored(d.ty);
         let k = self.table_in(key, sk);
         let v = self.table_in(value, sv);
@@ -782,6 +845,9 @@ impl Lowerer<'_> {
     /// `s.remove(x)` (`remove`) or `s.discard(x)`: a value of a kind no
     /// element is equal to is a missing value.
     pub(crate) fn set_discard(&mut self, s: Val, item: Val, remove: bool, span: Span) -> Node {
+        if let Some(name) = unhashable_name(item.ty, s.ty) {
+            return self.raise_unhashable(name, s.ty, vec![s.node, item.node], Ty::None, span);
+        }
         let op = if remove { "remove" } else { "discard" };
         if set_stored(s.ty) == Ty::Object {
             let item = self.coerce(item, Ty::Object);
@@ -815,6 +881,9 @@ impl Lowerer<'_> {
 
     /// `s.add(x)` into a set of type `s.ty`.
     pub(crate) fn set_add(&mut self, s: Val, item: Val, span: Span) -> Node {
+        if let Some(name) = unhashable_name(item.ty, Ty::None) {
+            return self.raise_unhashable(name, s.ty, vec![s.node, item.node], Ty::None, span);
+        }
         let stored = set_stored(s.ty);
         let item = self.table_in(item, stored);
         call(&set_fn("add", s.ty), vec![s.node, item], Ty::None, span)
