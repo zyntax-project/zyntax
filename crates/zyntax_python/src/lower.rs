@@ -1483,7 +1483,12 @@ impl<'m> Lowerer<'m> {
                 let own = scope.bound.contains(n)
                     || sig.params.iter().any(|(p, _)| p == n)
                     || captured.contains(n);
-                if own && !module.funcs.contains_key(n) {
+                // A module variable the module's functions read is the
+                // global they read, not a cell of the body that sets it.
+                let global = module.globals.contains_key(n)
+                    && !locals.vars.contains_key(n)
+                    && !captured.contains(n);
+                if own && !global && !module.funcs.contains_key(n) {
                     cells.insert(n.clone());
                 }
             }
