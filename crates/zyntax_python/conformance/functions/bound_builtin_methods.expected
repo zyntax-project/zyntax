@@ -1,0 +1,14 @@
+['a', 'b,c'] ['a b', 'c'] ['a b', 'c']
+A B,C
+['a-b', 'c']
+[1, 1, 0]
+[True, False]
+2 -1 -1
+1 None 7
+[1, 2, None]
+[('j', 2), ('k', 1)]
+1 0 {'j': 2}
+[1, 2, 9]
+[True, False]
+TypeError split() takes at most 2 arguments (3 given)
+TypeError get expected at least 1 argument, got 0

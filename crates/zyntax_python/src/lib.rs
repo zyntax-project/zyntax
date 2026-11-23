@@ -1164,21 +1164,7 @@ fn parse_program_once(
             Span::new(0, 0),
         ));
     }
-    for mut func in inferred.lifted.take() {
-        if !func
-            .annotations
-            .iter()
-            .any(|a| a.name.resolve_global().as_deref() == Some("strict_fp"))
-        {
-            func.annotations
-                .push(lower::strict_fp_annotation(Span::new(0, 0)));
-        }
-        declarations.push(TypedNode::new(
-            TypedDeclaration::Function(func),
-            Type::Unknown,
-            Span::new(0, 0),
-        ));
-    }
+    emit_lifted(&inferred, &mut declarations);
     records::watch(false);
     if !records::demoted().is_empty() {
         return Err(Error::unsupported_span(
@@ -1203,6 +1189,8 @@ fn parse_program_once(
             Span::new(0, 0),
         ));
     }
+    // What generating them lifted, a bound method a dynamic read makes.
+    emit_lifted(&inferred, &mut declarations);
     declarations.extend(lower::shape_declarations(&inferred, library.list_type));
     // A tuple field of a class set reads its box back through the set's
     // unboxer, which describing the shapes may have asked for.
@@ -1278,6 +1266,25 @@ fn parse_program_once(
 
 /// Annotates `nothrow` the functions the raise facts prove leave no
 /// exception pending; one that raises by construction is never one.
+/// The functions lowering lifted out of their bodies so far.
+fn emit_lifted(module: &types::Module, declarations: &mut Vec<TypedNode<TypedDeclaration>>) {
+    for mut func in module.lifted.take() {
+        if !func
+            .annotations
+            .iter()
+            .any(|a| a.name.resolve_global().as_deref() == Some("strict_fp"))
+        {
+            func.annotations
+                .push(lower::strict_fp_annotation(Span::new(0, 0)));
+        }
+        declarations.push(TypedNode::new(
+            TypedDeclaration::Function(func),
+            Type::Unknown,
+            Span::new(0, 0),
+        ));
+    }
+}
+
 fn mark_nothrow(declarations: &mut [TypedNode<TypedDeclaration>], non_raising: &HashSet<String>) {
     for d in declarations {
         let TypedDeclaration::Function(f) = &mut d.node else {

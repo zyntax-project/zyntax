@@ -1221,6 +1221,7 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         },
         span,
     );
+    statements.extend(builtin_attribute_arms(module, attr, x.clone(), span));
     statements.push(when(
         is_foreign(x.clone(), span),
         vec![ret(
@@ -1437,10 +1438,42 @@ fn builtin_arms(
     x: Node,
     span: Span,
 ) -> Vec<TypedNode<TypedStatement>> {
-    use crate::types::Elem;
     let args: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
     let source = format!("s.{method}({})", args.join(", "));
-    let Ok(parsed) = ruff_python_parser::parse_expression(&source) else {
+    arms_over_builtins(
+        module,
+        &source,
+        &args,
+        matches!(method, "count" | "index"),
+        x,
+        span,
+    )
+}
+
+/// The attribute of a boxed string, list, dict or set read as a value:
+/// the bound method, where the typed lowering has one.
+fn builtin_attribute_arms(
+    module: &Module,
+    attr: &str,
+    x: Node,
+    span: Span,
+) -> Vec<TypedNode<TypedStatement>> {
+    arms_over_builtins(module, &format!("s.{attr}"), &[], false, x, span)
+}
+
+/// One arm per kind of builtin a box may hold: the test on the box, and
+/// `source` lowered with `s` the unboxed value and `args` the dynamic
+/// arguments. A kind the lowering refuses gets no arm.
+fn arms_over_builtins(
+    module: &Module,
+    source: &str,
+    args: &[String],
+    tuple_methods: bool,
+    x: Node,
+    span: Span,
+) -> Vec<TypedNode<TypedStatement>> {
+    use crate::types::Elem;
+    let Ok(parsed) = ruff_python_parser::parse_expression(source) else {
         return Vec::new();
     };
     let expr = parsed.into_syntax().body;
@@ -1536,7 +1569,7 @@ fn builtin_arms(
     ));
     // A boxed tuple is a list of dynamic values under its own tag, and
     // answers the two methods a tuple has as that list.
-    if matches!(method, "count" | "index") {
+    if tuple_methods {
         receivers.push((
             kind(zyntax_builtins::TUPLE_TAG >> 8),
             Ty::List(Elem::Object),
@@ -1578,7 +1611,7 @@ fn builtin_arms(
     let mut arms = Vec::new();
     for (test, ty, raw) in receivers {
         let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
-        for a in &args {
+        for a in args {
             vars.push((a.as_str(), Ty::Object));
         }
         let mut lowerer = scratch_with(module, &vars);

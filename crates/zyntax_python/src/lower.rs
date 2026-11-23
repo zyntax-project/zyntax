@@ -8624,6 +8624,9 @@ impl<'m> Lowerer<'m> {
                 if let Some(member) = self.module_member_of(&a.value, a.attr.as_str()) {
                     return self.member_value(member, a.attr.as_str(), e, span);
                 }
+                if let Some(v) = self.unbound_builtin_method(a, span)? {
+                    return Ok(v);
+                }
                 // `C.X`: the class's attribute.
                 if let Some(k) = self.module.class_of_expr(&a.value) {
                     let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
@@ -14524,6 +14527,234 @@ impl<'m> Lowerer<'m> {
         })
     }
 
+    /// `str.upper`, `dict.get`, `list.append`: the method as a function
+    /// of the receiver and the arguments every call must give.
+    fn unbound_builtin_method(&mut self, a: &py::ExprAttribute, span: Span) -> Result<Option<Val>> {
+        let py::Expr::Name(t) = &*a.value else {
+            return Ok(None);
+        };
+        let name = t.id.as_str();
+        if self.is_variable(name)
+            || self.module.funcs.contains_key(name)
+            || self.module.class_index.contains_key(name)
+            || self.module.imported_name(name).is_some()
+        {
+            return Ok(None);
+        }
+        let receiver = match name {
+            "str" => Ty::Str,
+            "dict" => types::dynamic_dict(),
+            "set" => types::dynamic_set(false),
+            "list" => Ty::List(Elem::Object),
+            _ => return Ok(None),
+        };
+        let method = a.attr.as_str();
+        let given = match types::builtin_method_counts(receiver, method) {
+            Some((fewest, _)) => fewest,
+            None => match types::bound_method_arity(self.module, receiver, method) {
+                Some(zyntax_builtins::functions::VARIADIC_ARITY) => 0,
+                Some(arity) => arity as usize,
+                None => return Ok(None),
+            },
+        };
+        let params: Vec<String> = (0..=given).map(|i| format!("a{i}")).collect();
+        let text = format!(
+            "lambda {}: a0.{method}({})",
+            params.join(", "),
+            params[1..].join(", ")
+        );
+        let parsed = ruff_python_parser::parse_expression(&text).expect("a method call parses");
+        let py::Expr::Lambda(lambda) = &*parsed.into_syntax().body else {
+            unreachable!("the source is a lambda")
+        };
+        Ok(Some(self.lambda(lambda, span)?))
+    }
+
+    /// The body of a bound method of a str, dict or set: the packed
+    /// arguments, then the call for the number given, and the TypeError
+    /// when no call takes that many.
+    fn builtin_bound_body(
+        &mut self,
+        child: &mut Lowerer<'_>,
+        receiver_ty: Ty,
+        held: Val,
+        method: &str,
+        body: &mut Vec<Stmt>,
+        span: Span,
+    ) -> Result<()> {
+        let (fewest, most) =
+            types::builtin_method_counts(receiver_ty, method).expect("a bound method");
+        let packed = var(intern("a0"), Ty::Object, span);
+        let args = call(
+            "zb_list_unbox_any",
+            vec![packed],
+            Ty::List(Elem::Object),
+            span,
+        );
+        let count = method_call(args.clone(), "len", Vec::new(), Ty::Int, span);
+        child.locals.vars.insert("r".to_string(), receiver_ty);
+        // What reading the receiver out of the record needed comes first.
+        body.append(&mut child.hoisted);
+        body.push(TypedNode::new(
+            TypedStatement::Let(TypedLet {
+                name: intern("r"),
+                ty: ir(receiver_ty),
+                mutability: Mutability::Immutable,
+                initializer: Some(Box::new(held.node)),
+                span,
+            }),
+            Type::Unknown,
+            span,
+        ));
+        for given in fewest..=most {
+            let names: Vec<String> = (0..given).map(|i| format!("x{i}")).collect();
+            let mut branch = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                child.locals.vars.insert(name.clone(), Ty::Object);
+                branch.push(TypedNode::new(
+                    TypedStatement::Let(TypedLet {
+                        name: intern(name),
+                        ty: ir(Ty::Object),
+                        mutability: Mutability::Immutable,
+                        initializer: Some(Box::new(call(
+                            "zb_list_get_unchecked_any",
+                            vec![args.clone(), int_lit(i as i64, span)],
+                            Ty::Object,
+                            span,
+                        ))),
+                        span,
+                    }),
+                    Type::Unknown,
+                    span,
+                ));
+            }
+            let source = format!("r.{method}({})", names.join(", "));
+            let parsed =
+                ruff_python_parser::parse_expression(&source).expect("a bound method call parses");
+            let expr = parsed.into_syntax().body;
+            let outer = std::mem::take(&mut child.hoisted);
+            let result = child.expr(&expr)?;
+            let boxed = child.coerce(result, Ty::Object);
+            branch.append(&mut child.hoisted);
+            child.hoisted = outer;
+            branch.push(TypedNode::new(
+                TypedStatement::Return(Some(Box::new(boxed))),
+                Type::Unknown,
+                span,
+            ));
+            body.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(binary(
+                        BinaryOp::Eq,
+                        count.clone(),
+                        int_lit(given as i64, span),
+                        Ty::Bool,
+                        span,
+                    )),
+                    then_block: TypedBlock {
+                        statements: branch,
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+        // CPython's wording for a count that no call takes.
+        let owner = match receiver_ty {
+            Ty::Str => "str",
+            Ty::Dict(_) => "dict",
+            _ => "set",
+        };
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let (low, high) = if fewest == most {
+            let rule = match fewest {
+                0 => "takes no arguments".to_string(),
+                1 => "takes exactly one argument".to_string(),
+                n => format!("takes exactly {n} arguments"),
+            };
+            let head = format!("{owner}.{method}() {rule} (");
+            (
+                (head.clone(), " given)".to_string()),
+                (head, " given)".to_string()),
+            )
+        } else if matches!(method, "split" | "rsplit") {
+            let head = format!("{method}() takes at most {most} arguments (");
+            (
+                (head.clone(), " given)".to_string()),
+                (head, " given)".to_string()),
+            )
+        } else {
+            (
+                (
+                    format!(
+                        "{method} expected at least {fewest} argument{}, got ",
+                        plural(fewest)
+                    ),
+                    String::new(),
+                ),
+                (
+                    format!(
+                        "{method} expected at most {most} argument{}, got ",
+                        plural(most)
+                    ),
+                    String::new(),
+                ),
+            )
+        };
+        for (test, (head, tail)) in [
+            (
+                binary(
+                    BinaryOp::Lt,
+                    count.clone(),
+                    int_lit(fewest as i64, span),
+                    Ty::Bool,
+                    span,
+                ),
+                low,
+            ),
+            (
+                binary(
+                    BinaryOp::Gt,
+                    count.clone(),
+                    int_lit(most as i64, span),
+                    Ty::Bool,
+                    span,
+                ),
+                high,
+            ),
+        ] {
+            let message = call(
+                "zb_str_concat3",
+                vec![
+                    str_lit(&head, span),
+                    call("zb_str_of_int", vec![count.clone()], Ty::Str, span),
+                    str_lit(&tail, span),
+                ],
+                Ty::Str,
+                span,
+            );
+            let mut fail = Vec::new();
+            child.raise_named("TypeError", message, span, &mut fail);
+            body.push(TypedNode::new(
+                TypedStatement::If(TypedIf {
+                    condition: Box::new(test),
+                    then_block: TypedBlock {
+                        statements: fail,
+                        span,
+                    },
+                    else_block: None,
+                    span,
+                }),
+                Type::Unknown,
+                span,
+            ));
+        }
+        Ok(())
+    }
+
     /// A function record with the receiver held in its first cell.
     fn bound_method(&mut self, receiver: Val, method: &str, arity: i64, span: Span) -> Result<Val> {
         let receiver = if matches!(receiver.ty, Ty::Class(_)) {
@@ -14533,7 +14764,8 @@ impl<'m> Lowerer<'m> {
         };
         let code = self.lifted_name(&format!("bound${method}"));
         let receiver_ty = receiver.ty;
-        let variadic = method == "pop" && matches!(receiver_ty, Ty::List(_));
+        let pop_list = method == "pop" && matches!(receiver_ty, Ty::List(_));
+        let variadic = arity == zyntax_builtins::functions::VARIADIC_ARITY;
         let params: Vec<(String, Ty)> = (0..if variadic { 0 } else { arity as usize })
             .map(|i| (format!("a{i}"), Ty::Object))
             .collect();
@@ -14570,7 +14802,13 @@ impl<'m> Lowerer<'m> {
             ty: receiver_ty,
         };
         let mut body = Vec::new();
-        let result = if variadic {
+        let result = if variadic && !pop_list {
+            self.builtin_bound_body(&mut child, receiver_ty, held, method, &mut body, span)?;
+            Val {
+                node: node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),
+                ty: Ty::None,
+            }
+        } else if pop_list {
             let packed = var(intern("a0"), Ty::Object, span);
             let args = call(
                 "zb_list_unbox_any",

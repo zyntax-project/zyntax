@@ -2079,10 +2079,65 @@ pub(crate) struct BoundInfo {
     pub(crate) method: String,
 }
 
+/// The fewest and most arguments the lowering takes for a method of a
+/// str, dict or set, which is what a bound one is called with; `None`
+/// for any other method.
+pub(crate) fn builtin_method_counts(receiver: Ty, attr: &str) -> Option<(usize, usize)> {
+    match receiver {
+        Ty::Str => Some(match attr {
+            "upper" | "lower" | "capitalize" | "title" | "swapcase" | "casefold" | "isalpha"
+            | "isalnum" | "isdigit" | "isdecimal" | "isnumeric" | "isspace" | "isupper"
+            | "islower" | "istitle" | "isascii" | "isidentifier" => (0, 0),
+            "strip" | "lstrip" | "rstrip" | "splitlines" | "expandtabs" | "encode" => (0, 1),
+            "split" | "rsplit" => (0, 2),
+            "startswith" | "endswith" | "find" | "rfind" | "index" | "rindex" | "count" => (1, 3),
+            "replace" => (2, 3),
+            "center" | "ljust" | "rjust" => (1, 2),
+            "join" | "zfill" | "partition" | "rpartition" | "removeprefix" | "removesuffix" => {
+                (1, 1)
+            }
+            _ => return None,
+        }),
+        Ty::Dict(_) => Some(match attr {
+            "keys" | "values" | "items" | "copy" | "clear" => (0, 0),
+            "get" | "pop" | "setdefault" => (1, 2),
+            "update" => (1, 1),
+            _ => return None,
+        }),
+        Ty::Set(_)
+            if !(crate::lower::tables::frozen(receiver)
+                && matches!(
+                    attr,
+                    "add" | "remove" | "discard" | "pop" | "clear" | "update"
+                )) =>
+        {
+            Some(match attr {
+                "pop" | "clear" | "copy" => (0, 0),
+                "add"
+                | "remove"
+                | "discard"
+                | "update"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint" => (1, 1),
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The arity of a method a list or an instance value can be bound to,
 /// which is what the lowering makes a record for; `None` is any other
 /// attribute.
 pub(crate) fn bound_method_arity(module: &Module, receiver: Ty, attr: &str) -> Option<i64> {
+    if builtin_method_counts(receiver, attr).is_some() {
+        return Some(zyntax_builtins::functions::VARIADIC_ARITY);
+    }
     match receiver {
         Ty::List(_) => match attr {
             "append" | "remove" | "index" | "count" | "extend" => Some(1),
