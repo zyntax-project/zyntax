@@ -1,1 +1,1 @@
-{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":3,"timestamp":1795429540,"nonce":"c//z2AlI3vbftRfhwjnkXufpLgg=","message":"Fixed in e054c15e. isinstance_of_builtin answers list false and array true for a list with an array element kind, and the boxed path tests the array kind range. Case: conformance/array/isinstance_list.py.","files":null}]}
+{"author":{"id":"b409816c5cd5ab140d1d52eb33aace35de44952bb794b19806fd57f6ecb1ace9"},"ops":[{"type":4,"timestamp":1795429540,"nonce":"f3aEWvFZQTfqM41kQZIhh+TFVGM=","status":2}]}
