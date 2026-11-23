@@ -1,0 +1,157 @@
+'' False False False False False False False False False True False
+'abc' True True False False False False False True False True True
+'ABC' True True False False False False True False False True True
+'aBc' True True False False False False False False False True True
+'Hello World' False False False False False False False False True True False
+'hello world' False False False False False False False True False True False
+'123' False True True True True False False False False True False
+'12a' False True False False False False False True False True False
+' \t\n' False False False False False True False False False True False
+'  x ' False False False False False False False True False True False
+'ünï' True True False False False False False True False False True
+'ÜNÏ' True True False False False False True False False False True
+'a_b1' False False False False False False False True False True True
+'_x' False False False False False False False True False True True
+'1x' False True False False False False False True False True False
+'x y' False False False False False False False True False True False
+'Hello' True True False False False False False False True True True
+'HELLO' True True False False False False True False False True True
+'straße' True True False False False False False True False False True
+'ǅ' True True False False False False False False True False True
+'' '' ''
+'abc' 'ABC' 'abc'
+'ABC' 'abc' 'abc'
+'aBc' 'AbC' 'abc'
+'Hello World' 'hELLO wORLD' 'hello world'
+'hello world' 'HELLO WORLD' 'hello world'
+'123' '123' '123'
+'12a' '12A' '12a'
+' \t\n' ' \t\n' ' \t\n'
+'  x ' '  X ' '  x '
+'ünï' 'ÜNÏ' 'ünï'
+'ÜNÏ' 'ünï' 'ünï'
+'a_b1' 'A_B1' 'a_b1'
+'_x' '_X' '_x'
+'1x' '1X' '1x'
+'x y' 'X Y' 'x y'
+'Hello' 'hELLO' 'hello'
+'HELLO' 'hello' 'hello'
+'straße' 'STRASSE' 'strasse'
+'ǅ' 'ǅ' 'ǆ'
+'' -1 '' '' '' ''
+'' 0 '' '' '' ''
+'' 1 ' ' ' ' ' ' '0'
+'' 2 '  ' '  ' '  ' '00'
+'' 3 '   ' '   ' '   ' '000'
+'' 6 '      ' '      ' '      ' '000000'
+'' 7 '       ' '       ' '       ' '0000000'
+'******' '******' '******' '*******'
+'ab' -1 'ab' 'ab' 'ab' 'ab'
+'ab' 0 'ab' 'ab' 'ab' 'ab'
+'ab' 1 'ab' 'ab' 'ab' 'ab'
+'ab' 2 'ab' 'ab' 'ab' 'ab'
+'ab' 3 'ab ' ' ab' ' ab' '0ab'
+'ab' 6 'ab    ' '    ab' '  ab  ' '0000ab'
+'ab' 7 'ab     ' '     ab' '   ab  ' '00000ab'
+'ab****' '****ab' '**ab**' '***ab**'
+'abc' -1 'abc' 'abc' 'abc' 'abc'
+'abc' 0 'abc' 'abc' 'abc' 'abc'
+'abc' 1 'abc' 'abc' 'abc' 'abc'
+'abc' 2 'abc' 'abc' 'abc' 'abc'
+'abc' 3 'abc' 'abc' 'abc' 'abc'
+'abc' 6 'abc   ' '   abc' ' abc  ' '000abc'
+'abc' 7 'abc    ' '    abc' '  abc  ' '0000abc'
+'abc***' '***abc' '*abc**' '**abc**'
+'abcd' -1 'abcd' 'abcd' 'abcd' 'abcd'
+'abcd' 0 'abcd' 'abcd' 'abcd' 'abcd'
+'abcd' 1 'abcd' 'abcd' 'abcd' 'abcd'
+'abcd' 2 'abcd' 'abcd' 'abcd' 'abcd'
+'abcd' 3 'abcd' 'abcd' 'abcd' 'abcd'
+'abcd' 6 'abcd  ' '  abcd' ' abcd ' '00abcd'
+'abcd' 7 'abcd   ' '   abcd' '  abcd ' '000abcd'
+'abcd**' '**abcd' '*abcd*' '**abcd*'
+'-12' -1 '-12' '-12' '-12' '-12'
+'-12' 0 '-12' '-12' '-12' '-12'
+'-12' 1 '-12' '-12' '-12' '-12'
+'-12' 2 '-12' '-12' '-12' '-12'
+'-12' 3 '-12' '-12' '-12' '-12'
+'-12' 6 '-12   ' '   -12' ' -12  ' '-00012'
+'-12' 7 '-12    ' '    -12' '  -12  ' '-000012'
+'-12***' '***-12' '*-12**' '**-12**'
+'+5' -1 '+5' '+5' '+5' '+5'
+'+5' 0 '+5' '+5' '+5' '+5'
+'+5' 1 '+5' '+5' '+5' '+5'
+'+5' 2 '+5' '+5' '+5' '+5'
+'+5' 3 '+5 ' ' +5' ' +5' '+05'
+'+5' 6 '+5    ' '    +5' '  +5  ' '+00005'
+'+5' 7 '+5     ' '     +5' '   +5  ' '+000005'
+'+5****' '****+5' '**+5**' '***+5**'
+'ünï' -1 'ünï' 'ünï' 'ünï' 'ünï'
+'ünï' 0 'ünï' 'ünï' 'ünï' 'ünï'
+'ünï' 1 'ünï' 'ünï' 'ünï' 'ünï'
+'ünï' 2 'ünï' 'ünï' 'ünï' 'ünï'
+'ünï' 3 'ünï' 'ünï' 'ünï' 'ünï'
+'ünï' 6 'ünï   ' '   ünï' ' ünï  ' '000ünï'
+'ünï' 7 'ünï    ' '    ünï' '  ünï  ' '0000ünï'
+'ünï***' '***ünï' '*ünï**' '**ünï**'
+'abcabcabc' "b" 1 7 3
+'abcabcabc' "b", 2 4 7 2
+'abcabcabc' "b", 2, 8 4 7 2
+'abcabcabc' "b", -3 7 7 1
+'abcabcabc' "b", -3, -1 7 7 1
+'abcabcabc' "b", 20 -1 -1 0
+'abcabcabc' "b", 0, 1 -1 -1 0
+'abcabcabc' "b", 5, 3 -1 -1 0
+'abcabcabc' "", 0 0 9 10
+'abcabcabc' "", 3 3 9 7
+'abcabcabc' "", 9 9 9 1
+'abcabcabc' "", 10 -1 -1 0
+'abcabcabc' "", 2, 1 -1 -1 0
+'abcabcabc' "bc", 1 1 7 3
+'abcabcabc' "bca", 0, 5 1 1 1
+'abcabcabc' "a", 0, 100 0 6 3
+'abcabcabc' "b", 0, None 1 7 3
+'abcabcabc' "b", None, 5 1 4 2
+'äbcäbcäbc' "b" 1 7 3
+'äbcäbcäbc' "b", 2 4 7 2
+'äbcäbcäbc' "b", 2, 8 4 7 2
+'äbcäbcäbc' "b", -3 7 7 1
+'äbcäbcäbc' "b", -3, -1 7 7 1
+'äbcäbcäbc' "b", 20 -1 -1 0
+'äbcäbcäbc' "b", 0, 1 -1 -1 0
+'äbcäbcäbc' "b", 5, 3 -1 -1 0
+'äbcäbcäbc' "", 0 0 9 10
+'äbcäbcäbc' "", 3 3 9 7
+'äbcäbcäbc' "", 9 9 9 1
+'äbcäbcäbc' "", 10 -1 -1 0
+'äbcäbcäbc' "", 2, 1 -1 -1 0
+'äbcäbcäbc' "bc", 1 1 7 3
+'äbcäbcäbc' "bca", 0, 5 -1 -1 0
+'äbcäbcäbc' "a", 0, 100 -1 -1 0
+'äbcäbcäbc' "b", 0, None 1 7 3
+'äbcäbcäbc' "b", None, 5 1 4 2
+index "b" 1
+rindex "b" 7
+index "b", 2 4
+rindex "b", 2 7
+index "z" ValueError substring not found
+rindex "z" ValueError substring not found
+index "b", 5, 9 7
+rindex "b", 5, 9 7
+index "a", 1 3
+rindex "a", 1 6
+"a" True False
+"a", 0 True False
+"b", 1 True False
+"b", 1, 2 True True
+"bc", 1, 3 True True
+"c", -1 True True
+"c", 0, -1 False False
+"", 9 True True
+"", 10 False False
+"abc", 3 True True
+"abc", 0, 2 False False
+"", 0, 0 True True
+abcabcabc Xbcabcabc XbcXbcabc XbcXbcXbc XbcXbcXbc
+-a-bc -a-b-c- abc
+abcabc abcabcabc abcabcabc abcabc abcabcabc abcabcabc  

@@ -202,6 +202,56 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
         "i64",
         "$String$count",
     ),
+    // The `str.is*()` predicates, `swapcase` and `casefold`, `ljust`
+    // and its kin, and the methods that take a start and an end.
+    (
+        "zb_str_check",
+        &[("s", "str"), ("kind", "i64")],
+        "bool",
+        "$String$check",
+    ),
+    (
+        "zb_str_case_map",
+        &[("s", "str"), ("kind", "i64")],
+        "str",
+        "$String$case_map",
+    ),
+    (
+        "zb_str_justify_raw",
+        &[("s", "str"), ("w", "i64"), ("fill", "str"), ("mode", "i64")],
+        "str",
+        "$String$justify",
+    ),
+    (
+        "zb_str_find_range",
+        &[
+            ("s", "str"),
+            ("n", "str"),
+            ("a", "i64"),
+            ("b", "i64"),
+            ("mode", "i64"),
+        ],
+        "i64",
+        "$String$find_range",
+    ),
+    (
+        "zb_str_edge_range",
+        &[
+            ("s", "str"),
+            ("p", "str"),
+            ("a", "i64"),
+            ("b", "i64"),
+            ("ends", "i64"),
+        ],
+        "bool",
+        "$String$edge_range",
+    ),
+    (
+        "zb_str_replace_n",
+        &[("s", "str"), ("a", "str"), ("b", "str"), ("n", "i64")],
+        "str",
+        "$String$replace_n",
+    ),
     (
         "zb_str_parse_int",
         &[("s", "str")],
@@ -554,6 +604,84 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
                 vec![fatal("ValueError", text("substring not found"))],
             ),
             ret(at2.e()),
+        ],
+    ));
+    // The justifying methods take a fill of exactly one character.
+    let js = local("s", string());
+    let jw = local("w", i64());
+    let jfill = local("fill", string());
+    let jmode = local("mode", i64());
+    out.push(define(
+        "zb_str_justify",
+        &[&js, &jw, &jfill, &jmode],
+        string(),
+        vec![
+            when(
+                ne(chars_len(jfill.e()), int(1)),
+                vec![fatal(
+                    "TypeError",
+                    text("The fill character must be exactly one character long"),
+                )],
+            ),
+            ret(call(
+                "zb_str_justify_raw",
+                vec![js.e(), jw.e(), jfill.e(), jmode.e()],
+                string(),
+            )),
+        ],
+    ));
+    // `removeprefix` (`ends` 0) and `removesuffix` (1).
+    let ra = local("s", string());
+    let rp = local("p", string());
+    let re = local("ends", i64());
+    out.push(define(
+        "zb_str_remove_affix",
+        &[&ra, &rp, &re],
+        string(),
+        vec![
+            when(
+                and(
+                    eq(re.e(), int(0)),
+                    call("zb_str_startswith", vec![ra.e(), rp.e()], boolean()),
+                ),
+                vec![ret(substring(ra.e(), chars_len(rp.e()), chars_len(ra.e())))],
+            ),
+            when(
+                and(
+                    ne(re.e(), int(0)),
+                    call("zb_str_endswith", vec![ra.e(), rp.e()], boolean()),
+                ),
+                vec![ret(substring(
+                    ra.e(),
+                    int(0),
+                    sub(chars_len(ra.e()), chars_len(rp.e())),
+                ))],
+            ),
+            ret(ra.e()),
+        ],
+    ));
+    // `index` and `rindex` over a window: the search, or the ValueError.
+    let is = local("s", string());
+    let inn = local("n", string());
+    let ia = local("a", i64());
+    let ib = local("b", i64());
+    let imode = local("mode", i64());
+    let iat = local("at", i64());
+    out.push(define(
+        "zb_str_index_range",
+        &[&is, &inn, &ia, &ib, &imode],
+        i64(),
+        vec![
+            iat.decl(call(
+                "zb_str_find_range",
+                vec![is.e(), inn.e(), ia.e(), ib.e(), imode.e()],
+                i64(),
+            )),
+            when(
+                lt(iat.e(), int(0)),
+                vec![fatal("ValueError", text("substring not found"))],
+            ),
+            ret(iat.e()),
         ],
     ));
     // find: the character index of the first match, from the byte

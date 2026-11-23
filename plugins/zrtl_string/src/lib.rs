@@ -794,6 +794,272 @@ pub extern "C" fn string_reverse(s: StringPtr) -> StringPtr {
 }
 
 // ============================================================================
+// Python str methods
+// ============================================================================
+
+/// Whether `c` is a titlecase letter (category Lt).
+fn is_titlecase(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1C5 | 0x1C8 | 0x1CB | 0x1F2 | 0x1F88..=0x1F8F | 0x1F98..=0x1F9F | 0x1FA8..=0x1FAF
+            | 0x1FBC | 0x1FCC | 0x1FFC
+    )
+}
+
+/// Whether `c` is whitespace to Python's `str.isspace`.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
+/// The `str.is*()` predicates; `kind` picks one. Text without a
+/// character the predicate asks about is false, except `isascii`.
+#[no_mangle]
+pub extern "C" fn string_check(s: StringPtr, kind: i64) -> i32 {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let mut cased = false;
+    let mut chars = t.chars();
+    let result = match kind {
+        0 => !t.is_empty() && t.chars().all(char::is_alphabetic),
+        1 => !t.is_empty() && t.chars().all(char::is_alphanumeric),
+        // Digits: the ASCII ones, and what Unicode counts as numeric.
+        2..=4 => {
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric()))
+        }
+        5 => !t.is_empty() && t.chars().all(is_py_space),
+        6 => {
+            let no_lower = !t.chars().any(|c| c.is_lowercase() || is_titlecase(c));
+            cased = t.chars().any(char::is_uppercase);
+            no_lower && cased
+        }
+        7 => {
+            let no_upper = !t.chars().any(|c| c.is_uppercase() || is_titlecase(c));
+            cased = t.chars().any(char::is_lowercase);
+            no_upper && cased
+        }
+        8 => {
+            // Uppercase follows only uncased text, lowercase only cased.
+            let mut previous_cased = false;
+            let mut ok = true;
+            for c in t.chars() {
+                if c.is_uppercase() || is_titlecase(c) {
+                    if previous_cased {
+                        ok = false;
+                        break;
+                    }
+                    previous_cased = true;
+                    cased = true;
+                } else if c.is_lowercase() {
+                    if !previous_cased {
+                        ok = false;
+                        break;
+                    }
+                    cased = true;
+                } else {
+                    previous_cased = false;
+                }
+            }
+            ok && cased
+        }
+        9 => t.is_ascii(),
+        10 => match chars.next() {
+            Some(first) => {
+                (first == '_' || first.is_alphabetic())
+                    && chars.all(|c| c == '_' || c.is_alphanumeric())
+            }
+            None => false,
+        },
+        _ => false,
+    };
+    result as i32
+}
+
+/// `str.swapcase` (`kind` 0) and `str.casefold` (`kind` 1).
+#[no_mangle]
+pub extern "C" fn string_case_map(s: StringPtr, kind: i64) -> StringPtr {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let mut out = String::with_capacity(t.len());
+    for c in t.chars() {
+        if kind == 0 {
+            if c.is_lowercase() {
+                out.extend(c.to_uppercase());
+            } else if c.is_uppercase() {
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+        } else if c == 'ß' {
+            out.push_str("ss");
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    string_new(&out)
+}
+
+/// `str.ljust` (`mode` 0), `rjust` (1), `center` (2) and `zfill` (3) to
+/// `width` characters; `fill` is one character.
+#[no_mangle]
+pub extern "C" fn string_justify(
+    s: StringPtr,
+    width: i64,
+    fill: StringPtr,
+    mode: i64,
+) -> StringPtr {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let len = t.chars().count() as i64;
+    if width <= len {
+        return string_new(t);
+    }
+    let pad = (width - len) as usize;
+    let fill = unsafe { string_as_str(fill) }
+        .and_then(|f| f.chars().next())
+        .unwrap_or(' ');
+    let fills = |n: usize| std::iter::repeat(fill).take(n).collect::<String>();
+    let out = match mode {
+        0 => format!("{t}{}", fills(pad)),
+        1 => format!("{}{t}", fills(pad)),
+        2 => {
+            // Python puts the odd fill on the left when the width is odd.
+            let left = pad / 2 + (pad & width as usize & 1);
+            format!("{}{t}{}", fills(left), fills(pad - left))
+        }
+        _ => match t.chars().next() {
+            Some(sign @ ('+' | '-')) => format!("{sign}{}{}", "0".repeat(pad), &t[1..]),
+            _ => format!("{}{t}", "0".repeat(pad)),
+        },
+    };
+    string_new(&out)
+}
+
+/// The bounds `start..end` of a character window of `len` characters, as
+/// a slice clamps them; `end` is `i64::MAX` when it was not given.
+fn clamp_window(len: i64, start: i64, end: i64) -> (i64, i64) {
+    let start = if start < 0 {
+        (start + len).max(0)
+    } else {
+        start
+    };
+    let end = if end < 0 {
+        (end + len).max(0)
+    } else {
+        end.min(len)
+    };
+    (start, end)
+}
+
+/// The byte offset of the `n`th character of `t`.
+fn byte_of_char(t: &str, n: i64) -> usize {
+    if t.is_ascii() {
+        return n as usize;
+    }
+    t.char_indices().nth(n as usize).map_or(t.len(), |(b, _)| b)
+}
+
+/// `str.find` (`mode` 0), `rfind` (1) and `count` (2) over the window
+/// `start..end` of characters: the character index of the match, -1 for
+/// none, or the number of matches.
+#[no_mangle]
+pub extern "C" fn string_find_range(
+    s: StringPtr,
+    sub: StringPtr,
+    start: i64,
+    end: i64,
+    mode: i64,
+) -> i64 {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let n = unsafe { string_as_str(sub) }.unwrap_or("");
+    let len = if t.is_ascii() {
+        t.len() as i64
+    } else {
+        t.chars().count() as i64
+    };
+    let (start, end) = clamp_window(len, start, end);
+    let missing = if mode == 2 { 0 } else { -1 };
+    if start > len || end < start {
+        return missing;
+    }
+    let window = &t[byte_of_char(t, start)..byte_of_char(t, end)];
+    match mode {
+        2 => {
+            if n.is_empty() {
+                end - start + 1
+            } else {
+                window.matches(n).count() as i64
+            }
+        }
+        _ => {
+            let found = if mode == 0 {
+                window.find(n)
+            } else {
+                window.rfind(n)
+            };
+            match found {
+                Some(b) => {
+                    let before = &window[..b];
+                    start
+                        + if before.is_ascii() {
+                            before.len()
+                        } else {
+                            before.chars().count()
+                        } as i64
+                }
+                None => -1,
+            }
+        }
+    }
+}
+
+/// `str.startswith` (`ends` 0) and `endswith` (1) over the window
+/// `start..end` of characters.
+#[no_mangle]
+pub extern "C" fn string_edge_range(
+    s: StringPtr,
+    affix: StringPtr,
+    start: i64,
+    end: i64,
+    ends: i64,
+) -> i32 {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let a = unsafe { string_as_str(affix) }.unwrap_or("");
+    let len = if t.is_ascii() {
+        t.len() as i64
+    } else {
+        t.chars().count() as i64
+    };
+    let (start, end) = clamp_window(len, start, end);
+    if start > len || end < start {
+        return 0;
+    }
+    let window = &t[byte_of_char(t, start)..byte_of_char(t, end)];
+    (if ends == 0 {
+        window.starts_with(a)
+    } else {
+        window.ends_with(a)
+    }) as i32
+}
+
+/// `str.replace(from, to, count)`: the first `count` matches, all of
+/// them when `count` is negative.
+#[no_mangle]
+pub extern "C" fn string_replace_n(
+    s: StringPtr,
+    from: StringPtr,
+    to: StringPtr,
+    count: i64,
+) -> StringPtr {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let f = unsafe { string_as_str(from) }.unwrap_or("");
+    let r = unsafe { string_as_str(to) }.unwrap_or("");
+    if count < 0 {
+        string_new(&t.replace(f, r))
+    } else {
+        string_new(&t.replacen(f, r, count as usize))
+    }
+}
+
+// ============================================================================
 // Plugin Export
 // ============================================================================
 
@@ -851,6 +1117,14 @@ zrtl_plugin! {
         ("$String$from_char_code", string_from_char_code),
         ("$String$split", string_split),
         ("$String$lines", string_lines),
+
+        // Python str methods
+        ("$String$check", string_check),
+        ("$String$case_map", string_case_map),
+        ("$String$justify", string_justify),
+        ("$String$find_range", string_find_range),
+        ("$String$edge_range", string_edge_range),
+        ("$String$replace_n", string_replace_n),
 
         // Padding
         ("$String$pad_start", string_pad_start),

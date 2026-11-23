@@ -73,6 +73,17 @@ Provides comprehensive string operations including concatenation, case conversio
 | `$String$pad_start` | `(StringPtr, i64, StringPtr) -> StringPtr` | Pad on left to target length |
 | `$String$pad_end` | `(StringPtr, i64, StringPtr) -> StringPtr` | Pad on right to target length |
 
+### Python str methods
+
+| Symbol | Signature | Description |
+|--------|-----------|-------------|
+| `$String$check` | `(StringPtr, i64) -> i32` | An `is*` predicate: alpha, alnum, digit, decimal, numeric, space, upper, lower, title, ascii, identifier |
+| `$String$case_map` | `(StringPtr, i64) -> StringPtr` | `swapcase` (0) or `casefold` (1) |
+| `$String$justify` | `(StringPtr, i64, StringPtr, i64) -> StringPtr` | `ljust`, `rjust`, `center` or `zfill` to a width |
+| `$String$find_range` | `(StringPtr, StringPtr, i64, i64, i64) -> i64` | `find`, `rfind` or `count` over a character window |
+| `$String$edge_range` | `(StringPtr, StringPtr, i64, i64, i64) -> i32` | `startswith` or `endswith` over a character window |
+| `$String$replace_n` | `(StringPtr, StringPtr, StringPtr, i64) -> StringPtr` | Replace the first n matches, all when n is negative |
+
 ### Parsing
 
 | Symbol | Signature | Description |

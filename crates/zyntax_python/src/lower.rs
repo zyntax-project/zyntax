@@ -11047,6 +11047,113 @@ impl<'m> Lowerer<'m> {
                         let items = self.coerce(lowered.pop().unwrap(), Ty::List(Elem::Str));
                         call("zb_str_join", vec![s, items], Ty::Str, span)
                     }
+                    (
+                        "isalpha" | "isalnum" | "isdigit" | "isdecimal" | "isnumeric" | "isspace"
+                        | "isupper" | "islower" | "istitle" | "isascii" | "isidentifier",
+                        0,
+                    ) => {
+                        const KINDS: [&str; 11] = [
+                            "isalpha",
+                            "isalnum",
+                            "isdigit",
+                            "isdecimal",
+                            "isnumeric",
+                            "isspace",
+                            "isupper",
+                            "islower",
+                            "istitle",
+                            "isascii",
+                            "isidentifier",
+                        ];
+                        let kind = KINDS.iter().position(|k| *k == name).unwrap_or(0);
+                        call(
+                            "zb_str_check",
+                            vec![s, int_lit(kind as i64, span)],
+                            Ty::Bool,
+                            span,
+                        )
+                    }
+                    ("swapcase" | "casefold", 0) => {
+                        let kind = i64::from(name == "casefold");
+                        call(
+                            "zb_str_case_map",
+                            vec![s, int_lit(kind, span)],
+                            Ty::Str,
+                            span,
+                        )
+                    }
+                    ("ljust" | "rjust" | "center", 1 | 2) | ("zfill", 1) => {
+                        let mode = ["ljust", "rjust", "center", "zfill"]
+                            .iter()
+                            .position(|m| *m == name)
+                            .unwrap_or(0);
+                        let width = self.coerce(lowered.remove(0), Ty::Int);
+                        let fill = match lowered.pop() {
+                            Some(f) => self.coerce(f, Ty::Str),
+                            None if mode == 3 => str_lit("0", span),
+                            None => str_lit(" ", span),
+                        };
+                        call(
+                            "zb_str_justify",
+                            vec![s, width, fill, int_lit(mode as i64, span)],
+                            Ty::Str,
+                            span,
+                        )
+                    }
+                    ("removeprefix" | "removesuffix", 1) => {
+                        let affix = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        let ends = i64::from(name == "removesuffix");
+                        call(
+                            "zb_str_remove_affix",
+                            vec![s, affix, int_lit(ends, span)],
+                            Ty::Str,
+                            span,
+                        )
+                    }
+                    // Searches over a window of the string: the sought
+                    // text, then where the window starts and ends.
+                    (
+                        "find" | "rfind" | "index" | "rindex" | "count" | "startswith" | "endswith",
+                        1..=3,
+                    ) if !(lowered.len() == 1 && matches!(name, "find" | "index" | "count")) => {
+                        let mut it = lowered.drain(..);
+                        let needle = self.coerce(it.next().unwrap(), Ty::Str);
+                        let bounds: Vec<Val> = it.collect();
+                        let bound = |this: &mut Self, at: usize, none: i64| match bounds.get(at) {
+                            Some(v) if !matches!(args[at + 1], py::Expr::NoneLiteral(_)) => {
+                                this.coerce(v.clone(), Ty::Int)
+                            }
+                            _ => int_lit(none, span),
+                        };
+                        let from = bound(self, 0, 0);
+                        let to = bound(self, 1, i64::MAX);
+                        let (f, mode, result) = match name {
+                            "find" => ("zb_str_find_range", 0, Ty::Int),
+                            "rfind" => ("zb_str_find_range", 1, Ty::Int),
+                            "count" => ("zb_str_find_range", 2, Ty::Int),
+                            "index" => ("zb_str_index_range", 0, Ty::Int),
+                            "rindex" => ("zb_str_index_range", 1, Ty::Int),
+                            "startswith" => ("zb_str_edge_range", 0, Ty::Bool),
+                            _ => ("zb_str_edge_range", 1, Ty::Bool),
+                        };
+                        let node = call(
+                            f,
+                            vec![s, needle, from, to, int_lit(mode, span)],
+                            result,
+                            span,
+                        );
+                        if f == "zb_str_index_range" {
+                            let v = Val { node, ty: result };
+                            return Ok(self.guard(v, span));
+                        }
+                        node
+                    }
+                    ("replace", 3) => {
+                        let count = self.coerce(lowered.pop().unwrap(), Ty::Int);
+                        let b = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        call("zb_str_replace_n", vec![s, a, b, count], Ty::Str, span)
+                    }
                     // A string is its UTF-8 already; any other encoding
                     // is refused below.
                     ("encode", 0) => s,
