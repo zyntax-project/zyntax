@@ -2268,6 +2268,16 @@ impl<'m> Lowerer<'m> {
             || self.sig.params.iter().any(|(p, _)| p == name)
     }
 
+    /// Whether nothing binds `name` here: no variable, function, class,
+    /// builtin or import.
+    fn is_unbound(&self, name: &str) -> bool {
+        !self.is_visible(name)
+            && !self.module.funcs.contains_key(name)
+            && !self.module.class_index.contains_key(name)
+            && !types::is_python_builtin(name)
+            && self.module.imported_name(name).is_none()
+    }
+
     /// Whether `name` here is the module's variable rather than a local.
     fn is_global(&self, name: &str) -> bool {
         !self.comp_symbols.contains_key(name)
@@ -8576,11 +8586,7 @@ impl<'m> Lowerer<'m> {
                 self.class_value(k, span)?
             }
             // A name nothing binds: a NameError where it is read.
-            py::Expr::Name(n)
-                if !self.is_visible(n.id.as_str())
-                    && !self.module.funcs.contains_key(n.id.as_str())
-                    && !self.module.class_index.contains_key(n.id.as_str()) =>
-            {
+            py::Expr::Name(n) if self.is_unbound(n.id.as_str()) => {
                 let message = format!("name '{}' is not defined", n.id);
                 let node = self.raised_value(Vec::new(), "NameError", &message, ty, span);
                 Val { node, ty }
@@ -12536,6 +12542,15 @@ impl<'m> Lowerer<'m> {
                 }
                 _ => {}
             }
+        }
+        // A call to a name nothing binds raises where the name is read,
+        // before the arguments are.
+        if let py::Expr::Name(n) = &*c.func
+            && self.is_unbound(n.id.as_str())
+        {
+            let message = format!("name '{}' is not defined", n.id);
+            let node = self.raised_value(Vec::new(), "NameError", &message, ty, span);
+            return Ok(Val { node, ty });
         }
         unsupported(format!("calling `{}`", types::expr_kind(&c.func)), c)
     }
