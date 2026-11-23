@@ -1,0 +1,6 @@
+NameError name 'time' is not defined
+NameError name 'nosuch' is not defined
+NameError name 'missing_name' is not defined
+after
+AttributeError module 'math' has no attribute 'nope'
+5 True

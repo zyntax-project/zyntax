@@ -2260,6 +2260,14 @@ impl<'m> Lowerer<'m> {
             .unwrap_or(Ty::Object)
     }
 
+    /// Whether `name` is a variable this body can read: any kind of
+    /// variable, or a parameter.
+    fn is_visible(&self, name: &str) -> bool {
+        self.is_variable(name)
+            || self.bound.contains(&intern(name))
+            || self.sig.params.iter().any(|(p, _)| p == name)
+    }
+
     /// Whether `name` here is the module's variable rather than a local.
     fn is_global(&self, name: &str) -> bool {
         !self.comp_symbols.contains_key(name)
@@ -8567,6 +8575,16 @@ impl<'m> Lowerer<'m> {
             {
                 self.class_value(k, span)?
             }
+            // A name nothing binds: a NameError where it is read.
+            py::Expr::Name(n)
+                if !self.is_visible(n.id.as_str())
+                    && !self.module.funcs.contains_key(n.id.as_str())
+                    && !self.module.class_index.contains_key(n.id.as_str()) =>
+            {
+                let message = format!("name '{}' is not defined", n.id);
+                let node = self.raised_value(Vec::new(), "NameError", &message, ty, span);
+                Val { node, ty }
+            }
             py::Expr::Name(n) => {
                 let name = self.local_symbol(n.id.as_str());
                 // A number a test has shown is not None is held as the
@@ -8601,6 +8619,21 @@ impl<'m> Lowerer<'m> {
                 if let Some(k) = self.module.class_of_expr(&a.value) {
                     let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
                     return Ok(self.class_attr_read(&attr, span));
+                }
+                // A name the imported module does not have.
+                if let py::Expr::Name(m) = &*a.value
+                    && !self.is_variable(m.id.as_str())
+                    && let Some(module) = self.module.imports.get(m.id.as_str())
+                    && stdlib::is_known(module)
+                    && !matches!(module.as_str(), "os" | "typing" | "__future__")
+                    && self
+                        .module
+                        .module_member(m.id.as_str(), a.attr.as_str())
+                        .is_none()
+                {
+                    let message = format!("module '{module}' has no attribute '{}'", a.attr);
+                    let node = self.raised_value(Vec::new(), "AttributeError", &message, ty, span);
+                    return Ok(Val { node, ty });
                 }
                 // `type(v).__name__`: `type(v)` evaluates to the name.
                 if a.attr.as_str() == "__name__"
@@ -11380,7 +11413,11 @@ impl<'m> Lowerer<'m> {
                         let callee = self.expr(&c.func)?;
                         return self.host_call(callee, &signature, args, keywords, c, (ty, span));
                     }
-                    Ty::Bound(k) => {
+                    // The receiver is read where the binding is; a body
+                    // it is not visible in calls through the record.
+                    Ty::Bound(k)
+                        if self.is_visible(self.module.bounds[k as usize].receiver.id.as_str()) =>
+                    {
                         let info = self.module.bounds[k as usize].clone();
                         let receiver = self.expr(&py::Expr::Name(info.receiver))?;
                         match receiver.ty {
