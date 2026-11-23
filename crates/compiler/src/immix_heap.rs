@@ -1328,6 +1328,23 @@ struct Marker<'h> {
     large_span: usize,
 }
 
+/// Starts loading the line at `p`. A hint: any address is safe.
+#[inline(always)]
+fn prefetch(p: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch never faults.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
 impl Marker<'_> {
     fn scan(&mut self, lo: usize, hi: usize) {
         let (base, span) = (self.h.base, self.h.span);
@@ -1338,6 +1355,8 @@ impl Marker<'_> {
             // can only make a word stale.
             let w = unsafe { std::ptr::read_volatile(p as *const usize) };
             if w.wrapping_sub(base) < span {
+                // The object's line loads while its table entry is read.
+                prefetch(w);
                 self.consider_heap(w);
             } else if w.wrapping_sub(large_lo) < large_span {
                 self.consider_large(w);
@@ -1495,9 +1514,24 @@ impl Marker<'_> {
         }
     }
 
+    /// Scans the grey objects a few at a time, so the loads of
+    /// independent chains are in flight together.
     fn drain(&mut self) {
-        while let Some((s, bytes)) = self.stack.pop() {
-            self.scan(s, s + bytes);
+        const WINDOW: usize = 16;
+        let mut win = [(0usize, 0usize); WINDOW];
+        loop {
+            let mut n = 0;
+            while n < WINDOW {
+                let Some(e) = self.stack.pop() else { break };
+                win[n] = e;
+                n += 1;
+            }
+            if n == 0 {
+                return;
+            }
+            for &(s, bytes) in &win[..n] {
+                self.scan(s, s + bytes);
+            }
         }
     }
 }
@@ -1797,6 +1831,43 @@ mod tests {
         );
         assert!(h.containing(dead_medium).is_none());
         assert!(h.containing(dead).is_none() || h.containing(dead).map(|x| x.0) != Some(dead));
+    }
+
+    #[test]
+    fn a_fan_out_wider_than_the_scan_window_keeps_every_child_and_its_chain() {
+        let h = heap();
+        const CHILDREN: usize = 100;
+        const DEPTH: usize = 6;
+        let parent = make(&h, CHILDREN * 8);
+        let mut tails = Vec::new();
+        for i in 0..CHILDREN {
+            // A chain of `DEPTH` nodes, each holding the next.
+            let mut next = 0usize;
+            for d in 0..DEPTH {
+                let node = make(&h, 16);
+                // SAFETY: the node is 16 bytes.
+                unsafe {
+                    *(node as *mut usize) = next;
+                    *(node as *mut usize).add(1) = i * DEPTH + d;
+                }
+                next = node;
+            }
+            // SAFETY: the parent holds `CHILDREN` words.
+            unsafe { *(parent as *mut usize).add(i) = next };
+            tails.push(next);
+        }
+        let mut roots = vec![parent];
+        root(&h, &mut roots);
+        collect(&h);
+        for head in tails {
+            let mut at = head;
+            for _ in 0..DEPTH {
+                assert!(h.containing(at).is_some_and(|(s, _)| s == at));
+                // SAFETY: a live 16-byte node.
+                at = unsafe { *(at as *const usize) };
+            }
+            assert_eq!(at, 0);
+        }
     }
 
     #[test]
