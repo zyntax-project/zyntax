@@ -1,0 +1,12 @@
+list TypeError unhashable type: 'list'
+dict TypeError unhashable type: 'dict'
+set TypeError unhashable type: 'set'
+frozenset True
+dynamic list TypeError unhashable type: 'list'
+dynamic str True
+class hash 7
+class eq only TypeError unhashable type: 'Q'
+tuple of list TypeError unhashable type: 'list'
+float 2
+equal values True
+name 5

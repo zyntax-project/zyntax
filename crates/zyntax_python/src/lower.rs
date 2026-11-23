@@ -11877,6 +11877,16 @@ impl<'m> Lowerer<'m> {
                     };
                     return Ok(self.guard(ok, span));
                 }
+                // `hash(x)`: the hash a table keys by.
+                "hash" if args.len() == 1 => {
+                    let v = self.expr(&args[0])?;
+                    let o = self.coerce(v, Ty::Object);
+                    let ok = Val {
+                        node: call("zb_hash_builtin", vec![o], Ty::Int, span),
+                        ty: Ty::Int,
+                    };
+                    return Ok(self.guard(ok, span));
+                }
                 "chr" if args.len() == 1 => {
                     let v = self.expr(&args[0])?;
                     let code = self.coerce(v, Ty::Int);

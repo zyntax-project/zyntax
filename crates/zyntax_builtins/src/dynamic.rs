@@ -1297,6 +1297,18 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(int(0)),
         ],
     ));
+    // `hash(x)`: the value a table uses, but never -1, which marks an
+    // error to a C caller.
+    d.push(define(
+        "zb_hash_builtin",
+        &[&x],
+        i64(),
+        vec![
+            h.decl(call("zb_any_hash", vec![x.e()], i64())),
+            when(eq(h.e(), int(-1)), vec![ret(int(-2))]),
+            ret(h.e()),
+        ],
+    ));
     d.push(define(
         "zb_any_lt",
         &[&a, &b],
