@@ -8317,7 +8317,10 @@ pub(crate) fn isinstance_of_builtin(name: &str, ty: Ty) -> Option<bool> {
         ("float", Ty::Float) => true,
         ("str", Ty::Str) => true,
         ("bytes", Ty::Bytes) => true,
-        ("list", Ty::List(_)) => true,
+        // An array is a list with an array element kind, and a list of
+        // its own in Python's eyes.
+        ("list", Ty::List(e)) => !matches!(e, Elem::Array(_)),
+        ("array", Ty::List(Elem::Array(_))) => true,
         ("tuple", Ty::Tuple(_)) => true,
         ("dict", Ty::Dict(_)) => true,
         ("set", Ty::Set(k)) => !set_shape(k).1,

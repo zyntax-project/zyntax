@@ -1,0 +1,7 @@
+B True True
+ValueError True False
+KeyError False True
+ValueError True
+ValueError True
+0
+ValueError

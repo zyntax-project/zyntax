@@ -8597,6 +8597,16 @@ impl<'m> Lowerer<'m> {
                     let attr = self.class_attr_of(k, a.attr.as_str(), span)?;
                     return Ok(self.class_attr_read(&attr, span));
                 }
+                // `type(v).__name__`: `type(v)` evaluates to the name.
+                if a.attr.as_str() == "__name__"
+                    && let py::Expr::Call(c) = &*a.value
+                    && types::is_name(&c.func, "type")
+                    && c.arguments.args.len() == 1
+                    && c.arguments.keywords.is_empty()
+                    && !self.is_variable("type")
+                {
+                    return self.expr(&a.value);
+                }
                 let object = self.expr(&a.value)?;
                 let set = self.receiver_set_of(&a.value, object.ty);
                 self.attribute_via(object, a.attr.as_str(), set, span)?
@@ -12406,21 +12416,7 @@ impl<'m> Lowerer<'m> {
                 }
                 "type" if args.len() == 1 => {
                     let v = self.expr(&args[0])?;
-                    let node = match v.ty {
-                        Ty::Int => str_lit("int", span),
-                        Ty::Float => str_lit("float", span),
-                        Ty::Bool => str_lit("bool", span),
-                        Ty::Str => str_lit("str", span),
-                        Ty::Bytes => str_lit("bytes", span),
-                        Ty::None => str_lit("NoneType", span),
-                        Ty::List(_) => str_lit("list", span),
-                        Ty::Tuple(_) => str_lit("tuple", span),
-                        Ty::Dict(_) => str_lit("dict", span),
-                        Ty::Set(_) if tables::frozen(v.ty) => str_lit("frozenset", span),
-                        Ty::Set(_) => str_lit("set", span),
-                        Ty::Class(k) => str_lit(&self.module.classes[k as usize].name, span),
-                        _ => call("zb_any_type", vec![v.node], Ty::Str, span),
-                    };
+                    let node = self.type_name_of(&v, span);
                     return Ok(Val { node, ty: Ty::Str });
                 }
                 "abs" if args.len() == 1 && ty == Ty::Object => {
@@ -13412,17 +13408,26 @@ impl<'m> Lowerer<'m> {
         if let Some(answer) = types::isinstance_of_builtin(name, v.ty) {
             return Ok(lit(answer));
         }
-        let type_name = call("zb_any_type", vec![v.node], Ty::Str, span);
         let mut pre = Vec::new();
+        let value = self.hold(v, &mut pre, span);
         let held = self.hold(
             Val {
-                node: type_name,
+                node: call("zb_any_type", vec![value.node.clone()], Ty::Str, span),
                 ty: Ty::Str,
             },
             &mut pre,
             span,
         );
         self.hoisted.extend(pre);
+        // A boxed array is named a list; its kind is one of the array
+        // kinds, which no list has.
+        let is_array = binary(
+            BinaryOp::Ge,
+            call("zb_any_kind", vec![value.node], Ty::Int, span),
+            int_lit(zyntax_builtins::ARRAY_KIND_BASE, span),
+            Ty::Bool,
+            span,
+        );
         let same = |t: &str| {
             call(
                 "zb_str_eq",
@@ -13434,6 +13439,21 @@ impl<'m> Lowerer<'m> {
         let node = match name {
             // A bool is an int too.
             "int" => binary(BinaryOp::Or, same("int"), same("bool"), Ty::Bool, span),
+            "list" => binary(
+                BinaryOp::And,
+                same("list"),
+                node(
+                    TypedExpression::Unary(TypedUnary {
+                        op: UnaryOp::Not,
+                        operand: Box::new(is_array.clone()),
+                    }),
+                    Ty::Bool,
+                    span,
+                ),
+                Ty::Bool,
+                span,
+            ),
+            "array" => binary(BinaryOp::And, same("list"), is_array, Ty::Bool, span),
             other => same(other),
         };
         Ok(Val { node, ty: Ty::Bool })
@@ -15953,12 +15973,16 @@ impl<'m> Lowerer<'m> {
             Ty::Str => "str",
             Ty::Bytes => "bytes",
             Ty::None => "NoneType",
+            Ty::List(Elem::Array(_)) => "array",
             Ty::List(_) => "list",
             Ty::Tuple(_) => "tuple",
             Ty::Dict(_) => "dict",
             Ty::Set(_) if tables::frozen(v.ty) => "frozenset",
             Ty::Set(_) => "set",
-            Ty::Class(k) => return str_lit(&self.module.classes[k as usize].name, span),
+            // A class with subclasses holds an instance of any of them.
+            Ty::Class(k) if self.module.classes[k as usize].descendants <= 1 => {
+                return str_lit(&self.module.classes[k as usize].name, span);
+            }
             _ => {
                 let boxed = self.coerce(v.clone(), Ty::Object);
                 return call("zb_any_type", vec![boxed], Ty::Str, span);
