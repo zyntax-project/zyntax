@@ -220,6 +220,8 @@ pub const FILE_TAG: i64 = ((LIST_KINDS + 6) << 8) | 255;
 /// The box tag of a foreign object: a value of the program that embeds
 /// the runtime, reached through it (see [`foreign`]).
 pub const FOREIGN_TAG: i64 = ((LIST_KINDS + 7) << 8) | 255;
+/// The box tag of a generator: a record of its fiber and its type.
+pub const GEN_TAG: i64 = ((LIST_KINDS + 8) << 8) | 255;
 /// Kinds from here up are instances of a frontend's classes, in the
 /// order the frontend numbers them.
 pub const INSTANCE_KIND_BASE: i64 = 32;

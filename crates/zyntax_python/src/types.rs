@@ -1140,6 +1140,11 @@ pub(crate) fn gen_of(ty: Ty) -> Ty {
     })
 }
 
+/// How many generator types past the first the program has.
+pub(crate) fn gen_type_count() -> u16 {
+    GEN_YIELDS.with(|t| t.borrow().len() as u16)
+}
+
 /// What the generator type `k` yields.
 pub(crate) fn gen_yield(k: u16) -> Ty {
     match k {

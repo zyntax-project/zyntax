@@ -2054,6 +2054,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         box_hook(module, span),
         unbox_hook(module, span),
     ];
+    out.push(gen_items_hook(module, span));
     out.extend(shaped_hooks(module, span));
     out.extend(keyed_hooks(module, span));
     out
@@ -2804,6 +2805,63 @@ fn set_operation_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
 /// shape: its elements as dynamic values, one element, a store and an
 /// append. Each dispatches on the box's kind to the list functions
 /// generated for the shape; a kind no list here has is a type error.
+/// `zb_hook_gen_items(x)`: the values of a boxed generator, run to
+/// exhaustion, by the generator type its record names.
+fn gen_items_hook(module: &Module, span: Span) -> TypedFunction {
+    let mut lowerer = scratch(module);
+    let objects = Ty::List(Elem::Object);
+    let record = call(
+        "zb_gen_unbox",
+        vec![var(intern("x"), Ty::Object, span)],
+        objects,
+        span,
+    );
+    let mut statements = vec![let_("rec", objects, record, span)];
+    let rec = var(intern("rec"), objects, span);
+    let at = |i: i64| {
+        call(
+            "zb_list_get_unchecked_any",
+            vec![rec.clone(), int_lit(i, span)],
+            Ty::Object,
+            span,
+        )
+    };
+    let kind = lowerer.coerce(
+        Val {
+            node: at(1),
+            ty: Ty::Object,
+        },
+        Ty::Int,
+    );
+    statements.append(&mut lowerer.hoisted);
+    statements.push(let_("k", Ty::Int, kind, span));
+    for k in 0..=crate::types::gen_type_count() {
+        let items = lowerer.generator_to_list(cast(at(0), Ty::Gen(k), span), k, span);
+        let mut then = std::mem::take(&mut lowerer.hoisted);
+        then.push(ret(items, span));
+        statements.push(when(
+            binary(
+                BinaryOp::Eq,
+                var(intern("k"), Ty::Int, span),
+                int_lit(i64::from(k), span),
+                Ty::Bool,
+                span,
+            ),
+            then,
+            span,
+        ));
+    }
+    let none = lowerer.list_of(Vec::new(), Elem::Object, span);
+    statements.push(ret(none, span));
+    function(
+        "zb_hook_gen_items",
+        vec![param("x", Ty::Object, span)],
+        objects,
+        statements,
+        span,
+    )
+}
+
 fn shaped_hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
     use crate::types::Elem;
     let x = var(intern("x"), Ty::Object, span);

@@ -171,6 +171,12 @@ pub(super) fn instance_hooks(t: &Types) -> Vec<Decl> {
     let i = local("i", i64());
     let v = local("v", any());
     d.push(define(
+        "zb_hook_gen_items",
+        &[&x],
+        t.anys(),
+        vec![ret(list(Vec::new(), t.anys()))],
+    ));
+    d.push(define(
         "zb_hook_shaped_items",
         &[&x],
         t.anys(),

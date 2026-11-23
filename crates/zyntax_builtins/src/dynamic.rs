@@ -8,7 +8,8 @@ use crate::build::*;
 use crate::bytes::BYTES;
 use crate::foreign::is_foreign;
 use crate::{
-    DICT_TAG, FILE_TAG, FUNC_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG, list_of,
+    DICT_TAG, FILE_TAG, FUNC_TAG, GEN_TAG, INSTANCE_KIND_BASE, Kind, Policy, SET_TAG, TUPLE_TAG,
+    list_of,
 };
 use zyntax_typed_ast::TypeId;
 
@@ -850,6 +851,10 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                         vec![ret(text(names.set))],
                     ),
                     when(eq(kind(x.e()), int(FILE_TAG >> 8)), vec![ret(text("file"))]),
+                    when(
+                        eq(kind(x.e()), int(GEN_TAG >> 8)),
+                        vec![ret(text("generator"))],
+                    ),
                     when(is_keyed_dict(x.e()), vec![ret(text(names.dict))]),
                     when(
                         call("zb_any_is_keyed_frozen_set", vec![x.e()], boolean()),
@@ -2233,6 +2238,11 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             when(
                 eq(tag(x.e()), int(TUPLE_TAG)),
                 vec![ret(call("zb_unbox_tuple_raw", vec![x.e()], anys.clone()))],
+            ),
+            // A generator is run to exhaustion, by the frontend.
+            when(
+                eq(tag(x.e()), int(GEN_TAG)),
+                vec![ret(call("zb_hook_gen_items", vec![x.e()], anys.clone()))],
             ),
             cat.decl(category(x.e())),
             when(

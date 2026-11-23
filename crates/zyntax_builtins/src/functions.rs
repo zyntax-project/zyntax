@@ -6,7 +6,7 @@
 //! one, so a call through a value has one shape whatever it reaches.
 
 use crate::build::*;
-use crate::{CODE_TAG, FUNC_TAG, list_of};
+use crate::{CODE_TAG, FUNC_TAG, GEN_TAG, list_of};
 use zyntax_typed_ast::type_registry::{AsyncKind, CallingConvention, NullabilityKind, ParamInfo};
 use zyntax_typed_ast::{Type, TypeId};
 
@@ -108,6 +108,36 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             vec![code.e(), env.e(), int(0)],
             fiber_type(),
         ))],
+    ));
+
+    // A generator as a dynamic value: its fiber and its type in one
+    // record under the generator tag.
+    let gen_record = kept("rec", anys.clone());
+    d.push(define(
+        "zb_gen_box",
+        &[&gen_record],
+        any(),
+        vec![ret(call(
+            "zb_box_list_raw_any",
+            vec![gen_record.e(), int32(GEN_TAG as i32)],
+            any(),
+        ))],
+    ));
+    let gen_x = local("x", any());
+    d.push(define(
+        "zb_gen_unbox",
+        &[&gen_x],
+        anys.clone(),
+        vec![
+            when(
+                ne(
+                    cast(call("zb_box_tag", vec![gen_x.e()], i32()), i64()),
+                    int(GEN_TAG),
+                ),
+                vec![fatal("TypeError", text("expected a generator"))],
+            ),
+            ret(call("zb_unbox_list_raw_any", vec![gen_x.e()], anys.clone())),
+        ],
     ));
 
     // A record from a code address, an arity and the shared cells.

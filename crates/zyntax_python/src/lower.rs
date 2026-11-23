@@ -2969,6 +2969,39 @@ impl<'m> Lowerer<'m> {
                     checked.node
                 }
             }
+            // A generator held as a dynamic value is its fiber and its
+            // type in a record, which dynamic iteration runs.
+            (Ty::Gen(k), Ty::Object) => {
+                let fiber = Val {
+                    node: cast(v.node, Ty::Object, span),
+                    ty: Ty::Object,
+                };
+                let kind = Val {
+                    node: int_lit(i64::from(k), span),
+                    ty: Ty::Int,
+                };
+                let record = self.list_of(vec![fiber, kind], Elem::Object, span);
+                call("zb_gen_box", vec![record], Ty::Object, span)
+            }
+            (Ty::Object, Ty::Gen(_)) => {
+                let record = call("zb_gen_unbox", vec![v.node], Ty::List(Elem::Object), span);
+                let record = Val {
+                    node: record,
+                    ty: Ty::List(Elem::Object),
+                };
+                let record = if self.guards {
+                    self.guard(record, span)
+                } else {
+                    record
+                };
+                let fiber = call(
+                    "zb_list_get_unchecked_any",
+                    vec![record.node, int_lit(0, span)],
+                    Ty::Object,
+                    span,
+                );
+                cast(fiber, target, span)
+            }
             (Ty::File(_), Ty::File(_)) => v.node,
             (Ty::File(_), Ty::Object) => call("zb_file_box", vec![v.node], Ty::Object, span),
             (Ty::Object, Ty::File(_)) => {
@@ -13357,7 +13390,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// Every value a generator yields, as a list.
-    fn generator_to_list(&mut self, r#gen: Node, k: u16, span: Span) -> Node {
+    pub(crate) fn generator_to_list(&mut self, r#gen: Node, k: u16, span: Span) -> Node {
         let mut pre = Vec::new();
         let fresh = is_generator_start(&r#gen);
         let held = self.hold(
