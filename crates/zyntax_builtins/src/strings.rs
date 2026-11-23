@@ -202,6 +202,20 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
         "i64",
         "$String$count",
     ),
+    (
+        "zb_str_last_index_of",
+        &[("h", "str"), ("n", "str")],
+        "i64",
+        "$String$last_index_of",
+    ),
+    ("zb_str_reverse", &[("s", "str")], "str", "$String$reverse"),
+    ("zb_str_repr_py", &[("s", "str")], "str", "$String$repr_py"),
+    (
+        "zb_str_expandtabs",
+        &[("s", "str"), ("size", "i64")],
+        "str",
+        "$String$expand_tabs",
+    ),
     // The `str.is*()` predicates, `swapcase` and `casefold`, `ljust`
     // and its kin, and the methods that take a start and an end.
     (
@@ -516,27 +530,37 @@ pub(crate) fn declarations(policy: &Policy, list_type: zyntax_typed_ast::TypeId)
             escapes,
         )];
     }
-    let mut repr_body = vec![quote.decl(text(prefer))];
+    // Python's quoting and escapes come from the plugin.
     if policy.single_quotes {
-        // A single quote inside and no double quote flips the style.
-        repr_body.push(when(
-            and(
-                call("zb_str_contains", vec![s.e(), text("'")], boolean()),
-                not(call("zb_str_contains", vec![s.e(), text("\"")], boolean())),
-            ),
-            vec![quote.set(text(other))],
+        out.push(define(
+            "zb_str_repr",
+            &[&s],
+            string(),
+            vec![ret(call("zb_str_repr_py", vec![s.e()], string()))],
         ));
+    } else {
+        let mut repr_body = vec![quote.decl(text(prefer))];
+        if policy.single_quotes {
+            // A single quote inside and no double quote flips the style.
+            repr_body.push(when(
+                and(
+                    call("zb_str_contains", vec![s.e(), text("'")], boolean()),
+                    not(call("zb_str_contains", vec![s.e(), text("\"")], boolean())),
+                ),
+                vec![quote.set(text(other))],
+            ));
+        }
+        repr_body.push(pieces.decl(list(Vec::new(), strs.clone())));
+        repr_body.push(piece(quote.e()));
+        repr_body.push(chars.decl(char_list(s.e())));
+        repr_body.push(n.decl(mcall(chars.e(), "len", vec![], i64())));
+        let mut loop_body = vec![c.decl(idx(chars.e(), i.e(), string()))];
+        loop_body.extend(escapes);
+        repr_body.extend(for_range(&i, int(0), n.e(), loop_body));
+        repr_body.push(piece(quote.e()));
+        repr_body.push(ret(joined()));
+        out.push(define("zb_str_repr", &[&s], string(), repr_body));
     }
-    repr_body.push(pieces.decl(list(Vec::new(), strs.clone())));
-    repr_body.push(piece(quote.e()));
-    repr_body.push(chars.decl(char_list(s.e())));
-    repr_body.push(n.decl(mcall(chars.e(), "len", vec![], i64())));
-    let mut loop_body = vec![c.decl(idx(chars.e(), i.e(), string()))];
-    loop_body.extend(escapes);
-    repr_body.extend(for_range(&i, int(0), n.e(), loop_body));
-    repr_body.push(piece(quote.e()));
-    repr_body.push(ret(joined()));
-    out.push(define("zb_str_repr", &[&s], string(), repr_body));
 
     // Casing: capitalize the first character, or the first of every word.
     let c = local("c", string());

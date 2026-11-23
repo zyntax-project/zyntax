@@ -1,0 +1,48 @@
+'a\nb\r\nc\rd' ['a', 'b', 'c', 'd'] ['a\n', 'b\r\n', 'c\r', 'd'] ['a', 'b', 'c', 'd']
+'a\n\nb' ['a', '', 'b'] ['a\n', '\n', 'b'] ['a', '', 'b']
+'\n' [''] ['\n'] ['']
+'' [] [] []
+'abc' ['abc'] ['abc'] ['abc']
+'a\r\n' ['a'] ['a\r\n'] ['a']
+'x\ny\n' ['x', 'y'] ['x\n', 'y\n'] ['x', 'y']
+'\r\n\r\n' ['', ''] ['\r\n', '\r\n'] ['', '']
+'a,b,c' ',' ('a', ',', 'b,c') ('a,b', ',', 'c')
+'a,b,c' ',,' ('a,b,c', '', '') ('', '', 'a,b,c')
+'a,b,c' 'z' ('a,b,c', '', '') ('', '', 'a,b,c')
+'a,b,c' 'abc' ('a,b,c', '', '') ('', '', 'a,b,c')
+'a,b,c' 'ï' ('a,b,c', '', '') ('', '', 'a,b,c')
+'abc' ',' ('abc', '', '') ('', '', 'abc')
+'abc' ',,' ('abc', '', '') ('', '', 'abc')
+'abc' 'z' ('abc', '', '') ('', '', 'abc')
+'abc' 'abc' ('', 'abc', '') ('', 'abc', '')
+'abc' 'ï' ('abc', '', '') ('', '', 'abc')
+'' ',' ('', '', '') ('', '', '')
+'' ',,' ('', '', '') ('', '', '')
+'' 'z' ('', '', '') ('', '', '')
+'' 'abc' ('', '', '') ('', '', '')
+'' 'ï' ('', '', '') ('', '', '')
+'a,b,,c' ',' ('a', ',', 'b,,c') ('a,b,', ',', 'c')
+'a,b,,c' ',,' ('a,b', ',,', 'c') ('a,b', ',,', 'c')
+'a,b,,c' 'z' ('a,b,,c', '', '') ('', '', 'a,b,,c')
+'a,b,,c' 'abc' ('a,b,,c', '', '') ('', '', 'a,b,,c')
+'a,b,,c' 'ï' ('a,b,,c', '', '') ('', '', 'a,b,,c')
+'ünï,x' ',' ('ünï', ',', 'x') ('ünï', ',', 'x')
+'ünï,x' ',,' ('ünï,x', '', '') ('', '', 'ünï,x')
+'ünï,x' 'z' ('ünï,x', '', '') ('', '', 'ünï,x')
+'ünï,x' 'abc' ('ünï,x', '', '') ('', '', 'ünï,x')
+'ünï,x' 'ï' ('ün', 'ï', ',x') ('ün', 'ï', ',x')
+ValueError empty separator
+ValueError empty separator
+key = value=more
+key=value = more
+'a       b' 'ab' 'a b' 'a  b' 'a   b' 'ab'
+'ab      c       d' 'abcd' 'ab c d' 'ab c  d' 'ab  c   d' 'abcd'
+'        ' '' ' ' '   ' '    ' ''
+'a\nb       c' 'a\nbc' 'a\nb c' 'a\nb  c' 'a\nb   c' 'a\nbc'
+'abcdefgh        i' 'abcdefghi' 'abcdefgh i' 'abcdefgh i' 'abcdefgh    i' 'abcdefghi'
+'ü       b' 'üb' 'ü b' 'ü  b' 'ü   b' 'üb'
+True False
+False True
+False False
+True True
+True True

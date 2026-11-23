@@ -3095,77 +3095,87 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             i64(),
         )
     };
-    d.push(define(
-        "zb_str_splitlines",
-        &[&text_in],
-        strs.clone(),
-        vec![
-            chars.decl(list(Vec::new(), strs.clone())),
-            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
-            pos.decl(int(0)),
-            // The next `\n` and `\r` at or after `pos`, or -1 for none;
-            // each is searched for again only once `pos` has passed it.
-            nl.decl(find("\n", int(0))),
-            cr.decl(find("\r", int(0))),
-            while_(
-                lt(pos.e(), n.e()),
-                vec![
-                    when(
-                        and(ge(nl.e(), int(0)), lt(nl.e(), pos.e())),
-                        vec![nl.set(find("\n", pos.e()))],
-                    ),
-                    when(
-                        and(ge(cr.e(), int(0)), lt(cr.e(), pos.e())),
-                        vec![cr.set(find("\r", pos.e()))],
-                    ),
-                    cut.decl(nl.e()),
-                    when(
-                        and(
-                            ge(cr.e(), int(0)),
-                            or(lt(cut.e(), int(0)), lt(cr.e(), cut.e())),
+    for keep in [false, true] {
+        d.push(define(
+            if keep {
+                "zb_str_splitlines_keep"
+            } else {
+                "zb_str_splitlines"
+            },
+            &[&text_in],
+            strs.clone(),
+            vec![
+                chars.decl(list(Vec::new(), strs.clone())),
+                n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+                pos.decl(int(0)),
+                // The next `\n` and `\r` at or after `pos`, or -1 for none;
+                // each is searched for again only once `pos` has passed it.
+                nl.decl(find("\n", int(0))),
+                cr.decl(find("\r", int(0))),
+                while_(
+                    lt(pos.e(), n.e()),
+                    vec![
+                        when(
+                            and(ge(nl.e(), int(0)), lt(nl.e(), pos.e())),
+                            vec![nl.set(find("\n", pos.e()))],
                         ),
-                        vec![cut.set(cr.e())],
-                    ),
-                    if_(
-                        lt(cut.e(), int(0)),
-                        vec![
-                            expr(mcall(
-                                chars.e(),
-                                "push",
-                                vec![call(
-                                    "zb_str_bytes",
-                                    vec![text_in.e(), pos.e(), n.e()],
-                                    string(),
-                                )],
-                                unit(),
-                            )),
-                            pos.set(n.e()),
-                        ],
-                        vec![
-                            expr(mcall(
-                                chars.e(),
-                                "push",
-                                vec![call(
-                                    "zb_str_bytes",
-                                    vec![text_in.e(), pos.e(), cut.e()],
-                                    string(),
-                                )],
-                                unit(),
-                            )),
-                            after.decl(add(cut.e(), int(1))),
-                            // `\r\n` is one break.
-                            when(
-                                and(eq(cut.e(), cr.e()), eq(nl.e(), add(cr.e(), int(1)))),
-                                vec![after.set(add(cut.e(), int(2)))],
+                        when(
+                            and(ge(cr.e(), int(0)), lt(cr.e(), pos.e())),
+                            vec![cr.set(find("\r", pos.e()))],
+                        ),
+                        cut.decl(nl.e()),
+                        when(
+                            and(
+                                ge(cr.e(), int(0)),
+                                or(lt(cut.e(), int(0)), lt(cr.e(), cut.e())),
                             ),
-                            pos.set(after.e()),
-                        ],
-                    ),
-                ],
-            ),
-            ret(chars.e()),
-        ],
-    ));
+                            vec![cut.set(cr.e())],
+                        ),
+                        if_(
+                            lt(cut.e(), int(0)),
+                            vec![
+                                expr(mcall(
+                                    chars.e(),
+                                    "push",
+                                    vec![call(
+                                        "zb_str_bytes",
+                                        vec![text_in.e(), pos.e(), n.e()],
+                                        string(),
+                                    )],
+                                    unit(),
+                                )),
+                                pos.set(n.e()),
+                            ],
+                            vec![
+                                after.decl(add(cut.e(), int(1))),
+                                // `\r\n` is one break.
+                                when(
+                                    and(eq(cut.e(), cr.e()), eq(nl.e(), add(cr.e(), int(1)))),
+                                    vec![after.set(add(cut.e(), int(2)))],
+                                ),
+                                expr(mcall(
+                                    chars.e(),
+                                    "push",
+                                    vec![call(
+                                        "zb_str_bytes",
+                                        vec![
+                                            text_in.e(),
+                                            pos.e(),
+                                            if keep { after.e() } else { cut.e() },
+                                        ],
+                                        string(),
+                                    )],
+                                    unit(),
+                                )),
+                                pos.set(after.e()),
+                            ],
+                        ),
+                    ],
+                ),
+                ret(chars.e()),
+            ],
+        ));
+    }
     // split on runs of whitespace
     let c = local("c", string());
     let is_space = |c: Expr| call("zb_str_is_space", vec![c], boolean());
@@ -3173,16 +3183,7 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         "zb_str_is_space",
         &[&c],
         boolean(),
-        vec![ret(or(
-            or(
-                call("zb_str_eq", vec![c.e(), text(" ")], boolean()),
-                call("zb_str_eq", vec![c.e(), text("\t")], boolean()),
-            ),
-            or(
-                call("zb_str_eq", vec![c.e(), text("\n")], boolean()),
-                call("zb_str_eq", vec![c.e(), text("\r")], boolean()),
-            ),
-        ))],
+        vec![ret(call("zb_str_check", vec![c.e(), int(5)], boolean()))],
     ));
     // Words are the runs between spaces, cut out of the text by byte
     // offset once each ends.
@@ -3228,6 +3229,247 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     vec![byte_slice(text_in.e(), word_at.e(), n.e())],
                     unit(),
                 ))],
+            ),
+            ret(chars.e()),
+        ],
+    ));
+    // split with a limit: after `lim` cuts the rest is one piece, and a
+    // negative limit cuts everywhere.
+    let lim = local("lim", i64());
+    let cuts = local("cuts", i64());
+    let index_from = |from: Expr| {
+        call(
+            "zb_str_index_of_from",
+            vec![text_in.e(), sep.e(), from],
+            i64(),
+        )
+    };
+    d.push(define(
+        "zb_str_split_n",
+        &[&text_in, &sep, &lim],
+        strs.clone(),
+        vec![
+            chars.decl(list(Vec::new(), strs.clone())),
+            w.decl(call("zb_str_len", vec![sep.e()], i64())),
+            when(
+                eq(w.e(), int(0)),
+                vec![fatal("ValueError", text("empty separator"))],
+            ),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            cuts.decl(int(0)),
+            at.decl(index_from(pos.e())),
+            while_(
+                and(
+                    ge(at.e(), int(0)),
+                    or(lt(lim.e(), int(0)), lt(cuts.e(), lim.e())),
+                ),
+                vec![
+                    expr(mcall(
+                        chars.e(),
+                        "push",
+                        vec![byte_slice(text_in.e(), pos.e(), at.e())],
+                        unit(),
+                    )),
+                    pos.set(add(at.e(), w.e())),
+                    cuts.add_assign(int(1)),
+                    at.set(index_from(pos.e())),
+                ],
+            ),
+            expr(mcall(
+                chars.e(),
+                "push",
+                vec![byte_slice(text_in.e(), pos.e(), n.e())],
+                unit(),
+            )),
+            ret(chars.e()),
+        ],
+    ));
+    // split on whitespace with a limit: the rest keeps its trailing
+    // whitespace and loses its leading whitespace.
+    d.push(define(
+        "zb_str_split_ws_n",
+        &[&text_in, &lim],
+        strs.clone(),
+        vec![
+            chars.decl(list(Vec::new(), strs.clone())),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            pos.decl(int(0)),
+            word_at.decl(int(-1)),
+            cuts.decl(int(0)),
+            while_(
+                and(
+                    lt(pos.e(), n.e()),
+                    or(lt(lim.e(), int(0)), lt(cuts.e(), lim.e())),
+                ),
+                vec![
+                    c.decl(char_here(text_in.e(), pos.e())),
+                    if_(
+                        is_space(c.e()),
+                        vec![when(
+                            ge(word_at.e(), int(0)),
+                            vec![
+                                expr(mcall(
+                                    chars.e(),
+                                    "push",
+                                    vec![byte_slice(text_in.e(), word_at.e(), pos.e())],
+                                    unit(),
+                                )),
+                                word_at.set(int(-1)),
+                                cuts.add_assign(int(1)),
+                            ],
+                        )],
+                        vec![when(lt(word_at.e(), int(0)), vec![word_at.set(pos.e())])],
+                    ),
+                    pos.set(next_pos(text_in.e(), pos.e())),
+                ],
+            ),
+            // A word still open ends the text; at the limit, what is
+            // left starts at its first non-space character.
+            if_(
+                ge(word_at.e(), int(0)),
+                vec![expr(mcall(
+                    chars.e(),
+                    "push",
+                    vec![byte_slice(text_in.e(), word_at.e(), n.e())],
+                    unit(),
+                ))],
+                vec![
+                    while_(
+                        and(
+                            lt(pos.e(), n.e()),
+                            is_space(char_here(text_in.e(), pos.e())),
+                        ),
+                        vec![pos.set(next_pos(text_in.e(), pos.e()))],
+                    ),
+                    when(
+                        lt(pos.e(), n.e()),
+                        vec![expr(mcall(
+                            chars.e(),
+                            "push",
+                            vec![byte_slice(text_in.e(), pos.e(), n.e())],
+                            unit(),
+                        ))],
+                    ),
+                ],
+            ),
+            ret(chars.e()),
+        ],
+    ));
+    // rsplit: the same cuts made from the right, which is a split of
+    // the reversed text by the reversed separator, each piece turned
+    // back and the pieces taken last first.
+    let reversed_parts = local("parts", strs.clone());
+    let back = local("back", strs.clone());
+    let reversed = |s: Expr| call("zb_str_reverse", vec![s], string());
+    let turned_back = |at_end: Expr| reversed(idx(reversed_parts.e(), at_end, string()));
+    let turn_all = |this: &Local| {
+        let mut st = vec![
+            back.decl(list(Vec::new(), strs.clone())),
+            i.decl(sub(mcall(this.e(), "len", vec![], i64()), int(1))),
+        ];
+        st.push(while_(
+            ge(i.e(), int(0)),
+            vec![
+                expr(mcall(back.e(), "push", vec![turned_back(i.e())], unit())),
+                i.set(sub(i.e(), int(1))),
+            ],
+        ));
+        st.push(ret(back.e()));
+        st
+    };
+    d.push(define(
+        "zb_str_rsplit_n",
+        &[&text_in, &sep, &lim],
+        strs.clone(),
+        {
+            // The separator is checked here: the split below must not
+            // raise, as its caller stores the list it returns.
+            let mut st = vec![
+                when(
+                    eq(call("zb_str_len", vec![sep.e()], i64()), int(0)),
+                    vec![fatal("ValueError", text("empty separator"))],
+                ),
+                reversed_parts.decl(call(
+                    "zb_str_split_n",
+                    vec![reversed(text_in.e()), reversed(sep.e()), lim.e()],
+                    strs.clone(),
+                )),
+            ];
+            st.extend(turn_all(&reversed_parts));
+            st
+        },
+    ));
+    d.push(define(
+        "zb_str_rsplit_ws_n",
+        &[&text_in, &lim],
+        strs.clone(),
+        {
+            let mut st = vec![reversed_parts.decl(call(
+                "zb_str_split_ws_n",
+                vec![reversed(text_in.e()), lim.e()],
+                strs.clone(),
+            ))];
+            st.extend(turn_all(&reversed_parts));
+            st
+        },
+    ));
+    // partition: the text before the first (`right` false) or last
+    // separator, the separator, and the text after; the whole text and
+    // two empty strings when it is absent.
+    let right = local("right", i64());
+    d.push(define(
+        "zb_str_partition",
+        &[&text_in, &sep, &right],
+        strs.clone(),
+        vec![
+            chars.decl(list(Vec::new(), strs.clone())),
+            w.decl(call("zb_str_len", vec![sep.e()], i64())),
+            when(
+                eq(w.e(), int(0)),
+                vec![fatal("ValueError", text("empty separator"))],
+            ),
+            n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+            at.decl(int(0)),
+            if_(
+                ne(right.e(), int(0)),
+                vec![at.set(call(
+                    "zb_str_last_index_of",
+                    vec![text_in.e(), sep.e()],
+                    i64(),
+                ))],
+                vec![at.set(call("zb_str_index_of", vec![text_in.e(), sep.e()], i64()))],
+            ),
+            if_(
+                lt(at.e(), int(0)),
+                vec![if_(
+                    ne(right.e(), int(0)),
+                    vec![
+                        expr(mcall(chars.e(), "push", vec![text("")], unit())),
+                        expr(mcall(chars.e(), "push", vec![text("")], unit())),
+                        expr(mcall(chars.e(), "push", vec![text_in.e()], unit())),
+                    ],
+                    vec![
+                        expr(mcall(chars.e(), "push", vec![text_in.e()], unit())),
+                        expr(mcall(chars.e(), "push", vec![text("")], unit())),
+                        expr(mcall(chars.e(), "push", vec![text("")], unit())),
+                    ],
+                )],
+                vec![
+                    expr(mcall(
+                        chars.e(),
+                        "push",
+                        vec![byte_slice(text_in.e(), int(0), at.e())],
+                        unit(),
+                    )),
+                    expr(mcall(chars.e(), "push", vec![sep.e()], unit())),
+                    expr(mcall(
+                        chars.e(),
+                        "push",
+                        vec![byte_slice(text_in.e(), add(at.e(), w.e()), n.e())],
+                        unit(),
+                    )),
+                ],
             ),
             ret(chars.e()),
         ],

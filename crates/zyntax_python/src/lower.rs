@@ -11000,6 +11000,44 @@ impl<'m> Lowerer<'m> {
                 Ok(Val { node, ty })
             }
             Ty::Str => {
+                // A tuple of affixes: any one of them is the answer, each
+                // evaluated before the test as a call's arguments are.
+                if matches!(name, "startswith" | "endswith")
+                    && let [py::Expr::Tuple(t)] = args
+                    && !t.elts.is_empty()
+                {
+                    let mut pre = Vec::new();
+                    let held = self.hold(receiver, &mut pre, span);
+                    let mut affixes = Vec::new();
+                    for e in &t.elts {
+                        let v = self.expr(e)?;
+                        let a = self.coerce(v, Ty::Str);
+                        let a = self.hold(
+                            Val {
+                                node: a,
+                                ty: Ty::Str,
+                            },
+                            &mut pre,
+                            span,
+                        );
+                        affixes.push(a.node);
+                    }
+                    let mut any: Option<Node> = None;
+                    for a in affixes {
+                        let test = call(
+                            &format!("zb_str_{name}"),
+                            vec![held.node.clone(), a],
+                            Ty::Bool,
+                            span,
+                        );
+                        any = Some(match any {
+                            Some(prev) => binary(BinaryOp::Or, prev, test, Ty::Bool, span),
+                            None => test,
+                        });
+                    }
+                    let node = Self::block_value(pre, any.expect("one"), Ty::Bool, span);
+                    return Ok(Val { node, ty });
+                }
                 let s = receiver.node;
                 let mut lowered = Vec::with_capacity(args.len());
                 for a in args {
@@ -11035,13 +11073,104 @@ impl<'m> Lowerer<'m> {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call("zb_str_replace", vec![s, a, b], Ty::Str, span)
                     }
-                    ("split", 0) => call("zb_str_split_ws", vec![s], Ty::List(Elem::Str), span),
+                    ("split" | "rsplit", 0..=2) => {
+                        let right = name == "rsplit";
+                        // No separator, or None, splits on whitespace.
+                        let by_space = args
+                            .first()
+                            .is_none_or(|a| matches!(a, py::Expr::NoneLiteral(_)));
+                        let limit = if lowered.len() == 2 {
+                            Some(self.coerce(lowered.pop().unwrap(), Ty::Int))
+                        } else {
+                            None
+                        };
+                        let sep = if by_space {
+                            None
+                        } else {
+                            Some(self.coerce(lowered.remove(0), Ty::Str))
+                        };
+                        let list = Ty::List(Elem::Str);
+                        match (sep, limit, right) {
+                            (None, None, false) => call("zb_str_split_ws", vec![s], list, span),
+                            (Some(sep), None, false) => {
+                                call("zb_str_split", vec![s, sep], list, span)
+                            }
+                            (None, limit, _) => {
+                                let f = if right {
+                                    "zb_str_rsplit_ws_n"
+                                } else {
+                                    "zb_str_split_ws_n"
+                                };
+                                let limit = limit.unwrap_or_else(|| int_lit(-1, span));
+                                call(f, vec![s, limit], list, span)
+                            }
+                            (Some(sep), limit, _) => {
+                                let f = if right {
+                                    "zb_str_rsplit_n"
+                                } else {
+                                    "zb_str_split_n"
+                                };
+                                let limit = limit.unwrap_or_else(|| int_lit(-1, span));
+                                call(f, vec![s, sep, limit], list, span)
+                            }
+                        }
+                    }
                     ("splitlines", 0) => {
                         call("zb_str_splitlines", vec![s], Ty::List(Elem::Str), span)
                     }
-                    ("split", 1) => {
-                        let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
-                        call("zb_str_split", vec![s, a], Ty::List(Elem::Str), span)
+                    ("splitlines", 1) => {
+                        let keep = self.coerce(lowered.pop().unwrap(), Ty::Bool);
+                        let list = Ty::List(Elem::Str);
+                        let kept = call("zb_str_splitlines_keep", vec![s.clone()], list, span);
+                        let plain = call("zb_str_splitlines", vec![s], list, span);
+                        node(
+                            TypedExpression::If(TypedIfExpr {
+                                condition: Box::new(keep),
+                                then_branch: Box::new(kept),
+                                else_branch: Box::new(plain),
+                            }),
+                            list,
+                            span,
+                        )
+                    }
+                    ("expandtabs", 0 | 1) => {
+                        let size = match lowered.pop() {
+                            Some(v) => self.coerce(v, Ty::Int),
+                            None => int_lit(8, span),
+                        };
+                        call("zb_str_expandtabs", vec![s, size], Ty::Str, span)
+                    }
+                    ("partition" | "rpartition", 1) => {
+                        let sep = self.coerce(lowered.pop().unwrap(), Ty::Str);
+                        let right = i64::from(name == "rpartition");
+                        let parts = Val {
+                            node: call(
+                                "zb_str_partition",
+                                vec![s, sep, int_lit(right, span)],
+                                Ty::List(Elem::Str),
+                                span,
+                            ),
+                            ty: Ty::List(Elem::Str),
+                        };
+                        let parts = self.guard(parts, span);
+                        let mut pre = Vec::new();
+                        let held = self.hold(parts, &mut pre, span);
+                        let items: Vec<Val> = (0..3)
+                            .map(|i| Val {
+                                node: elem_call(
+                                    "get",
+                                    Elem::Str,
+                                    vec![held.node.clone(), int_lit(i, span)],
+                                    span,
+                                ),
+                                ty: Ty::Str,
+                            })
+                            .collect();
+                        let tuple = self.tuple_of_items(items, ty, span);
+                        return Ok(Val {
+                            node: Self::block_value(pre, tuple, ty, span),
+                            ty,
+                        });
                     }
                     ("join", 1) => {
                         let items = self.coerce(lowered.pop().unwrap(), Ty::List(Elem::Str));

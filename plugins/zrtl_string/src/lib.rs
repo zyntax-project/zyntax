@@ -1040,6 +1040,109 @@ pub extern "C" fn string_edge_range(
     }) as i32
 }
 
+/// Whether Python's `repr` writes `c` as it is: not a control, format,
+/// private-use, separator or surrogate character.
+fn is_py_printable(c: char) -> bool {
+    if c.is_ascii() {
+        return !c.is_ascii_control();
+    }
+    let n = c as u32;
+    !(c.is_control()
+        || c.is_whitespace()
+        // Noncharacters are unassigned.
+        || n & 0xFFFE == 0xFFFE
+        || matches!(
+            n,
+            0xAD | 0x600..=0x605
+                | 0x61C
+                | 0x6DD
+                | 0x70F
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xE000..=0xF8FF
+                | 0xFDD0..=0xFDEF
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0xE0001
+                | 0xE0020..=0xE007F
+                | 0xF0000..=0xFFFFD
+                | 0x100000..=0x10FFFD
+        ))
+}
+
+/// Python's `repr` of a string: single quotes unless it holds a single
+/// quote and no double quote, the backslash escapes for the quote, the
+/// backslash, tab, newline and return, and `\x`, `\u` or `\U` escapes
+/// for what is not printable.
+#[no_mangle]
+pub extern "C" fn string_repr_py(s: StringPtr) -> StringPtr {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let quote = if t.contains('\'') && !t.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(t.len() + 2);
+    out.push(quote);
+    for c in t.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if is_py_printable(c) => out.push(c),
+            c => {
+                let n = c as u32;
+                if n <= 0xff {
+                    out.push_str(&format!("\\x{n:02x}"));
+                } else if n <= 0xffff {
+                    out.push_str(&format!("\\u{n:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{n:08x}"));
+                }
+            }
+        }
+    }
+    out.push(quote);
+    string_new(&out)
+}
+
+/// `str.expandtabs(size)`: each tab becomes the spaces that reach the
+/// next multiple of `size` columns; none when `size` is not positive.
+#[no_mangle]
+pub extern "C" fn string_expand_tabs(s: StringPtr, size: i64) -> StringPtr {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let mut out = String::with_capacity(t.len());
+    let mut column = 0i64;
+    for c in t.chars() {
+        match c {
+            '\t' => {
+                if size > 0 {
+                    let spaces = size - column % size;
+                    out.extend(std::iter::repeat(' ').take(spaces as usize));
+                    column += spaces;
+                }
+            }
+            '\n' | '\r' => {
+                out.push(c);
+                column = 0;
+            }
+            _ => {
+                out.push(c);
+                column += 1;
+            }
+        }
+    }
+    string_new(&out)
+}
+
 /// `str.replace(from, to, count)`: the first `count` matches, all of
 /// them when `count` is negative.
 #[no_mangle]
@@ -1125,6 +1228,8 @@ zrtl_plugin! {
         ("$String$find_range", string_find_range),
         ("$String$edge_range", string_edge_range),
         ("$String$replace_n", string_replace_n),
+        ("$String$expand_tabs", string_expand_tabs),
+        ("$String$repr_py", string_repr_py),
 
         // Padding
         ("$String$pad_start", string_pad_start),

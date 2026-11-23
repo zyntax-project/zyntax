@@ -10181,12 +10181,13 @@ impl Typer<'_> {
             Ty::Str => match attr {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"
                 | "capitalize" | "title" | "swapcase" | "format" | "zfill" | "center" | "ljust"
-                | "rjust" | "casefold" | "removeprefix" | "removesuffix" => Ty::Str,
+                | "rjust" | "casefold" | "removeprefix" | "removesuffix" | "expandtabs" => Ty::Str,
                 "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" | "istitle" | "isdecimal" | "isnumeric" | "isascii"
                 | "isidentifier" => Ty::Bool,
                 "split" | "rsplit" | "splitlines" => Ty::List(Elem::Str),
+                "partition" | "rpartition" => tuple_of(vec![Ty::Str, Ty::Str, Ty::Str]),
                 "encode" => Ty::Bytes,
                 _ => Ty::Object,
             },
