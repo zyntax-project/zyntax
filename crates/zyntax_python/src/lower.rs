@@ -10956,7 +10956,28 @@ impl<'m> Lowerer<'m> {
                         ty: Ty::Object,
                     },
                     ("update", 1) => {
-                        let other = self.expr_as(&args[0], dict_ty)?;
+                        let given = self.expr(&args[0])?;
+                        let other = match given.ty {
+                            Ty::Dict(_) => self.coerce(given, dict_ty),
+                            Ty::Object => {
+                                let library = types::dynamic_dict();
+                                let made = Val {
+                                    node: call("zb_dict_from_any", vec![given.node], library, span),
+                                    ty: library,
+                                };
+                                self.convert_table(made, dict_ty, span)
+                            }
+                            // Anything else is a sequence of pairs.
+                            _ => {
+                                let items = self.iterable(given, span);
+                                let library = types::dynamic_dict();
+                                let pairs = Val {
+                                    node: call("zb_dict_from_tuples", vec![items], library, span),
+                                    ty: library,
+                                };
+                                self.convert_table(pairs, dict_ty, span)
+                            }
+                        };
                         Val {
                             node: call(
                                 &tables::dict_fn("update", dict_ty),
@@ -12554,6 +12575,15 @@ impl<'m> Lowerer<'m> {
                                     span,
                                 ),
                                 Ty::Dict(_) => self.convert_table(v, dict_ty, span),
+                                // A dynamic value is a dict or a sequence of pairs.
+                                Ty::Object => {
+                                    let library = types::dynamic_dict();
+                                    let made = Val {
+                                        node: call("zb_dict_from_any", vec![v.node], library, span),
+                                        ty: library,
+                                    };
+                                    self.convert_table(made, dict_ty, span)
+                                }
                                 // Anything else is a sequence of pairs.
                                 _ => {
                                     let items = self.iterable(v, span);

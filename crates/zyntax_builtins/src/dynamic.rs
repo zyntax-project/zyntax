@@ -2326,6 +2326,28 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
+    // `dict(x)`: a copy of a dict, else the dict of a sequence of pairs.
+    d.push(define(
+        "zb_dict_from_any",
+        &[&x],
+        dict_ty.clone(),
+        vec![
+            when(
+                is_dict(x.e()),
+                vec![ret(call(
+                    "zb_dict_copy",
+                    vec![raw_dict(x.e())],
+                    dict_ty.clone(),
+                ))],
+            ),
+            ret(call(
+                "zb_dict_from_tuples",
+                vec![call("zb_any_iter", vec![x.e()], anys.clone())],
+                dict_ty.clone(),
+            )),
+        ],
+    ));
+
     // Whether every value in `items` is of category `wanted`.
     let wanted = local("wanted", i64());
     let items = local("items", anys.clone());
