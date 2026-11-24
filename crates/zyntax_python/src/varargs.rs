@@ -458,43 +458,7 @@ fn pack(extras: Vec<py::Expr>, range: TextRange) -> py::Expr {
             parenthesized: true,
         });
     }
-    // `tuple([a, b] + list(xs) + [c])`.
-    let mut fill: HashMap<String, py::Expr> = HashMap::default();
-    let mut parts: Vec<String> = Vec::new();
-    let mut run: Vec<String> = Vec::new();
-    let mut star: Option<String> = None;
-    let count = extras.len();
-    for (i, e) in extras.into_iter().enumerate() {
-        let name = format!("__va{i}");
-        match e {
-            py::Expr::Starred(s) => {
-                if !run.is_empty() {
-                    parts.push(format!("[{}]", run.join(", ")));
-                    run.clear();
-                }
-                fill.insert(name.clone(), *s.value);
-                parts.push(format!("list({name})"));
-                star = Some(name);
-            }
-            other => {
-                fill.insert(name.clone(), other);
-                run.push(name);
-            }
-        }
-    }
-    if !run.is_empty() {
-        parts.push(format!("[{}]", run.join(", ")));
-    }
-    let source = match (&star, count) {
-        (Some(only), 1) => format!("tuple({only})"),
-        _ => format!("tuple({})", parts.join(" + ")),
-    };
-    let mut e = *ruff_python_parser::parse_expression(&source)
-        .expect("a packed tuple parses")
-        .into_syntax()
-        .body;
-    Fill(fill).visit_expr(&mut e);
-    e
+    crate::spreads::display_of(crate::spreads::Wrap::Tuple, extras)
 }
 
 impl Transformer for Rewriter<'_> {

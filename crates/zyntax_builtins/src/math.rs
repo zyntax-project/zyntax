@@ -114,6 +114,36 @@ pub(crate) fn declarations() -> Vec<Decl> {
             eq(x.e(), float(f64::NEG_INFINITY)),
         ))],
     ));
+    // `isclose(a, b, rel_tol, abs_tol)`.
+    let a = local("a", f64());
+    let b = local("b", f64());
+    let rel = local("rel_tol", f64());
+    let abs = local("abs_tol", f64());
+    let gap = local("gap", f64());
+    let inf = |v: Expr| {
+        or(
+            eq(v.clone(), float(f64::INFINITY)),
+            eq(v, float(f64::NEG_INFINITY)),
+        )
+    };
+    let fabs = |v: Expr| call("zb_math_fabs", vec![v], f64());
+    d.push(define(
+        "zb_math_isclose",
+        &[&a, &b, &rel, &abs],
+        boolean(),
+        vec![
+            when(eq(a.e(), b.e()), vec![ret(bool(true))]),
+            when(or(inf(a.e()), inf(b.e())), vec![ret(bool(false))]),
+            gap.decl(fabs(sub(b.e(), a.e()))),
+            ret(or(
+                or(
+                    le(gap.e(), fabs(mul(rel.e(), b.e()))),
+                    le(gap.e(), fabs(mul(rel.e(), a.e()))),
+                ),
+                le(gap.e(), abs.e()),
+            )),
+        ],
+    ));
     d.push(define(
         "zb_math_isfinite",
         &[&x],

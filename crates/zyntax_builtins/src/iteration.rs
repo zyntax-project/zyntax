@@ -238,6 +238,46 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         s
     }));
 
+    // `zip(*rows)`: the columns of a list of iterables, as tuples.
+    let rows = local("rows", anys.clone());
+    let row = local("row", anys.clone());
+    let parts = local("parts", anys.clone());
+    let j = local("j", i64());
+    let m = local("m", i64());
+    let of_row = |at_row: Expr| call("zb_any_iter", vec![at_row], anys.clone());
+    d.push(define("zb_list_zip_rows", &[&rows], anys.clone(), {
+        let mut s = vec![
+            out.decl(empty()),
+            m.decl(len(&rows)),
+            when(eq(m.e(), int(0)), vec![ret(out.e())]),
+            row.decl(of_row(at(&rows, int(0)))),
+            n.decl(len(&row)),
+        ];
+        s.extend(for_range(
+            &j,
+            int(1),
+            m.e(),
+            vec![
+                row.set(of_row(at(&rows, j.e()))),
+                when(lt(len(&row), n.e()), vec![n.set(len(&row))]),
+            ],
+        ));
+        let mut column = vec![parts.decl(empty())];
+        column.extend(for_range(
+            &j,
+            int(0),
+            m.e(),
+            vec![
+                row.set(of_row(at(&rows, j.e()))),
+                push(&parts, at(&row, i.e())),
+            ],
+        ));
+        column.push(push(&out, call("zb_box_tuple", vec![parts.e()], any())));
+        s.extend(for_range(&i, int(0), n.e(), column));
+        s.push(ret(out.e()));
+        s
+    }));
+
     // Each call back into the program may raise; the loop stops at the
     // first that does.
     let y = local("y", any());

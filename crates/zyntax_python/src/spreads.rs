@@ -1,12 +1,16 @@
-//! Dicts built from other dicts and keywords, written as the merge.
-//! `{**a, "k": v}`, `dict(a, k=v)` and `d.update(a, k=v)` are a dict
-//! display or a call to a module function that copies its first operand
-//! and updates the copy with the second, so the rest of the frontend
-//! sees only dict displays, `dict(x)` and `update` with one operand.
+//! Displays and calls that spread other values in, written as the
+//! concatenation or merge. `[a, *xs]`, `(*xs, b)` and `{*xs}` are the
+//! lists of their parts added together. `{**a, "k": v}`, `dict(a, k=v)`
+//! and `d.update(a, k=v)` are a dict display or a call to a module
+//! function that copies its first operand and updates the copy with the
+//! second. The rest of the frontend sees only plain displays,
+//! `dict(x)` and `update` with one operand.
 
+use crate::dataclass::Fill;
 use ruff_python_ast as py;
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr, walk_stmt};
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::FxHashMap as HashMap;
 use std::cell::Cell;
 
 /// The function every merge calls.
@@ -164,6 +168,61 @@ fn parts_of_call(positional: Option<py::Expr>, keywords: Vec<py::Keyword>) -> Ve
     parts
 }
 
+/// What a display with `*` elements is made into.
+#[derive(Clone, Copy)]
+pub(crate) enum Wrap {
+    List,
+    Tuple,
+    Set,
+}
+
+/// The display `elts`, some of them `*xs`, as the list of its parts
+/// added together: `tuple([a] + list(xs) + [b])`.
+pub(crate) fn display_of(wrap: Wrap, elts: Vec<py::Expr>) -> py::Expr {
+    let mut fill: HashMap<String, py::Expr> = HashMap::default();
+    let mut parts: Vec<String> = Vec::new();
+    let mut run: Vec<String> = Vec::new();
+    for (i, e) in elts.into_iter().enumerate() {
+        let name = format!("__sp{i}");
+        match e {
+            py::Expr::Starred(star) => {
+                if !run.is_empty() {
+                    parts.push(format!("[{}]", run.join(", ")));
+                    run.clear();
+                }
+                fill.insert(name.clone(), *star.value);
+                parts.push(format!("list({name})"));
+            }
+            other => {
+                fill.insert(name.clone(), other);
+                run.push(name);
+            }
+        }
+    }
+    if !run.is_empty() {
+        parts.push(format!("[{}]", run.join(", ")));
+    }
+    let joined = parts.join(" + ");
+    let source = match (wrap, parts.len()) {
+        (Wrap::List, _) => joined,
+        // `tuple(xs)` and `set(xs)` take the one operand as it is.
+        (Wrap::Tuple, 1) if joined.starts_with("list(") => format!("tuple{}", &joined[4..]),
+        (Wrap::Set, 1) if joined.starts_with("list(") => format!("set{}", &joined[4..]),
+        (Wrap::Tuple, _) => format!("tuple({joined})"),
+        (Wrap::Set, _) => format!("set({joined})"),
+    };
+    let mut e = *ruff_python_parser::parse_expression(&source)
+        .expect("a spread display parses")
+        .into_syntax()
+        .body;
+    Fill(fill).visit_expr(&mut e);
+    e
+}
+
+fn has_star(elts: &[py::Expr]) -> bool {
+    elts.iter().any(|e| matches!(e, py::Expr::Starred(_)))
+}
+
 impl Rewriter {
     /// The dict the operands merge into, later ones winning.
     fn fold(&self, parts: Vec<Part>, range: TextRange) -> py::Expr {
@@ -209,6 +268,15 @@ impl Transformer for Rewriter {
         walk_expr(self, e);
         let range = e.range();
         match e {
+            py::Expr::List(l) if l.ctx == py::ExprContext::Load && has_star(&l.elts) => {
+                *e = display_of(Wrap::List, std::mem::take(&mut l.elts));
+            }
+            py::Expr::Tuple(t) if t.ctx == py::ExprContext::Load && has_star(&t.elts) => {
+                *e = display_of(Wrap::Tuple, std::mem::take(&mut t.elts));
+            }
+            py::Expr::Set(s) if has_star(&s.elts) => {
+                *e = display_of(Wrap::Set, std::mem::take(&mut s.elts));
+            }
             py::Expr::Dict(d) if d.items.iter().any(|i| i.key.is_none()) => {
                 let parts = parts_of_items(std::mem::take(&mut d.items));
                 *e = self.fold(parts, range);

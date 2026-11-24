@@ -31,7 +31,6 @@ mod bytes;
 mod class_attrs;
 mod classes;
 mod dataclass;
-mod dicts;
 mod format;
 mod host;
 mod infer_deps;
@@ -43,9 +42,11 @@ mod rebind;
 mod records;
 mod scope;
 mod shape;
+mod spreads;
 mod stdlib;
 mod sugar;
 mod types;
+mod unpack;
 mod varargs;
 
 pub use zyntax_embed::host::{
@@ -501,7 +502,8 @@ fn parse_program_once(
     // becomes the class, a local rebound in straight-line code becomes
     // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
-    dicts::rewrite(&mut statements, &mut origins);
+    unpack::rewrite(&mut statements, &mut origins);
+    spreads::rewrite(&mut statements, &mut origins);
     varargs::rewrite(&mut statements)?;
     kwargs::rewrite(&mut statements)?;
     sugar::rewrite(&mut statements, &mut origins);

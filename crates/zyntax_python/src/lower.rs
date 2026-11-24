@@ -2298,6 +2298,61 @@ impl<'m> Lowerer<'m> {
 
     /// Whether `name` is a variable of some kind here, as opposed to a
     /// module function or a builtin.
+    /// `issubclass(x, y)` for classes named in the source: a class of
+    /// the module, or a builtin type; `y` may be a tuple of them.
+    fn static_subclass(&self, x: &py::Expr, y: &py::Expr) -> Option<bool> {
+        enum Named {
+            User(usize),
+            Builtin(&'static str),
+        }
+        const BUILTINS: &[&str] = &[
+            "object",
+            "int",
+            "float",
+            "bool",
+            "str",
+            "bytes",
+            "list",
+            "tuple",
+            "dict",
+            "set",
+            "frozenset",
+        ];
+        let named = |e: &py::Expr| -> Option<Named> {
+            let py::Expr::Name(n) = e else {
+                return None;
+            };
+            let id = n.id.as_str();
+            if self.is_variable(id) {
+                return None;
+            }
+            match self.module.class_index.get(id) {
+                Some(k) => Some(Named::User(*k)),
+                None => BUILTINS
+                    .iter()
+                    .find(|b| **b == id)
+                    .map(|b| Named::Builtin(b)),
+            }
+        };
+        let derives = |x: &Named, y: &Named| match (x, y) {
+            (_, Named::Builtin("object")) => true,
+            (Named::User(k), Named::User(base)) => self.module.is_subclass(*k, *base),
+            (Named::Builtin(a), Named::Builtin(b)) => a == b || (*a == "bool" && *b == "int"),
+            _ => false,
+        };
+        let x = named(x)?;
+        match y {
+            py::Expr::Tuple(t) => {
+                let mut any = false;
+                for e in &t.elts {
+                    any |= derives(&x, &named(e)?);
+                }
+                Some(any)
+            }
+            other => Some(derives(&x, &named(other)?)),
+        }
+    }
+
     fn is_variable(&self, name: &str) -> bool {
         self.comp_symbols.contains_key(name)
             || self.cells.contains_key(name)
@@ -7542,6 +7597,19 @@ impl<'m> Lowerer<'m> {
         let stdlib::Member::Func { params, ret, zb } = member else {
             return unsupported(format!("calling `{name}`, which is not a function"), c);
         };
+        // A function with keywords or defaults is called with every
+        // argument in its place.
+        let filled;
+        let (args, keywords) = match stdlib::keyword_params(zb) {
+            Some(table) => {
+                let Some(all) = types::keywords_positional(table, 0, true, args, keywords) else {
+                    return unsupported(format!("calling `{name}` with these arguments"), c);
+                };
+                filled = all;
+                (&filled[..], &[][..])
+            }
+            None => (args, keywords),
+        };
         if !keywords.is_empty() {
             return unsupported(format!("keyword arguments to `{name}`"), c);
         }
@@ -11644,6 +11712,40 @@ impl<'m> Lowerer<'m> {
     /// A call: `print`, a conversion builtin, or a function the module
     /// defines.
     fn call(&mut self, c: &py::ExprCall, ty: Ty, span: Span) -> Result<Val> {
+        // `max(*xs)` and `min(*xs)` are those of `xs`; `zip(*rows)` is
+        // the columns of `rows`.
+        if let py::Expr::Name(n) = &*c.func
+            && matches!(n.id.as_str(), "max" | "min" | "zip")
+            && !self.is_variable(n.id.as_str())
+            && let [py::Expr::Starred(star)] = &*c.arguments.args
+        {
+            if n.id.as_str() == "zip" {
+                if !c.arguments.keywords.is_empty() {
+                    return unsupported("zip() with keywords", c);
+                }
+                let rows = self.expr(&star.value)?;
+                let rows = self.iterable(rows, span);
+                let node = call("zb_list_zip_rows", vec![rows], Ty::List(Elem::Object), span);
+                return Ok(Val {
+                    node: self.coerce(
+                        Val {
+                            node,
+                            ty: Ty::List(Elem::Object),
+                        },
+                        ty,
+                    ),
+                    ty,
+                });
+            }
+            let expanded = py::ExprCall {
+                arguments: py::Arguments {
+                    args: vec![(*star.value).clone()].into_boxed_slice(),
+                    ..c.arguments.clone()
+                },
+                ..c.clone()
+            };
+            return self.call(&expanded, ty, span);
+        }
         // `f(*t)` with `t` a tuple of known shape is `f(t[0], t[1], ...)`.
         if c.arguments
             .args
@@ -12203,6 +12305,19 @@ impl<'m> Lowerer<'m> {
                 "isinstance" if args.len() == 2 => {
                     let v = self.expr(&args[0])?;
                     return self.isinstance(v, &args[1], span);
+                }
+                "issubclass" if args.len() == 2 && keywords.is_empty() => {
+                    let Some(answer) = self.static_subclass(&args[0], &args[1]) else {
+                        return unsupported("issubclass() of classes that are not named", c);
+                    };
+                    return Ok(Val {
+                        node: node(
+                            TypedExpression::Literal(TypedLiteral::Bool(answer)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        ty: Ty::Bool,
+                    });
                 }
                 "callable" if args.len() == 1 && keywords.is_empty() => {
                     // A function, class or builtin named is callable

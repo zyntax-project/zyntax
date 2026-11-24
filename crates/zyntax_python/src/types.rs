@@ -2163,6 +2163,22 @@ pub(crate) fn str_keywords_positional(
     keywords: &[py::Keyword],
 ) -> Option<Vec<py::Expr>> {
     let params = str_keyword_params(attr)?;
+    // `old` and `new` of `replace` are positional only.
+    let positional_only = if attr == "replace" { 2 } else { 0 };
+    keywords_positional(params, positional_only, false, args, keywords)
+}
+
+/// The arguments of a call to a function with these `params` as
+/// positional ones, as [`str_keywords_positional`] has them for a str
+/// method. The first `positional_only` parameters take no keyword; with
+/// `full`, the parameters after the last one given are filled in too.
+pub(crate) fn keywords_positional(
+    params: &[(&str, &str)],
+    positional_only: usize,
+    full: bool,
+    args: &[py::Expr],
+    keywords: &[py::Keyword],
+) -> Option<Vec<py::Expr>> {
     if args.len() > params.len() {
         return None;
     }
@@ -2174,14 +2190,17 @@ pub(crate) fn str_keywords_positional(
     for k in keywords {
         let name = k.arg.as_ref()?.as_str();
         let i = params.iter().position(|(n, _)| *n == name)?;
-        // `old` and `new` of `replace` are positional only.
-        if i < after || (attr == "replace" && i < 2) {
+        if i < after || i < positional_only {
             return None;
         }
         slots[i] = Some(k.value.clone());
         after = i + 1;
     }
-    let last = slots.iter().rposition(Option::is_some)?;
+    let last = if full {
+        params.len() - 1
+    } else {
+        slots.iter().rposition(Option::is_some)?
+    };
     let mut out = Vec::with_capacity(last + 1);
     for (slot, (_, default)) in slots[..=last].iter().zip(params) {
         match slot {
@@ -10229,7 +10248,7 @@ impl Typer<'_> {
             // or the file is a text one.
             "open" => Ty::File(open_mode(c).unwrap_or(Mode::Text)),
             "float" => Ty::Float,
-            "bool" | "isinstance" | "callable" | "hasattr" => Ty::Bool,
+            "bool" | "isinstance" | "issubclass" | "callable" | "hasattr" => Ty::Bool,
             "abs" => match arg(0) {
                 Ty::Int | Ty::Bool => Ty::Int,
                 Ty::Float => Ty::Float,

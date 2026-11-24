@@ -116,6 +116,21 @@ pub(crate) fn is_typing_name(name: &str) -> bool {
     )
 }
 
+/// The parameters of a library function that takes keywords or has
+/// defaults, in order, each with its default as source; an empty
+/// default is a parameter that must be given.
+pub(crate) fn keyword_params(zb: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    Some(match zb {
+        "zb_math_isclose" => &[
+            ("a", ""),
+            ("b", ""),
+            ("rel_tol", "1e-09"),
+            ("abs_tol", "0.0"),
+        ],
+        _ => return None,
+    })
+}
+
 const F: Ty = Ty::Float;
 const I: Ty = Ty::Int;
 const B: Ty = Ty::Bool;
@@ -141,6 +156,7 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
             "zb_insort_left",
         ),
         ("math", "sqrt") => func(&[F], F, "zb_math_sqrt"),
+        ("math", "isclose") => func(&[F, F, F, F], Ty::Bool, "zb_math_isclose"),
         ("math", "pow") => func(&[F, F], F, "zb_math_pow"),
         ("math", "fabs") => func(&[F], F, "zb_math_fabs"),
         ("math", "floor") => func(&[F], I, "zb_math_floor"),
