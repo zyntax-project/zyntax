@@ -1,0 +1,33 @@
+enter a
+body a
+exit a True
+enter b
+no target
+exit b True
+enter x
+enter y
+x y
+exit y True
+exit x True
+q 7
+swallow boom
+after quiet
+enter c
+exit c False
+caught 'k'
+enter f
+exit f True
+enter f
+late
+exit f True
+early end
+enter loop0
+iter 0
+exit loop0 True
+enter loop1
+exit loop1 True
+enter loop2
+exit loop2 True
+enter held
+True
+exit held True

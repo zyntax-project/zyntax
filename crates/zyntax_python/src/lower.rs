@@ -11471,6 +11471,8 @@ impl<'m> Lowerer<'m> {
                     }
                     ("getvalue", 0) => call("zb_file_getvalue", vec![f], mode.content(), span),
                     ("close", 0) => call("zb_file_close", vec![f], Ty::None, span),
+                    ("__enter__", 0) => f,
+                    ("__exit__", 3) => call("zb_file_close", vec![f], Ty::None, span),
                     ("flush", 0) => Self::after_none(
                         f,
                         node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span),

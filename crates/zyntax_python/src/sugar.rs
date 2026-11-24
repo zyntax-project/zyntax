@@ -156,6 +156,24 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         map_is_builtin: !binds_module_name(body, "map"),
         list_is_builtin: !binds_module_name(body, "list"),
         iter_is_builtin: !binds_module_name(body, "iter"),
+        imported_modules: body
+            .iter()
+            .filter_map(|s| match s {
+                py::Stmt::Import(i) => Some(i),
+                _ => None,
+            })
+            .flat_map(|i| i.names.iter())
+            .map(|a| {
+                a.asname
+                    .as_ref()
+                    .map_or_else(
+                        || a.name.split('.').next().unwrap_or_default(),
+                        |n| n.as_str(),
+                    )
+                    .to_string()
+            })
+            .collect(),
+        with_items: Cell::new(0),
         map_items: Cell::new(0),
         folds: Folds::of(body, origins),
         origin: RefCell::new(None),
@@ -245,6 +263,10 @@ struct Rewriter {
     list_is_builtin: bool,
     /// No module-level binding shadows the builtin `iter`.
     iter_is_builtin: bool,
+    /// The names `import` binds to modules at the top of the program.
+    imported_modules: HashSet<String>,
+    /// `with` statements made into try statements so far.
+    with_items: Cell<u32>,
     /// Comprehension targets made for `map` calls so far.
     map_items: Cell<u32>,
     /// What names `functools.reduce` and the `operator` functions, by
@@ -536,6 +558,89 @@ impl Transformer for Relocate {
 }
 
 impl Rewriter {
+    /// Whether `with` on `e` may be a context manager the program
+    /// defines: not a file opened in place, nor a call of a module's.
+    fn is_program_context(&self, e: &py::Expr) -> bool {
+        match e {
+            py::Expr::Call(c) => match &*c.func {
+                py::Expr::Name(f) => f.id.as_str() != "open",
+                py::Expr::Attribute(a) => !matches!(
+                    &*a.value,
+                    py::Expr::Name(m) if self.imported_modules.contains(m.id.as_str())
+                ),
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// `with a as x, b as y: body` as
+    /// `m = a; x = m.__enter__(); try: ... except BaseException as e:
+    /// seen = True; if not m.__exit__(type(e), e, None): raise;
+    /// finally: if not seen: m.__exit__(None, None, None)`, nested.
+    fn desugar_with(&self, w: &mut py::StmtWith) -> py::Stmt {
+        let range = w.range();
+        let mut body = std::mem::take(&mut w.body);
+        let items = std::mem::take(&mut w.items);
+        for item in items.into_iter().rev() {
+            let n = self.with_items.get();
+            self.with_items.set(n + 1);
+            let source = format!(
+                "__with_mgr_{n} = None\n\
+                 __with_target_{n} = __with_mgr_{n}.__enter__()\n\
+                 __with_seen_{n} = False\n\
+                 try:\n    pass\n\
+                 except BaseException as __with_exc_{n}:\n\
+                 \x20   __with_seen_{n} = True\n\
+                 \x20   if not __with_mgr_{n}.__exit__(type(__with_exc_{n}), __with_exc_{n}, None):\n\
+                 \x20       raise\n\
+                 finally:\n\
+                 \x20   if not __with_seen_{n}:\n\
+                 \x20       __with_mgr_{n}.__exit__(None, None, None)\n"
+            );
+            let mut parsed = ruff_python_parser::parse_module(&source)
+                .expect("the with template parses")
+                .into_syntax()
+                .body;
+            if let py::Stmt::Assign(a) = &mut parsed[0] {
+                *a.value = item.context_expr;
+            }
+            match item.optional_vars {
+                Some(target) => {
+                    if let py::Stmt::Assign(a) = &mut parsed[1] {
+                        a.targets = vec![*target];
+                    }
+                }
+                None => {
+                    // The entered value is dropped.
+                    if let py::Stmt::Assign(a) = &parsed[1] {
+                        let call = (*a.value).clone();
+                        parsed[1] = py::Stmt::Expr(py::StmtExpr {
+                            node_index: Default::default(),
+                            range: a.range,
+                            value: Box::new(call),
+                        });
+                    }
+                }
+            }
+            if let py::Stmt::Try(t) = &mut parsed[3] {
+                t.body = body;
+            }
+            body = parsed;
+        }
+        py::Stmt::If(py::StmtIf {
+            node_index: Default::default(),
+            range,
+            test: Box::new(py::Expr::BooleanLiteral(py::ExprBooleanLiteral {
+                node_index: Default::default(),
+                range,
+                value: true,
+            })),
+            body,
+            elif_else_clauses: Vec::new(),
+        })
+    }
+
     fn is_static(&self, class: &str, method: &str) -> bool {
         self.statics
             .get(class)
@@ -586,6 +691,17 @@ impl Transformer for Rewriter {
                         walk_stmt(self, m);
                     }
                 }
+            }
+            // `with` on a context manager of the program's own is a try
+            // statement that calls its `__enter__` and `__exit__`.
+            py::Stmt::With(w)
+                if !w.is_async
+                    && w.items
+                        .iter()
+                        .all(|i| self.is_program_context(&i.context_expr)) =>
+            {
+                *s = self.desugar_with(w);
+                walk_stmt(self, s);
             }
             _ => walk_stmt(self, s),
         }

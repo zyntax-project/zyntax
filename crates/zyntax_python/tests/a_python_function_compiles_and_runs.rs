@@ -143,8 +143,8 @@ fn an_error_renders_against_its_source() {
         "should show the line, got: {shown}"
     );
 
-    let source = "def f():\n    pass\n\nwith f() as g:\n    pass\n";
-    let err = zyntax_python::parse_program(source).expect_err("with is not in the subset");
+    let source = "def f():\n    pass\n\nmatch f():\n    case 1:\n        pass\n";
+    let err = zyntax_python::parse_program(source).expect_err("match is not in the subset");
     let shown = err.render("prog.py", source, false);
     assert!(shown.contains("not supported yet"), "got: {shown}");
     assert!(
