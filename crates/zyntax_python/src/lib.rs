@@ -30,6 +30,7 @@ mod aliases;
 mod bytes;
 mod class_attrs;
 mod classes;
+mod dataclass;
 mod format;
 mod host;
 mod infer_deps;

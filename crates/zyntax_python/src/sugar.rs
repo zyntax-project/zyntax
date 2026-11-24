@@ -45,10 +45,16 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
     let mut getters: HashSet<String> = HashSet::default();
     let mut setters: HashSet<String> = HashSet::default();
     let mut class_info: Vec<ClassInfo> = Vec::new();
+    // The fields of the dataclasses so far, which one derived from them
+    // starts with.
+    let mut dataclass_fields: HashMap<String, Vec<crate::dataclass::Field>> = HashMap::default();
     for (i, s) in body.iter_mut().enumerate() {
         let py::Stmt::ClassDef(c) = s else {
             continue;
         };
+        if let Some(fields) = crate::dataclass::rewrite_class(c, &dataclass_fields) {
+            dataclass_fields.insert(c.name.to_string(), fields);
+        }
         let origin = origins.get(i).cloned().flatten();
         let class = c.name.to_string();
         let bases = c.bases();
@@ -177,6 +183,44 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
             }
         }
         c.body = kept.into_iter().collect();
+    }
+    // The decorator and `field` were consumed: the import of them is
+    // no module the program needs.
+    if !dataclass_fields.is_empty() {
+        // The import of a module the program lacks is the binding
+        // `name = __import__("dataclasses")`, or one of its members.
+        fn names_dataclasses(e: &py::Expr) -> bool {
+            match e {
+                py::Expr::Attribute(a) => names_dataclasses(&a.value),
+                py::Expr::Call(c) => {
+                    is_name(&c.func, "__import__")
+                        && matches!(c.arguments.args.first(),
+                            Some(py::Expr::StringLiteral(l)) if l.value.to_str() == "dataclasses")
+                }
+                _ => false,
+            }
+        }
+        let is_import = |s: &py::Stmt| match s {
+            py::Stmt::Assign(a) => names_dataclasses(&a.value),
+            py::Stmt::ImportFrom(f) => {
+                f.level == 0
+                    && f.module
+                        .as_ref()
+                        .is_some_and(|m| m.as_str() == "dataclasses")
+            }
+            py::Stmt::Import(i) => i.names.iter().all(|a| a.name.as_str() == "dataclasses"),
+            _ => false,
+        };
+        let mut kept = Vec::with_capacity(body.len());
+        let mut kept_origins = Vec::with_capacity(body.len());
+        for (s, origin) in std::mem::take(body).into_iter().zip(origins.iter()) {
+            if !is_import(&s) {
+                kept.push(s);
+                kept_origins.push(origin.clone());
+            }
+        }
+        *body = kept;
+        *origins = kept_origins;
     }
     // A property is not rewritten where a class that does not own it
     // keeps a plain attribute of the name.

@@ -1,0 +1,10 @@
+Point(x=1, y=2) 1 2 True False False
+Point(x=5, y=6)
+True True True [Version(major=1, minor=0), Version(major=1, minor=5), Version(major=2, minor=0)]
+Key(a='a', b=1) True 1 True
+Bag(name='b', items=[3, 4], count=2) True 2
+[] True
+Point3(x=1, y=2, z=3) Point3(x=1, y=2, z=9) True
+Checked(value=4) 8
+ValueError negative
+[Point(x=0, y=2), Point(x=1, y=2)]
