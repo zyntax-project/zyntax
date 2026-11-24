@@ -6434,8 +6434,9 @@ impl<'m> Lowerer<'m> {
             }
             seq = iterator;
         }
-        // An instance is iterated as the list its class makes of it.
-        let seq = if let Ty::Class(_) | Ty::Classes(_) = seq.ty {
+        // An instance is iterated as the list its class makes of it, and
+        // a text file as its lines.
+        let seq = if let Ty::Class(_) | Ty::Classes(_) | Ty::File(types::Mode::Text) = seq.ty {
             Val {
                 node: self.iterable(seq, span),
                 ty: Ty::List(Elem::Object),
@@ -8037,6 +8038,16 @@ impl<'m> Lowerer<'m> {
 
     fn iterable(&mut self, v: Val, span: Span) -> Node {
         match v.ty {
+            // A text file yields its lines.
+            Ty::File(types::Mode::Text) => {
+                let lines = self.file_lines(v.node, span);
+                call(
+                    &list_fn("to_any", Elem::Str),
+                    vec![lines],
+                    Ty::List(Elem::Object),
+                    span,
+                )
+            }
             Ty::Str => {
                 let chars = call("zb_str_chars", vec![v.node], Ty::List(Elem::Str), span);
                 call(
@@ -8061,6 +8072,18 @@ impl<'m> Lowerer<'m> {
     fn calls_eq(&self, e: Elem) -> bool {
         matches!(e, Elem::Class(_))
             && (0..self.module.classes.len()).any(|c| self.module.method_sig(c, "__eq__").is_some())
+    }
+
+    /// The lines left in a text file, each with its newline, as the list
+    /// a `for` over the file reads.
+    fn file_lines(&mut self, f: Node, span: Span) -> Node {
+        let rest = call("zb_file_read", vec![f], Ty::Str, span);
+        call(
+            "zb_str_splitlines_keep",
+            vec![rest],
+            Ty::List(Elem::Str),
+            span,
+        )
     }
 
     /// Whether some class of the module has a method called `name` that
@@ -11650,6 +11673,30 @@ impl<'m> Lowerer<'m> {
                     ("read", 1) => {
                         let count = self.expr_as(&args[0], Ty::Int)?;
                         call("zb_file_read_n", vec![f, count], mode.content(), span)
+                    }
+                    ("readline", 0) if mode == types::Mode::Text => {
+                        call("zb_file_readline", vec![f], Ty::Str, span)
+                    }
+                    ("readlines", 0) if mode == types::Mode::Text => self.file_lines(f, span),
+                    ("writelines", 1) if mode == types::Mode::Text => {
+                        let lines = self.expr(&args[0])?;
+                        let lines = self.iterable(lines, span);
+                        let joined = call(
+                            "zb_str_join",
+                            vec![
+                                str_lit("", span),
+                                self.coerce(
+                                    Val {
+                                        node: lines,
+                                        ty: Ty::List(Elem::Object),
+                                    },
+                                    Ty::List(Elem::Str),
+                                ),
+                            ],
+                            Ty::Str,
+                            span,
+                        );
+                        call("zb_file_write", vec![f, joined], Ty::None, span)
                     }
                     ("getvalue", 0) => call("zb_file_getvalue", vec![f], mode.content(), span),
                     ("close", 0) => call("zb_file_close", vec![f], Ty::None, span),

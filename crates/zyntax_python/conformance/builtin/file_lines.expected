@@ -1,0 +1,17 @@
+'alpha\n'
+'beta\n'
+'\n'
+'gamma\n'
+'xy\n'
+['alpha', 'beta', '', 'gamma', 'xy']
+'alpha\n' 'beta\n'
+'\n' 'gamma\nxy\n' ''
+['alpha\n', 'beta\n', '\n', 'gamma\n', 'xy\n']
+21
+5 True
+False
+a/b/c /x/y /b/c a/b
+('dir.d/file.tar', '.gz') ('noext', '') ('.hidden', '') ('a/b.c/d', '')
+('/a/b', 'c.txt') ('', 'file') ('/', '') True False
+a/b/d /x .. .
+y.txt /x

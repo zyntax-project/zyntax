@@ -1027,6 +1027,38 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         string(),
         read_body(count.e()),
     ));
+    // The next line, with its newline, or "" at the end.
+    d.push(define(
+        "zb_file_readline",
+        &[&f],
+        string(),
+        vec![
+            closed_check(),
+            when(
+                eq(bitand(file_flags(), int(READ)), int(0)),
+                vec![fatal("IOError", text("file not open for reading"))],
+            ),
+            load(),
+            buffer.decl(file_buffer()),
+            pos.decl(file_pos()),
+            n.decl(mcall(buffer.e(), "len", vec![], i64())),
+            end.decl(pos.e()),
+            while_(
+                and(
+                    lt(end.e(), n.e()),
+                    ne(cast(idx(buffer.e(), end.e(), u8()), i64()), int(10)),
+                ),
+                vec![end.set(add(end.e(), int(1)))],
+            ),
+            when(lt(end.e(), n.e()), vec![end.set(add(end.e(), int(1)))]),
+            set_pos(end.e()),
+            ret(call(
+                "zb_bytes_from_buffer_range",
+                vec![buffer.e(), pos.e(), end.e()],
+                string(),
+            )),
+        ],
+    ));
     d.push(define(
         "zb_file_close",
         &[&f],

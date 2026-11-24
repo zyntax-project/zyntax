@@ -41,6 +41,7 @@ mod kwargs;
 mod lower;
 mod modules;
 mod namedtuple;
+mod ospath;
 mod patterns;
 mod prelude;
 mod rebind;
@@ -470,6 +471,7 @@ fn parse_program_once(
     scope::reset_cache();
     let mut module = parsed.into_syntax();
     let mut main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
+    ospath::rewrite(&mut main);
     let big = bigint::requested(source);
     if big {
         main.insert(0, bigint::import());
