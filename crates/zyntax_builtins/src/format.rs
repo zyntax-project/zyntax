@@ -156,9 +156,11 @@ pub(crate) fn declarations() -> Vec<Decl> {
         ],
     ));
 
-    // A magnitude with its sign, padded: zero padding and `=` alignment
-    // go between the sign and the digits, anything else around both.
+    // A magnitude with its sign and radix prefix, padded: zero padding
+    // and `=` alignment go between the prefix and the digits, anything
+    // else around all three.
     let body = local("body", string());
+    let radix_prefix = local("radix_prefix", string());
     let negative = local("negative", boolean());
     let sign = local("sign", i64());
     let zero = local("zero", boolean());
@@ -167,7 +169,16 @@ pub(crate) fn declarations() -> Vec<Decl> {
     let a = local("a", i64());
     d.push(define(
         "zb_fmt_signed",
-        &[&body, &negative, &sign, &zero, &fill, &align, &width],
+        &[
+            &body,
+            &radix_prefix,
+            &negative,
+            &sign,
+            &zero,
+            &fill,
+            &align,
+            &width,
+        ],
         string(),
         vec![
             prefix.decl(text("")),
@@ -179,6 +190,7 @@ pub(crate) fn declarations() -> Vec<Decl> {
                     when(eq(sign.e(), int(2)), vec![prefix.set(text(" "))]),
                 ],
             ),
+            prefix.set(add(prefix.e(), radix_prefix.e())),
             when(
                 or(
                     eq(align.e(), int(AFTER_SIGN)),
@@ -362,12 +374,9 @@ fn int_format() -> Vec<Decl> {
     let mag = local("mag", i64());
     let body = local("body", string());
     let radix = |r: i32| call("zb_str_of_int_radix", vec![mag.e(), int32(r)], string());
-    let with_prefix = |p: &str, digits: Expr| {
-        vec![
-            body.set(digits),
-            when(alt.e(), vec![body.set(add(text(p), body.e()))]),
-        ]
-    };
+    let head = local("head", string());
+    let with_prefix =
+        |p: &str, digits: Expr| vec![body.set(digits), when(alt.e(), vec![head.set(text(p))])];
     vec![define(
         "zb_fmt_int",
         &[
@@ -379,6 +388,7 @@ fn int_format() -> Vec<Decl> {
             mag.decl(v.e()),
             when(negative.e(), vec![mag.set(sub(int(0), v.e()))]),
             body.decl(text("")),
+            head.decl(text("")),
             if_(
                 is_ty(&ty, 'x'),
                 with_prefix("0x", radix(16)),
@@ -404,6 +414,7 @@ fn int_format() -> Vec<Decl> {
                 "zb_fmt_signed",
                 vec![
                     body.e(),
+                    head.e(),
                     negative.e(),
                     sign.e(),
                     zero.e(),
@@ -697,6 +708,7 @@ fn float_format() -> Vec<Decl> {
                 "zb_fmt_signed",
                 vec![
                     body.e(),
+                    text(""),
                     negative.e(),
                     sign.e(),
                     zero.e(),
