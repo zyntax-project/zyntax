@@ -72,13 +72,38 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         d.push(extern_fn(name, &params, ret, Some(symbol)));
     }
 
+    // A list of `n` limbs whose slots hold whatever the room held: the
+    // operation that fills it writes every one.
+    let room = local("room", ints.clone());
+    d.push(extern_fn(
+        "zb_big_set_len_raw",
+        &[("xs", ints.clone()), ("n", i64())],
+        unit(),
+        Some("$Host$big_set_len"),
+    ));
+    let n = local("n", i64());
+    d.push(define(
+        "zb_big_alloc",
+        &[&n],
+        ints.clone(),
+        vec![
+            room.decl(mcall(
+                list(Vec::new(), ints.clone()),
+                "with_capacity",
+                vec![n.e()],
+                ints.clone(),
+            )),
+            expr(call("zb_big_set_len_raw", vec![room.e(), n.e()], unit())),
+            ret(room.e()),
+        ],
+    ));
+
     let a = borrowed("a", ints.clone());
     let b = borrowed("b", ints.clone());
     let out = borrowed("out", ints.clone());
     let q = borrowed("q", ints.clone());
     let r = borrowed("r", ints.clone());
     let m = borrowed("m", ints.clone());
-    let n = local("n", i64());
     let k = local("k", i64());
     let dv = local("d", i64());
     let add_in = local("add", i64());

@@ -560,7 +560,11 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 63] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 64] = [
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_set_len".as_ptr(),
+        crate::host_bignum::host_big_set_len as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Host$big_cmp".as_ptr(),
         crate::host_bignum::host_big_cmp as *const u8,

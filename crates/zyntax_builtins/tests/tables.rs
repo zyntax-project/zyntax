@@ -47,9 +47,10 @@ extern "C" fn unreached() -> i64 {
     std::process::abort()
 }
 static HOST_INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"test_host".as_ptr());
-static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 63] = [
+static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 64] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_set_len".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_at".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$big_cmp".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$big_add".as_ptr(), unreached as *const u8),

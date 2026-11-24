@@ -1,14 +1,14 @@
 # Arbitrary-precision int, for a program that opts in. An int that fits
 # 64 bits is the machine int; one that does not is a BigInt of a sign and
-# little-endian 30-bit limbs. The operators that can overflow call the
+# little-endian 60-bit limbs. The operators that can overflow call the
 # functions at the end of this file, which check and promote; a result that
 # fits 64 bits comes back as the machine int, so a BigInt is never equal to
 # one.
 
 import __bignative
 
-BASE = 1073741824
-MASK = 1073741823
+LIMB = 60
+MASK = 1152921504606846975
 MIN = -9223372036854775807 - 1
 
 
@@ -187,10 +187,9 @@ class BigInt:
         h = 0
         i = len(self.mag) - 1
         while i >= 0:
-            hi = h >> 31
-            lo = h & 2147483647
-            h = hi + (lo << 30) + self.mag[i]
-            while h >= p:
+            # h * 2 ** 60 modulo 2 ** 61 - 1, as the bit moved across.
+            h = (h >> 1) + ((h & 1) << 60) + self.mag[i]
+            while h > p:
                 h = (h & p) + (h >> 61)
             if h == p:
                 h = 0
@@ -225,7 +224,7 @@ class BigInt:
         return _format(self, spec)
 
     def bit_length(self):
-        return (len(self.mag) - 1) * 30 + _limb_bits(self.mag[len(self.mag) - 1])
+        return (len(self.mag) - 1) * LIMB + _limb_bits(self.mag[len(self.mag) - 1])
 
 
 def _isint(x: object) -> bool:
@@ -242,7 +241,7 @@ def _limbs(x: int) -> list[int]:
     m: list[int] = []
     while x > 0:
         m.append(x & MASK)
-        x = x >> 30
+        x = x >> LIMB
     return m
 
 
@@ -251,7 +250,7 @@ def _of_int(x: int) -> tuple[int, list[int]]:
         return 1, []
     if x < 0:
         if x == MIN:
-            return -1, [0, 0, 8]
+            return -1, [0, 8]
         return -1, _limbs(-x)
     return 1, _limbs(x)
 
@@ -267,16 +266,16 @@ def _make(sign: int, m: list[int]) -> object:
     n = len(m)
     if n == 0:
         return 0
-    if n <= 2 or (n == 3 and m[2] < 8):
+    if n == 1 or (n == 2 and m[1] < 8):
         v = 0
         i = n - 1
         while i >= 0:
-            v = (v << 30) | m[i]
+            v = (v << LIMB) | m[i]
             i -= 1
         if sign < 0:
             return -v
         return v
-    if sign < 0 and n == 3 and m[2] == 8 and m[1] == 0 and m[0] == 0:
+    if sign < 0 and n == 2 and m[1] == 8 and m[0] == 0:
         return MIN
     return BigInt(sign, m)
 
@@ -297,14 +296,14 @@ def _add_mag(a: list[int], b: list[int]) -> list[int]:
     n = len(a)
     if len(b) > n:
         n = len(b)
-    out = [0] * (n + 1)
+    out = __bignative.alloc(n + 1)
     __bignative.add(a, b, out)
     return _trim(out)
 
 
 def _sub_mag(a: list[int], b: list[int]) -> list[int]:
     # a >= b
-    out = [0] * len(a)
+    out = __bignative.alloc(len(a))
     __bignative.sub(a, b, out)
     return _trim(out)
 
@@ -314,13 +313,13 @@ def _mul_mag(a: list[int], b: list[int]) -> list[int]:
     m = len(b)
     if n == 0 or m == 0:
         return []
-    out = [0] * (n + m)
+    out = __bignative.alloc(n + m)
     __bignative.mul(a, b, out)
     return _trim(out)
 
 
 def _divmod_small(a: list[int], d: int) -> tuple[list[int], int]:
-    q = [0] * len(a)
+    q = __bignative.alloc(len(a))
     r = __bignative.divmod_small(a, d, q)
     return _trim(q), r
 
@@ -328,21 +327,21 @@ def _divmod_small(a: list[int], d: int) -> tuple[list[int], int]:
 def _shl_mag(a: list[int], n: int) -> list[int]:
     if len(a) == 0:
         return []
-    out = [0] * (len(a) + n // 30 + 1)
+    out = __bignative.alloc(len(a) + n // LIMB + 1)
     __bignative.shl(a, n, out)
     return _trim(out)
 
 
 def _shr_mag(a: list[int], n: int) -> list[int]:
-    out = [0] * len(a)
+    out = __bignative.alloc(len(a))
     __bignative.shr(a, n, out)
     return _trim(out)
 
 
 def _divmod_mag(a: list[int], b: list[int]) -> tuple[list[int], list[int]]:
     # b is not empty.
-    q = [0] * (len(a) + 1)
-    r = [0] * len(b)
+    q = __bignative.alloc(len(a) + 1)
+    r = __bignative.alloc(len(b))
     __bignative.divmod(a, b, q, r)
     return _trim(q), _trim(r)
 
@@ -417,7 +416,7 @@ def _compare(a: object, b: object) -> int:
 def _bits_of(m: list[int]) -> int:
     if len(m) == 0:
         return 0
-    return (len(m) - 1) * 30 + _limb_bits(m[len(m) - 1])
+    return (len(m) - 1) * LIMB + _limb_bits(m[len(m) - 1])
 
 
 def _tofloat(a: object) -> float:
@@ -427,7 +426,7 @@ def _tofloat(a: object) -> float:
         v = 0
         i = len(ma) - 1
         while i >= 0:
-            v = (v << 30) | ma[i]
+            v = (v << LIMB) | ma[i]
             i -= 1
         f = float(v)
     else:
@@ -438,7 +437,7 @@ def _tofloat(a: object) -> float:
         v = 0
         i = len(top) - 1
         while i >= 0:
-            v = (v << 30) | top[i]
+            v = (v << LIMB) | top[i]
             i -= 1
         if sticky:
             v = v | 1
@@ -497,7 +496,7 @@ def _truediv(a: object, b: object) -> float:
     v = 0
     i = len(q) - 1
     while i >= 0:
-        v = (v << 30) | q[i]
+        v = (v << LIMB) | q[i]
         i -= 1
     if len(r) > 0:
         v = v | 1
@@ -514,15 +513,15 @@ def _mag_str(m: list[int]) -> str:
     if len(m) == 0:
         return "0"
     parts: list[int] = []
-    cur = list(m)
+    cur = m
     while len(cur) > 0:
-        cur, r = _divmod_small(cur, 1000000000)
+        cur, r = _divmod_small(cur, 1000000000000000000)
         parts.append(r)
     out = [str(parts[len(parts) - 1])]
     i = len(parts) - 2
     while i >= 0:
         s = str(parts[i])
-        out.append("0" * (9 - len(s)) + s)
+        out.append("0" * (18 - len(s)) + s)
         i -= 1
     return "".join(out)
 
@@ -531,7 +530,7 @@ def _mul_small_add(m: list[int], k: int, add: int):
     carry = __bignative.mul_small_add(m, k, add)
     while carry > 0:
         m.append(carry & MASK)
-        carry = carry >> 30
+        carry = carry >> LIMB
 
 
 def _parse(text: str, base: int) -> object:
@@ -590,7 +589,7 @@ def _twos(sign: int, m: list[int], n: int) -> list[int]:
         while i < n:
             t = ((~out[i]) & MASK) + carry
             out[i] = t & MASK
-            carry = t >> 30
+            carry = t >> LIMB
             i += 1
     return out
 
@@ -616,13 +615,13 @@ def _bitop(op: int, a: object, b: object) -> object:
         else:
             out.append(xa[i] ^ xb[i])
         i += 1
-    if (out[n - 1] >> 29) & 1 == 1:
+    if (out[n - 1] >> (LIMB - 1)) & 1 == 1:
         carry = 1
         i = 0
         while i < n:
             t = ((~out[i]) & MASK) + carry
             out[i] = t & MASK
-            carry = t >> 30
+            carry = t >> LIMB
             i += 1
         return _make(-1, out)
     return _make(1, out)
@@ -802,7 +801,7 @@ def powmod(a, b, m):
     i = bits - 1
     while i >= 0:
         result = mul(result, result) % m
-        if (mb[i // 30] >> (i % 30)) & 1 == 1:
+        if (mb[i // LIMB] >> (i % LIMB)) & 1 == 1:
             result = mul(result, base) % m
         i -= 1
     return result
@@ -832,7 +831,7 @@ def abs_(x):
         return BigInt(1, x.mag)
     if isinstance(x, int):
         if x == MIN:
-            return _make(1, [0, 0, 8])
+            return _make(1, [0, 8])
         return abs(x)
     return abs(x)
 

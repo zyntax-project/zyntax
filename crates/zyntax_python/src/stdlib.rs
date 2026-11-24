@@ -217,6 +217,7 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("os", "path.exists") => func(&[S], B, "zb_path_exists"),
         // A digest is the bytes it hashes to: `hexdigest()` spells them.
         // The big-int library's magnitude arithmetic, over lists of limbs.
+        ("__bignative", "alloc") => func(&[I], L, "zb_big_alloc"),
         ("__bignative", "cmp") => func(&[L, L], I, "zb_big_cmp"),
         ("__bignative", "add") => func(&[L, L, L], Ty::None, "zb_big_add"),
         ("__bignative", "sub") => func(&[L, L, L], Ty::None, "zb_big_sub"),

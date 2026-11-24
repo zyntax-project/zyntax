@@ -1,14 +1,15 @@
 //! The magnitude arithmetic of the arbitrary-precision int library: add,
 //! subtract, multiply, divide, compare and shift over little-endian
-//! 30-bit limbs, each held in a slot of a list of ints. Operands are
-//! trimmed (no zero limb on top); results are written into slices the
-//! caller made and zero filled, and the caller trims them.
+//! 60-bit limbs, each held in a slot of a list of ints. Operands are
+//! trimmed (no zero limb on top). A result is written into a slice the
+//! caller made, every slot of it, and the caller trims it.
 
-const BITS: u32 = 30;
+const BITS: u32 = 60;
 const BASE: i64 = 1 << BITS;
 const MASK: i64 = BASE - 1;
+const WIDE_MASK: u128 = MASK as u128;
 /// Operands this long, both, multiply by Karatsuba.
-const KARATSUBA: usize = 48;
+const KARATSUBA: usize = 32;
 
 /// `-1`, `0` or `1` as `a` is less than, equal to or more than `b`.
 pub fn cmp(a: &[i64], b: &[i64]) -> i64 {
@@ -86,20 +87,30 @@ fn shifted(a: &[i64], k: usize) -> Vec<i64> {
     out
 }
 
-/// The product by rows into a zeroed `out`: one row of the longer operand for each limb of
-/// the shorter, so a small multiplier makes few rows.
+/// The product by rows into `out`, which holds both operands' limbs:
+/// one row of the longer operand for each limb of the shorter, so a
+/// small multiplier makes few rows. The first row writes where the
+/// others add, so `out` need not be zero.
 fn mul_school(a: &[i64], b: &[i64], out: &mut [i64]) {
     let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     let m = long.len();
     for (i, &si) in short.iter().enumerate() {
         let row = &mut out[i..i + m + 1];
-        let mut carry = 0;
-        for (slot, &x) in row.iter_mut().zip(long) {
-            let t = *slot + si * x + carry;
-            *slot = t & MASK;
-            carry = t >> BITS;
+        let (si, mut carry) = (si as u128, 0u128);
+        if i == 0 {
+            for (slot, &x) in row.iter_mut().zip(long) {
+                let t = si * x as u128 + carry;
+                *slot = (t & WIDE_MASK) as i64;
+                carry = t >> BITS;
+            }
+        } else {
+            for (slot, &x) in row.iter_mut().zip(long) {
+                let t = *slot as u128 + si * x as u128 + carry;
+                *slot = (t & WIDE_MASK) as i64;
+                carry = t >> BITS;
+            }
         }
-        row[m] = carry;
+        row[m] = carry as i64;
     }
 }
 
@@ -140,38 +151,45 @@ pub fn mul(a: &[i64], b: &[i64], out: &mut [i64]) {
 /// `a / d` into `q`, which holds `a.len()` limbs, for `d` one limb;
 /// the remainder.
 pub fn divmod_small(a: &[i64], d: i64, q: &mut [i64]) -> i64 {
-    let mut r = 0;
+    let d = d as u128;
+    let mut r = 0u128;
     for i in (0..a.len()).rev() {
-        let cur = (r << BITS) | a[i];
+        let cur = (r << BITS) | a[i] as u128;
         let qi = cur / d;
-        q[i] = qi;
+        q[i] = qi as i64;
         r = cur - qi * d;
     }
-    r
+    r as i64
 }
 
-/// `a << n` into `out`, which holds `a.len() + n / 30 + 1` limbs.
+/// `a << n` into `out`, which holds `a.len() + n / 60 + 1` limbs.
 pub fn shl(a: &[i64], n: usize, out: &mut [i64]) {
-    let (limbs, bits) = (n / 30, (n % 30) as u32);
-    let mut carry = 0;
+    let limbs = n / BITS as usize;
+    let bits = (n % BITS as usize) as u32;
+    out[..limbs].fill(0);
+    let mut carry = 0u128;
     for (i, &x) in a.iter().enumerate() {
-        let t = (x << bits) | carry;
-        out[limbs + i] = t & MASK;
+        let t = ((x as u128) << bits) | carry;
+        out[limbs + i] = (t & WIDE_MASK) as i64;
         carry = t >> BITS;
     }
-    out[limbs + a.len()] = carry;
+    out[limbs + a.len()] = carry as i64;
 }
 
 /// `a >> n` into `out`, which holds `a.len()` limbs.
 pub fn shr(a: &[i64], n: usize, out: &mut [i64]) {
-    let (limbs, bits) = (n / 30, (n % 30) as u32);
+    let limbs = n / BITS as usize;
+    let bits = (n % BITS as usize) as u32;
+    let kept = a.len().saturating_sub(limbs);
     for i in limbs..a.len() {
-        let mut v = a[i] >> bits;
-        if i + 1 < a.len() {
-            v |= (a[i + 1] << (BITS - bits)) & MASK;
-        }
-        out[i - limbs] = v;
+        let low = (a[i] >> bits) as u128;
+        let high = match a.get(i + 1) {
+            Some(&next) => ((next as u128) << (BITS - bits)) & WIDE_MASK,
+            None => 0,
+        };
+        out[i - limbs] = (low | high) as i64;
     }
+    out[kept..].fill(0);
 }
 
 fn bit_length(x: i64) -> u32 {
@@ -189,8 +207,7 @@ pub fn divmod(a: &[i64], b: &[i64], q: &mut [i64], r: &mut [i64]) {
     }
     let n = b.len();
     if n == 1 {
-        let rem = divmod_small(a, b[0], q);
-        r[0] = rem;
+        r[0] = divmod_small(a, b[0], q);
         return;
     }
     // Knuth's algorithm D on normalised copies.
@@ -201,23 +218,24 @@ pub fn divmod(a: &[i64], b: &[i64], q: &mut [i64], r: &mut [i64]) {
     let mut u = vec![0; a.len() + 1];
     shl(a, s as usize, &mut u);
     let m = a.len() - n;
-    let (vtop, vsec) = (v[n - 1], v[n - 2]);
+    let (vtop, vsec) = (v[n - 1] as u128, v[n - 2] as u128);
+    let base = BASE as u128;
     for j in (0..=m).rev() {
-        let num = u[j + n] * BASE + u[j + n - 1];
+        let num = ((u[j + n] as u128) << BITS) | u[j + n - 1] as u128;
         let mut qhat = num / vtop;
         let mut rhat = num - qhat * vtop;
-        while qhat >= BASE || qhat * vsec > rhat * BASE + u[j + n - 2] {
+        while qhat >= base || qhat * vsec > ((rhat << BITS) | u[j + n - 2] as u128) {
             qhat -= 1;
             rhat += vtop;
-            if rhat >= BASE {
+            if rhat >= base {
                 break;
             }
         }
-        let (mut borrow, mut carry) = (0, 0);
+        let (mut borrow, mut carry) = (0i64, 0u128);
         for i in 0..n {
-            let p = qhat * v[i] + carry;
+            let p = qhat * v[i] as u128 + carry;
             carry = p >> BITS;
-            let mut t = u[i + j] - (p & MASK) - borrow;
+            let mut t = u[i + j] - (p & WIDE_MASK) as i64 - borrow;
             if t < 0 {
                 t += BASE;
                 borrow = 1;
@@ -226,7 +244,7 @@ pub fn divmod(a: &[i64], b: &[i64], q: &mut [i64], r: &mut [i64]) {
             }
             u[i + j] = t;
         }
-        let t = u[j + n] - carry - borrow;
+        let t = u[j + n] - carry as i64 - borrow;
         u[j + n] = t;
         if t < 0 {
             qhat -= 1;
@@ -238,20 +256,28 @@ pub fn divmod(a: &[i64], b: &[i64], q: &mut [i64], r: &mut [i64]) {
             }
             u[j + n] += carry;
         }
-        q[j] = qhat;
+        q[j] = qhat as i64;
     }
     shr(trim_slice(&u[..n]), s as usize, r);
 }
 
 /// `m = m * k + add` in place; the carry out of the top limb.
 pub fn mul_small_add(m: &mut [i64], k: i64, add: i64) -> i64 {
-    let mut carry = add;
+    let (k, mut carry) = (k as u128, add as u128);
     for x in m.iter_mut() {
-        let t = *x * k + carry;
-        *x = t & MASK;
+        let t = *x as u128 * k + carry;
+        *x = (t & WIDE_MASK) as i64;
         carry = t >> BITS;
     }
-    carry
+    carry as i64
+}
+
+/// A list as the library lays it out: storage, length, capacity.
+#[repr(C)]
+pub(crate) struct ListHeader {
+    data: *mut i64,
+    len: i64,
+    capacity: i64,
 }
 
 /// A list's slots as a slice.
@@ -357,33 +383,52 @@ pub(crate) extern "C" fn host_big_mul_small_add(m: *mut i64, n: i64, k: i64, add
     unsafe { mul_small_add(slots_mut(m, n), k, add) }
 }
 
+/// Make a list that has room for `n` limbs, and none yet, hold `n`:
+/// the slots keep what the room held, which the caller writes whole.
+pub(crate) extern "C" fn host_big_set_len(list: *mut ListHeader, n: i64) {
+    // SAFETY: a list the program holds, with room for `n` ints.
+    let header = unsafe { &mut *list };
+    if n >= 0 && n <= header.capacity && !header.data.is_null() {
+        header.len = n;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A limb vector as a big integer, for the checks below.
     fn value(m: &[i64]) -> u128 {
-        m.iter().rev().fold(0u128, |v, &x| (v << 30) | x as u128)
+        m.iter().rev().fold(0u128, |v, &x| (v << BITS) | x as u128)
     }
 
     fn limbs(mut x: u128) -> Vec<i64> {
         let mut m = Vec::new();
         while x > 0 {
-            m.push((x & MASK as u128) as i64);
-            x >>= 30;
+            m.push((x & WIDE_MASK) as i64);
+            x >>= BITS;
         }
         m
     }
 
     #[test]
     fn small_values_add_subtract_and_compare() {
-        let (a, b) = (limbs(123_456_789_012_345_678), limbs(987_654_321_098_765));
+        let (a, b) = (
+            limbs(123_456_789_012_345_678_901_234),
+            limbs(987_654_321_098_765),
+        );
         let mut s = vec![0; a.len().max(b.len()) + 1];
         add(&a, &b, &mut s);
-        assert_eq!(value(&s), 123_456_789_012_345_678 + 987_654_321_098_765);
+        assert_eq!(
+            value(&s),
+            123_456_789_012_345_678_901_234 + 987_654_321_098_765
+        );
         let mut d = vec![0; a.len()];
         sub(&a, &b, &mut d);
-        assert_eq!(value(&d), 123_456_789_012_345_678 - 987_654_321_098_765);
+        assert_eq!(
+            value(&d),
+            123_456_789_012_345_678_901_234 - 987_654_321_098_765
+        );
         assert_eq!(cmp(&a, &b), 1);
         assert_eq!(cmp(&b, &a), -1);
         assert_eq!(cmp(&a, &a), 0);
@@ -393,9 +438,20 @@ mod tests {
     fn products_match_wide_arithmetic() {
         let (x, y) = (0x1234_5678_9abc_def0u128, 0xfedc_ba98_7654_3210u128);
         let (a, b) = (limbs(x), limbs(y));
-        let mut p = vec![0; a.len() + b.len()];
+        let mut p = vec![-1; a.len() + b.len()];
         mul(&a, &b, &mut p);
         assert_eq!(value(&p), x * y);
+    }
+
+    #[test]
+    fn a_product_overwrites_what_the_output_held() {
+        let a: Vec<i64> = (0..7).map(|i| (i * 7919 + 13) % BASE + 1).collect();
+        let b: Vec<i64> = vec![123_456_789];
+        let mut dirty = vec![i64::MAX; a.len() + b.len()];
+        let mut clean = vec![0; a.len() + b.len()];
+        mul(&a, &b, &mut dirty);
+        mul(&a, &b, &mut clean);
+        assert_eq!(dirty, clean);
     }
 
     #[test]
@@ -425,13 +481,13 @@ mod tests {
 
     #[test]
     fn division_by_a_limb_and_by_a_larger_value() {
-        let a = limbs(10u128.pow(30) + 7);
+        let a = limbs(10u128.pow(36) + 7);
         let mut q = vec![0; a.len()];
-        let r = divmod_small(&a, 1_000_000_000, &mut q);
-        assert_eq!(value(&q), (10u128.pow(30) + 7) / 1_000_000_000);
-        assert_eq!(r as u128, (10u128.pow(30) + 7) % 1_000_000_000);
+        let r = divmod_small(&a, 1_000_000_000_000_000_000, &mut q);
+        assert_eq!(value(&q), (10u128.pow(36) + 7) / 1_000_000_000_000_000_000);
+        assert_eq!(r as u128, (10u128.pow(36) + 7) % 1_000_000_000_000_000_000);
         let small = limbs(5);
-        let big = limbs(10u128.pow(20));
+        let big = limbs(10u128.pow(30));
         let mut q = vec![0; 1];
         let mut r = vec![0; big.len()];
         divmod(&small, &big, &mut q, &mut r);
@@ -441,21 +497,30 @@ mod tests {
 
     #[test]
     fn shifts_move_bits_across_limbs() {
-        let a = limbs(0xdead_beef_cafe_f00d);
-        let mut l = vec![0; a.len() + 100 / 30 + 1];
-        shl(&a, 100, &mut l);
-        assert_eq!(value(&l), 0xdead_beef_cafe_f00du128 << 100);
-        let mut r = vec![0; a.len()];
+        let x = 0xdead_beef_u128;
+        let a = limbs(x);
+        let mut l = vec![-1; a.len() + 70 / 60 + 1];
+        shl(&a, 70, &mut l);
+        assert_eq!(value(&l), x << 70);
+        let wide = 0xdead_beef_cafe_f00d_u128;
+        let a = limbs(wide);
+        let mut r = vec![-1; a.len()];
         shr(&a, 17, &mut r);
-        assert_eq!(value(&r), 0xdead_beef_cafe_f00du128 >> 17);
+        assert_eq!(value(&r), wide >> 17);
+        let mut gone = vec![-1; a.len()];
+        shr(&a, 600, &mut gone);
+        assert_eq!(value(&gone), 0);
+        let mut whole = vec![-1; a.len()];
+        shr(&a, 60, &mut whole);
+        assert_eq!(value(&whole), wide >> 60);
     }
 
     #[test]
     fn a_small_multiplier_with_a_carry() {
-        let mut m = limbs(999_999_999_999);
+        let mut m = limbs(999_999_999_999_999_999_999);
         let carry = mul_small_add(&mut m, 36, 35);
         let mut v = value(&m);
-        v += (carry as u128) << (30 * m.len());
-        assert_eq!(v, 999_999_999_999 * 36 + 35);
+        v += (carry as u128) << (BITS as usize * m.len());
+        assert_eq!(v, 999_999_999_999_999_999_999 * 36 + 35);
     }
 }
