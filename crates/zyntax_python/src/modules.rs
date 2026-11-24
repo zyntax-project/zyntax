@@ -23,6 +23,7 @@ pub(crate) fn bundled(module: &str) -> Option<&'static str> {
         "decimal" => Some(include_str!("../stdlib/decimal.py")),
         "collections" => Some(include_str!("../stdlib/collections.py")),
         "itertools" => Some(include_str!("../stdlib/itertools.py")),
+        "re" => Some(include_str!("../stdlib/re.py")),
         crate::redirect::OSPATH => Some(include_str!("../stdlib/ospath.py")),
         crate::redirect::JSON => Some(include_str!("../stdlib/json.py")),
         crate::redirect::INTBASE => Some(include_str!("../stdlib/intbase.py")),
