@@ -176,6 +176,22 @@ pub(super) fn instance_hooks(t: &Types) -> Vec<Decl> {
         t.anys(),
         vec![ret(list(Vec::new(), t.anys()))],
     ));
+    // A Lua value is never iterated as an instance.
+    d.push(define(
+        "zb_hook_instance_items",
+        &[&x],
+        t.anys(),
+        vec![
+            fatal(
+                "TypeError",
+                add(
+                    add(text("'"), call("zb_any_type", vec![x.e()], string())),
+                    text("' object is not iterable"),
+                ),
+            ),
+            ret(list(Vec::new(), t.anys())),
+        ],
+    ));
     d.push(define(
         "zb_hook_shaped_items",
         &[&x],

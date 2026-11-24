@@ -5811,7 +5811,7 @@ impl<'m> Lowerer<'m> {
                         node: self.iterable(value, span),
                         ty: Ty::List(Elem::Object),
                     },
-                    Ty::Dict(_) => Val {
+                    Ty::Dict(_) | Ty::Class(_) | Ty::Classes(_) => Val {
                         node: self.coerce(value, Ty::Object),
                         ty: Ty::Object,
                     },
@@ -6330,6 +6330,64 @@ impl<'m> Lowerer<'m> {
         if let Ty::Gen(_) = seq.ty {
             return self.for_generator(f, seq, extra, span);
         }
+        // An instance whose `__iter__` returns a generator, or an
+        // iterator class, is advanced item by item.
+        let mut seq = seq;
+        if let Ty::Class(k) = seq.ty
+            && self.module.method_sig(k as usize, "__iter__").is_some()
+        {
+            let obj = self.checked_instance_as(
+                seq,
+                "TypeError",
+                "'NoneType' object is not iterable",
+                span,
+            );
+            let mut pre = Vec::new();
+            let held = self.hold(obj, &mut pre, span);
+            self.hoisted.extend(pre);
+            let iterator = self.dunder(k as usize, "__iter__", held.node.clone(), Vec::new(), span);
+            let Some(mut iterator) = iterator else {
+                return unsupported(
+                    "iterating an instance whose __iter__ takes arguments",
+                    &*f.iter,
+                );
+            };
+            // An iterator class is pulled from by its generator.
+            if let Ty::Class(k2) = iterator.ty
+                && self
+                    .module
+                    .method_sig(k2 as usize, "__iter_gen__")
+                    .is_some()
+            {
+                let mut pre = Vec::new();
+                let it = self.hold(iterator, &mut pre, span);
+                self.hoisted.extend(pre);
+                let pulled = self.dunder(
+                    k2 as usize,
+                    "__iter_gen__",
+                    it.node.clone(),
+                    Vec::new(),
+                    span,
+                );
+                match pulled {
+                    Some(g) => iterator = g,
+                    None => iterator = it,
+                }
+            }
+            if let Ty::Gen(_) = iterator.ty {
+                return self.for_generator(f, iterator, extra, span);
+            }
+            seq = iterator;
+        }
+        // An instance is iterated as the list its class makes of it.
+        let seq = if let Ty::Class(_) | Ty::Classes(_) = seq.ty {
+            Val {
+                node: self.iterable(seq, span),
+                ty: Ty::List(Elem::Object),
+            }
+        } else {
+            seq
+        };
         self.for_items(f, seq, None, extra, span)
     }
 
@@ -7921,6 +7979,11 @@ impl<'m> Lowerer<'m> {
                 )
             }
             Ty::Object => call("zb_any_iter", vec![v.node], Ty::List(Elem::Object), span),
+            // An instance iterates by its class, found from the box.
+            Ty::Class(_) | Ty::Classes(_) => {
+                let boxed = self.coerce(v, Ty::Object);
+                call("zb_any_iter", vec![boxed], Ty::List(Elem::Object), span)
+            }
             _ => self.coerce(v, Ty::List(Elem::Object)),
         }
     }
@@ -12138,6 +12201,28 @@ impl<'m> Lowerer<'m> {
                 }
                 "next" if !args.is_empty() && args.len() <= 2 => {
                     let g = self.expr(&args[0])?;
+                    // An iterator class gives its next item, or raises
+                    // what its `__next__` does.
+                    if args.len() == 1
+                        && let Ty::Class(k) = g.ty
+                        && self.module.method_sig(k as usize, "__next__").is_some()
+                    {
+                        let g = self.checked_instance_as(
+                            g,
+                            "TypeError",
+                            "'NoneType' object is not an iterator",
+                            span,
+                        );
+                        let Some(item) =
+                            self.dunder(k as usize, "__next__", g.node, Vec::new(), span)
+                        else {
+                            return unsupported(
+                                "next() of an iterator whose __next__ takes arguments",
+                                c,
+                            );
+                        };
+                        return Ok(item);
+                    }
                     let Ty::Gen(k) = g.ty else {
                         return unsupported("next() on something other than a generator", c);
                     };

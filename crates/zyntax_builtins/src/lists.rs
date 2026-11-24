@@ -2723,6 +2723,12 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
             None,
         ));
         d.push(extern_fn(
+            "zb_hook_instance_items",
+            &[("x", any())],
+            anys.clone(),
+            None,
+        ));
+        d.push(extern_fn(
             "zb_hook_shaped_items",
             &[("x", any())],
             anys.clone(),
@@ -2785,6 +2791,15 @@ pub(crate) fn shape_hook_declarations(policy: &Policy, list_type: TypeId) -> Vec
         anys.clone(),
         vec![
             fatal("TypeError", text("a generator of an unknown kind")),
+            ret(list(Vec::new(), anys.clone())),
+        ],
+    ));
+    d.push(define(
+        "zb_hook_instance_items",
+        &[&x],
+        anys.clone(),
+        vec![
+            fatal("TypeError", text("an instance of an unknown kind")),
             ret(list(Vec::new(), anys.clone())),
         ],
     ));

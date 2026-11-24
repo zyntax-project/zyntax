@@ -116,6 +116,28 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
                 other => kept.push(other),
             }
         }
+        // A class that defines `__iter__` or `__next__` gets the method
+        // that lists what it iterates, which the library calls to
+        // iterate an instance it holds boxed.
+        let defines = |name: &str| {
+            kept.iter()
+                .any(|m| matches!(m, py::Stmt::FunctionDef(f) if f.name.as_str() == name))
+        };
+        if (defines("__iter__") || defines("__next__")) && !defines("__iter_all__") {
+            // An iterator class is read through its `__next__` until
+            // StopIteration; any other through the iterator `__iter__`
+            // returns.
+            // The iterator class also has the generator that pulls from
+            // it, which a `for` loop advances item by item.
+            let source = if defines("__next__") {
+                "def __iter_all__(self):\n    out = []\n    while True:\n        try:\n            out.append(self.__next__())\n        except StopIteration:\n            break\n    return out\n\ndef __iter_gen__(self):\n    while True:\n        try:\n            item = self.__next__()\n        except StopIteration:\n            return\n        yield item\n"
+            } else {
+                "def __iter_all__(self):\n    return list(self.__iter__())\n"
+            };
+            if let Ok(parsed) = ruff_python_parser::parse_module(source) {
+                kept.extend(parsed.into_syntax().body);
+            }
+        }
         c.body = kept.into_iter().collect();
     }
     let classes: HashSet<String> = body
@@ -133,6 +155,7 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         method_of: RefCell::new(None),
         map_is_builtin: !binds_module_name(body, "map"),
         list_is_builtin: !binds_module_name(body, "list"),
+        iter_is_builtin: !binds_module_name(body, "iter"),
         map_items: Cell::new(0),
         folds: Folds::of(body, origins),
         origin: RefCell::new(None),
@@ -220,6 +243,8 @@ struct Rewriter {
     map_is_builtin: bool,
     /// No module-level binding shadows the builtin `list`.
     list_is_builtin: bool,
+    /// No module-level binding shadows the builtin `iter`.
+    iter_is_builtin: bool,
     /// Comprehension targets made for `map` calls so far.
     map_items: Cell<u32>,
     /// What names `functools.reduce` and the `operator` functions, by
@@ -532,6 +557,9 @@ impl Transformer for Rewriter {
                     if let py::Stmt::FunctionDef(f) = m {
                         bind_none_defaults(f);
                         narrow_isinstance_branches(f, &self.classes);
+                        if f.name.as_str() == "__iter__" && self.iter_is_builtin {
+                            unwrap_iter_returns(&mut f.body);
+                        }
                         let this = f
                             .parameters
                             .args
@@ -660,6 +688,43 @@ impl Transformer for Rewriter {
                 let range = c.func.range();
                 *c.func = name_expr(&name, range);
             }
+            // `iter(xs)` is the generator `(x for x in xs)`: an iterator
+            // that `next` and a `for` loop advance.
+            py::Expr::Call(c)
+                if self.iter_is_builtin
+                    && is_name(&c.func, "iter")
+                    && c.arguments.keywords.is_empty()
+                    && let [only] = &*c.arguments.args
+                    && !matches!(only, py::Expr::Starred(_)) =>
+            {
+                let range = c.range();
+                let n = self.map_items.get();
+                self.map_items.set(n + 1);
+                let item = format!("iter$item{n}");
+                let mut iter = std::mem::take(&mut c.arguments.args)
+                    .into_vec()
+                    .pop()
+                    .expect("one argument");
+                self.visit_expr(&mut iter);
+                let mut target = name_expr(&item, range);
+                if let py::Expr::Name(t) = &mut target {
+                    t.ctx = py::ExprContext::Store;
+                }
+                *e = py::Expr::Generator(py::ExprGenerator {
+                    node_index: Default::default(),
+                    range,
+                    elt: Box::new(name_expr(&item, range)),
+                    generators: vec![py::Comprehension {
+                        range,
+                        node_index: Default::default(),
+                        target,
+                        iter,
+                        ifs: Vec::new(),
+                        is_async: false,
+                    }],
+                    parenthesized: true,
+                });
+            }
             // `map(f, xs)` is `[f(x) for x in xs]`: eager, as the
             // frontend's `map` is, with `f` named once per element.
             py::Expr::Call(c)
@@ -707,6 +772,53 @@ impl Transformer for Rewriter {
                 });
             }
             _ => walk_expr(self, e),
+        }
+    }
+}
+
+/// `return iter(xs)` in an `__iter__` is `return xs`: the sequence is
+/// iterated once by whoever called, as the iterator would be.
+fn unwrap_iter_returns(stmts: &mut [py::Stmt]) {
+    for s in stmts {
+        match s {
+            py::Stmt::Return(r) => {
+                if let Some(value) = &mut r.value
+                    && let py::Expr::Call(c) = &mut **value
+                    && is_name(&c.func, "iter")
+                    && c.arguments.keywords.is_empty()
+                    && c.arguments.args.len() == 1
+                    && !matches!(c.arguments.args[0], py::Expr::Starred(_))
+                {
+                    let range = c.range();
+                    let inner = std::mem::replace(
+                        &mut c.arguments.args[0],
+                        py::Expr::NoneLiteral(py::ExprNoneLiteral {
+                            node_index: Default::default(),
+                            range,
+                        }),
+                    );
+                    **value = inner;
+                }
+            }
+            py::Stmt::If(i) => {
+                unwrap_iter_returns(&mut i.body);
+                for clause in &mut i.elif_else_clauses {
+                    unwrap_iter_returns(&mut clause.body);
+                }
+            }
+            py::Stmt::For(f) => unwrap_iter_returns(&mut f.body),
+            py::Stmt::While(w) => unwrap_iter_returns(&mut w.body),
+            py::Stmt::With(w) => unwrap_iter_returns(&mut w.body),
+            py::Stmt::Try(t) => {
+                unwrap_iter_returns(&mut t.body);
+                for h in &mut t.handlers {
+                    let py::ExceptHandler::ExceptHandler(h) = h;
+                    unwrap_iter_returns(&mut h.body);
+                }
+                unwrap_iter_returns(&mut t.orelse);
+                unwrap_iter_returns(&mut t.finalbody);
+            }
+            _ => {}
         }
     }
 }

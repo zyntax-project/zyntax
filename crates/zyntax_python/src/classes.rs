@@ -2175,6 +2175,7 @@ fn hooks(module: &Module, span: Span) -> Vec<TypedFunction> {
         unbox_hook(module, span),
     ];
     out.push(gen_items_hook(module, span));
+    out.push(instance_items_hook(module, span));
     out.extend(shaped_hooks(module, span));
     out.extend(keyed_hooks(module, span));
     out
@@ -2975,6 +2976,39 @@ fn gen_items_hook(module: &Module, span: Span) -> TypedFunction {
     statements.push(ret(none, span));
     function(
         "zb_hook_gen_items",
+        vec![param("x", Ty::Object, span)],
+        objects,
+        statements,
+        span,
+    )
+}
+
+/// `zb_hook_instance_items(x)`: the values an instance iterates as, from
+/// the `__iter_all__` its class has when it defines `__iter__` or
+/// `__next__`; any other instance is not iterable.
+fn instance_items_hook(module: &Module, span: Span) -> TypedFunction {
+    let x = var(intern("x"), Ty::Object, span);
+    let objects = Ty::List(Elem::Object);
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| module.method_sig(c, "__iter_all__").is_some(),
+        |lowerer, c, obj| {
+            let Some(items) = lowerer.invoke(c, "__iter_all__", obj, Vec::new(), span) else {
+                return Vec::new();
+            };
+            let items = lowerer.coerce(items, objects);
+            vec![ret(items, span)]
+        },
+        span,
+    );
+    statements.push(type_error_stmt(x.clone(), " object is not iterable", span));
+    let mut lowerer = scratch(module);
+    let none = lowerer.list_of(Vec::new(), Elem::Object, span);
+    statements.append(&mut lowerer.hoisted);
+    statements.push(ret(none, span));
+    function(
+        "zb_hook_instance_items",
         vec![param("x", Ty::Object, span)],
         objects,
         statements,

@@ -2267,10 +2267,19 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                     ),
                 ))],
             ),
+            // An instance is iterable by what its class says.
+            when(
+                is_instance(x.e()),
+                vec![ret(call(
+                    "zb_hook_instance_items",
+                    vec![x.e()],
+                    anys.clone(),
+                ))],
+            ),
             when(
                 or(
                     ne(cat.e(), int(CUSTOM)),
-                    or(eq(kind(x.e()), int(FUNC_TAG >> 8)), is_instance(x.e())),
+                    eq(kind(x.e()), int(FUNC_TAG >> 8)),
                 ),
                 vec![type_error(add(
                     quoted(type_name(x.e())),
