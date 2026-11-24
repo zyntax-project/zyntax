@@ -39,6 +39,12 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
     // Static and class methods, by class then method.
     let mut statics: HashMap<String, HashSet<String>> = HashMap::default();
     let mut hoisted: Vec<(py::Stmt, Option<String>)> = Vec::new();
+    // Property getters and setters by name, and what each class says
+    // about them: the classes it derives from, the properties it
+    // defines, and the attributes its methods assign on `self`.
+    let mut getters: HashSet<String> = HashSet::default();
+    let mut setters: HashSet<String> = HashSet::default();
+    let mut class_info: Vec<ClassInfo> = Vec::new();
     for (i, s) in body.iter_mut().enumerate() {
         let py::Stmt::ClassDef(c) = s else {
             continue;
@@ -59,6 +65,17 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
                 continue;
             }
         }
+        let mut info = ClassInfo {
+            bases: bases
+                .iter()
+                .filter_map(|b| match b {
+                    py::Expr::Name(n) => Some(n.id.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            name: class.clone(),
+            ..ClassInfo::default()
+        };
         let mut kept = Vec::new();
         // The plain methods defined so far, for an alias of one.
         let mut defined: HashMap<String, py::StmtFunctionDef> = HashMap::default();
@@ -113,9 +130,30 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
                         py::Identifier::new(format!("{class}${}", f.name.as_str()), f.name.range());
                     hoisted.push((py::Stmt::FunctionDef(f), origin.clone()));
                 }
+                py::Stmt::FunctionDef(mut f) if property_accessor(&f).is_some() => {
+                    let (name, is_getter) = property_accessor(&f).expect("picked");
+                    f.decorator_list.clear();
+                    let suffix = if is_getter { "get" } else { "set" };
+                    f.name = py::Identifier::new(format!("{name}${suffix}"), f.name.range());
+                    if is_getter {
+                        getters.insert(name.clone());
+                    } else {
+                        setters.insert(name.clone());
+                    }
+                    info.props.insert(name);
+                    kept.push(py::Stmt::FunctionDef(f));
+                }
                 other => kept.push(other),
             }
         }
+        for m in &kept {
+            if let py::Stmt::FunctionDef(f) = m
+                && let Some(this) = f.parameters.args.first().map(|p| p.parameter.name.as_str())
+            {
+                assigned_on(&f.body, this, &mut info.assigns);
+            }
+        }
+        class_info.push(info);
         // A class that defines `__iter__` or `__next__` gets the method
         // that lists what it iterates, which the library calls to
         // iterate an instance it holds boxed.
@@ -140,6 +178,40 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         }
         c.body = kept.into_iter().collect();
     }
+    // A property is not rewritten where a class that does not own it
+    // keeps a plain attribute of the name.
+    let owns = |class: &str, prop: &str| {
+        let mut seen: Vec<&str> = vec![class];
+        let mut at = 0;
+        while at < seen.len() {
+            let Some(info) = class_info.iter().find(|c| c.name == seen[at]) else {
+                at += 1;
+                continue;
+            };
+            if info.props.contains(prop) {
+                return true;
+            }
+            for b in &info.bases {
+                if !seen.contains(&b.as_str()) {
+                    seen.push(b.as_str());
+                }
+            }
+            at += 1;
+        }
+        false
+    };
+    let conflicts: HashSet<String> = getters
+        .iter()
+        .chain(&setters)
+        .filter(|p| {
+            class_info
+                .iter()
+                .any(|c| c.assigns.contains(*p) && !owns(&c.name, p))
+        })
+        .cloned()
+        .collect();
+    getters.retain(|p| !conflicts.contains(p));
+    setters.retain(|p| !conflicts.contains(p));
     let classes: HashSet<String> = body
         .iter()
         .filter_map(|s| match s {
@@ -148,6 +220,8 @@ pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>
         })
         .collect();
     let rewriter = Rewriter {
+        getters,
+        setters,
         classes,
         rootless,
         aliases,
@@ -217,9 +291,62 @@ fn decorated_with(f: &py::StmtFunctionDef, name: &str) -> bool {
         .any(|d| matches!(&d.expression, py::Expr::Name(n) if n.id.as_str() == name))
 }
 
+/// A property accessor: `@property` is the getter, `@name.setter` on
+/// `def name` the setter. Returns the property's name and which.
+fn property_accessor(f: &py::StmtFunctionDef) -> Option<(String, bool)> {
+    let [d] = &*f.decorator_list else {
+        return None;
+    };
+    match &d.expression {
+        py::Expr::Name(n) if n.id.as_str() == "property" => Some((f.name.to_string(), true)),
+        py::Expr::Attribute(a)
+            if a.attr.as_str() == "setter"
+                && matches!(&*a.value, py::Expr::Name(n) if n.id.as_str() == f.name.as_str()) =>
+        {
+            Some((f.name.to_string(), false))
+        }
+        _ => None,
+    }
+}
+
 fn is_static_or_class_method(f: &py::StmtFunctionDef) -> bool {
     f.decorator_list.len() == 1
         && (decorated_with(f, "classmethod") || decorated_with(f, "staticmethod"))
+}
+
+/// `receiver.method(args)`.
+fn method_call(
+    receiver: py::Expr,
+    method: &str,
+    args: Vec<py::Expr>,
+    range: ruff_text_size::TextRange,
+) -> py::Expr {
+    py::Expr::Call(py::ExprCall {
+        node_index: Default::default(),
+        range_start: range.start(),
+        func: Box::new(py::Expr::Attribute(py::ExprAttribute {
+            node_index: Default::default(),
+            range,
+            value: Box::new(receiver),
+            attr: py::Identifier::new(method, range),
+            ctx: py::ExprContext::Load,
+        })),
+        arguments: py::Arguments {
+            node_index: Default::default(),
+            range,
+            args: args.into_boxed_slice(),
+            keywords: Default::default(),
+        },
+    })
+}
+
+/// Whether `e` reads the same twice: names and attributes of names.
+fn is_pure_path(e: &py::Expr) -> bool {
+    match e {
+        py::Expr::Name(_) => true,
+        py::Expr::Attribute(a) => is_pure_path(&a.value),
+        _ => false,
+    }
 }
 
 fn name_expr(id: &str, range: ruff_text_size::TextRange) -> py::Expr {
@@ -249,7 +376,43 @@ impl Transformer for ClsRenamer {
     }
 }
 
+/// What `rewrite` learns of one class for its properties.
+#[derive(Default)]
+struct ClassInfo {
+    name: String,
+    bases: Vec<String>,
+    props: HashSet<String>,
+    assigns: HashSet<String>,
+}
+
+/// The attributes `body` assigns on the name `this`.
+fn assigned_on(body: &[py::Stmt], this: &str, out: &mut HashSet<String>) {
+    use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+    struct Assigns<'a>(&'a str, &'a mut HashSet<String>);
+    impl<'a> Visitor<'a> for Assigns<'_> {
+        fn visit_stmt(&mut self, s: &'a py::Stmt) {
+            walk_stmt(self, s);
+        }
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if let py::Expr::Attribute(a) = e
+                && matches!(a.ctx, py::ExprContext::Store)
+                && is_name(&a.value, self.0)
+            {
+                self.1.insert(a.attr.to_string());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = Assigns(this, out);
+    for s in body {
+        v.visit_stmt(s);
+    }
+}
+
 struct Rewriter {
+    /// The names of properties with a getter, and with a setter.
+    getters: HashSet<String>,
+    setters: HashSet<String>,
     /// The classes the module defines.
     classes: HashSet<String>,
     rootless: HashSet<String>,
@@ -558,6 +721,13 @@ impl Transformer for Relocate {
 }
 
 impl Rewriter {
+    /// Whether `e` names a module or a class of the program, whose
+    /// attributes are not an instance's.
+    fn names_module_or_class(&self, e: &py::Expr) -> bool {
+        matches!(e, py::Expr::Name(n)
+            if self.imported_modules.contains(n.id.as_str()) || self.classes.contains(n.id.as_str()))
+    }
+
     /// Whether `with` on `e` may be a context manager the program
     /// defines: not a file opened in place, nor a call of a module's.
     fn is_program_context(&self, e: &py::Expr) -> bool {
@@ -692,6 +862,77 @@ impl Transformer for Rewriter {
                     }
                 }
             }
+            // `obj.p = v` for a property with a setter is `obj.p$set(v)`.
+            py::Stmt::Assign(a)
+                if a.targets.len() == 1
+                    && let py::Expr::Attribute(t) = &a.targets[0]
+                    && self.setters.contains(t.attr.as_str())
+                    && !is_super(&t.value)
+                    && !self.names_module_or_class(&t.value) =>
+            {
+                let range = a.range;
+                let placeholder = name_expr("_", range);
+                let py::Expr::Attribute(target) =
+                    std::mem::replace(&mut a.targets[0], placeholder.clone())
+                else {
+                    unreachable!("matched an attribute")
+                };
+                let value = std::mem::replace(&mut *a.value, placeholder);
+                *s = py::Stmt::Expr(py::StmtExpr {
+                    node_index: Default::default(),
+                    range,
+                    value: Box::new(method_call(
+                        *target.value,
+                        &format!("{}$set", target.attr),
+                        vec![value],
+                        range,
+                    )),
+                });
+                walk_stmt(self, s);
+            }
+            // `obj.p += v` is `obj.p$set(obj.p + v)`.
+            py::Stmt::AugAssign(a)
+                if let py::Expr::Attribute(t) = &*a.target
+                    && self.setters.contains(t.attr.as_str())
+                    && self.getters.contains(t.attr.as_str())
+                    && is_pure_path(&t.value)
+                    && !is_super(&t.value)
+                    && !self.names_module_or_class(&t.value) =>
+            {
+                let range = a.range;
+                let placeholder = name_expr("_", range);
+                let py::Expr::Attribute(target) =
+                    std::mem::replace(&mut *a.target, placeholder.clone())
+                else {
+                    unreachable!("matched an attribute")
+                };
+                let value = std::mem::replace(&mut *a.value, placeholder);
+                let read = py::Expr::Attribute(py::ExprAttribute {
+                    node_index: Default::default(),
+                    range,
+                    value: target.value.clone(),
+                    attr: target.attr.clone(),
+                    ctx: py::ExprContext::Load,
+                });
+                let sum = py::Expr::BinOp(py::ExprBinOp {
+                    node_index: Default::default(),
+                    range,
+                    left: Box::new(read),
+                    op: a.op,
+                    right: Box::new(value),
+                });
+                *s = py::Stmt::Expr(py::StmtExpr {
+                    node_index: Default::default(),
+                    range,
+                    value: Box::new(method_call(
+                        *target.value,
+                        &format!("{}$set", target.attr),
+                        vec![sum],
+                        range,
+                    )),
+                });
+                walk_stmt(self, s);
+            }
             // `with` on a context manager of the program's own is a try
             // statement that calls its `__enter__` and `__exit__`.
             py::Stmt::With(w)
@@ -803,6 +1044,34 @@ impl Transformer for Rewriter {
                 }
                 let range = c.func.range();
                 *c.func = name_expr(&name, range);
+            }
+            // A call of an attribute is a method call: the receiver and
+            // the arguments are rewritten, not the callee.
+            py::Expr::Call(c)
+                if !self.getters.is_empty() && matches!(&*c.func, py::Expr::Attribute(_)) =>
+            {
+                if let py::Expr::Attribute(a) = &mut *c.func {
+                    self.visit_expr(&mut a.value);
+                }
+                for arg in c.arguments.args.iter_mut() {
+                    self.visit_expr(arg);
+                }
+                for k in c.arguments.keywords.iter_mut() {
+                    self.visit_expr(&mut k.value);
+                }
+            }
+            // `obj.p` of a property is `obj.p$get()`.
+            py::Expr::Attribute(a)
+                if self.getters.contains(a.attr.as_str())
+                    && a.ctx.is_load()
+                    && !is_super(&a.value)
+                    && !self.names_module_or_class(&a.value) =>
+            {
+                self.visit_expr(&mut a.value);
+                let range = a.range;
+                let receiver = std::mem::replace(&mut *a.value, name_expr("_", range));
+                let method = format!("{}$get", a.attr);
+                *e = method_call(receiver, &method, Vec::new(), range);
             }
             // `iter(xs)` is the generator `(x for x in xs)`: an iterator
             // that `next` and a `for` loop advance.
