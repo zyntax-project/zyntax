@@ -28,7 +28,6 @@ pub(crate) fn bundled(module: &str) -> Option<&'static str> {
         crate::redirect::JSON => Some(include_str!("../stdlib/json.py")),
         crate::redirect::INTBASE => Some(include_str!("../stdlib/intbase.py")),
         crate::redirect::BYTEARRAY => Some(include_str!("../stdlib/bytearray.py")),
-        "tempfile" => Some(include_str!("../stdlib/tempfile.py")),
         crate::bigint::MODULE => Some(include_str!("../stdlib/bigint.py")),
         _ => None,
     }

@@ -66,6 +66,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "codecs"
             | "json"
             | "struct"
+            | "tempfile"
             | "__bignative"
             | "__future__"
     )
@@ -227,6 +228,8 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("__bignative", "shr") => func(&[L, I, L], Ty::None, "zb_big_shr"),
         ("__bignative", "divmod") => func(&[L, L, L, L], Ty::None, "zb_big_divmod"),
         ("__bignative", "mul_small_add") => func(&[L, I, I], I, "zb_big_mul_small_add"),
+        // The directory the host keeps temporary files in.
+        ("tempfile", "gettempdir") => func(&[], S, "zb_temp_dir"),
         ("hashlib", "md5") => func(&[Ty::Bytes], Ty::Bytes, "zb_md5"),
         ("json", "dumps") => func(&[Ty::Object], S, "zb_json_dumps"),
         // The format is a literal the lowering reads; the result is the

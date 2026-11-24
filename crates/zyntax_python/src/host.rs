@@ -33,6 +33,16 @@ extern "C" fn host_argv(i: i64) -> zrtl::StringPtr {
     }
 }
 
+/// Where the host keeps temporary files: `TMPDIR` or `/tmp` on Unix,
+/// the system's temporary directory on Windows.
+extern "C" fn host_temp_dir() -> zrtl::StringPtr {
+    let dir = std::env::temp_dir();
+    let text = dir.to_string_lossy();
+    // Python's has no separator at its end, a root excepted.
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    zrtl::string_new(if trimmed.is_empty() { &text } else { trimmed })
+}
+
 /// Seconds since the Unix epoch, as `time.time()` gives them.
 extern "C" fn host_time() -> f64 {
     std::time::SystemTime::now()
@@ -560,7 +570,8 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 64] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 65] = [
+    zrtl::ZrtlSymbol::new(c"$Host$temp_dir".as_ptr(), host_temp_dir as *const u8),
     zrtl::ZrtlSymbol::new(
         c"$Host$big_set_len".as_ptr(),
         crate::host_bignum::host_big_set_len as *const u8,

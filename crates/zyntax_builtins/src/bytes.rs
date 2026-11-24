@@ -344,6 +344,7 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             i64(),
             "$Host$float_is_integer",
         ),
+        ("zb_temp_dir", vec![], string(), "$Host$temp_dir"),
         // What `int()`, `float()` and `eval()` accept of a string.
         (
             "zb_str_is_int_literal",
