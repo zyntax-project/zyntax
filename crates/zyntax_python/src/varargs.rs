@@ -352,6 +352,9 @@ impl<'a> Visitor<'a> for Values<'_> {
             py::Expr::Call(c) => {
                 match &*c.func {
                     py::Expr::Name(_) => {}
+                    // `chain.from_iterable(x)` calls the module's function
+                    // of that name.
+                    py::Expr::Attribute(a) if is_chain_from_iterable(a) => {}
                     py::Expr::Attribute(a) => self.visit_expr(&a.value),
                     other => self.visit_expr(other),
                 }
@@ -549,6 +552,13 @@ impl Rewriter<'_> {
     }
 }
 
+/// `chain.from_iterable` of the bundled `itertools`, as the linked
+/// program names it.
+fn is_chain_from_iterable(a: &py::ExprAttribute) -> bool {
+    a.attr.as_str() == "from_iterable"
+        && matches!(&*a.value, py::Expr::Name(n) if n.id.as_str() == "itertools$chain")
+}
+
 fn is_super(c: &py::ExprCall) -> bool {
     matches!(&*c.func, py::Expr::Name(n) if n.id.as_str() == "super") && c.arguments.args.is_empty()
 }
@@ -606,6 +616,17 @@ impl Transformer for Rewriter<'_> {
             return;
         };
         let range = c.range();
+        if let py::Expr::Attribute(a) = &*c.func
+            && is_chain_from_iterable(a)
+        {
+            *c.func = py::Expr::Name(py::ExprName {
+                node_index: Default::default(),
+                range,
+                id: py::name::Name::new("itertools$chain_from_iterable"),
+                ctx: py::ExprContext::Load,
+            });
+            return;
+        }
         let Some((v, fixed)) = self.resolve(&c.func, &range) else {
             return;
         };

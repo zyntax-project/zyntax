@@ -22,6 +22,7 @@ pub(crate) fn bundled(module: &str) -> Option<&'static str> {
     match module {
         "decimal" => Some(include_str!("../stdlib/decimal.py")),
         "collections" => Some(include_str!("../stdlib/collections.py")),
+        "itertools" => Some(include_str!("../stdlib/itertools.py")),
         crate::bigint::MODULE => Some(include_str!("../stdlib/bigint.py")),
         _ => None,
     }

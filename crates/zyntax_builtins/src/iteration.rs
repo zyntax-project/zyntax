@@ -140,13 +140,36 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
     };
     let none = || eq(len(&given), int(0));
     let one = |build: Expr, empty_value: Expr| if_expr(none(), empty_value, build);
-    let mut body = vec![when(
-        gt(len(&given), int(1)),
-        vec![fatal(
-            "TypeError",
-            add(held.e(), text(" expected at most 1 argument")),
-        )],
-    )];
+    let constructor = [
+        "list", "tuple", "dict", "set", "int", "float", "str", "bool",
+    ]
+    .iter()
+    .map(|b| named(b))
+    .reduce(or)
+    .expect("a constructor");
+    let mut body = vec![
+        when(
+            and(constructor, gt(len(&given), int(1))),
+            vec![fatal(
+                "TypeError",
+                add(held.e(), text(" expected at most 1 argument")),
+            )],
+        ),
+        // The functions a program passes as values to a call that
+        // takes one.
+        when(
+            and(named("len"), eq(len(&given), int(1))),
+            vec![ret(call(
+                "zb_box_i64",
+                vec![call("zb_seq_len_any", vec![first()], i64())],
+                any(),
+            ))],
+        ),
+        when(
+            and(named("abs"), eq(len(&given), int(1))),
+            vec![ret(call("zb_any_abs", vec![first()], any()))],
+        ),
+    ];
     // list(x) and tuple(x) copy what x iterates.
     for (builtin, boxer) in [("list", "zb_list_box_any"), ("tuple", "zb_box_tuple")] {
         let mut arm = vec![when(none(), vec![ret(call(boxer, vec![empty()], any()))])];

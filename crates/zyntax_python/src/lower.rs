@@ -14013,9 +14013,7 @@ impl<'m> Lowerer<'m> {
             .zip(&sig.params)
             .map(|(a, (_, ty))| Val { node: a, ty: *ty })
             .collect();
-        self.in_env += 1;
         let rest = self.list_of(items, Elem::Object, span);
-        self.in_env -= 1;
         let env = call(
             "zb_list_concat_any",
             vec![record, rest],
@@ -14059,9 +14057,9 @@ impl<'m> Lowerer<'m> {
         for (a, (_, ty)) in args.into_iter().zip(&sig.params) {
             items.push(Val { node: a, ty: *ty });
         }
-        self.in_env += 1;
+        // The arguments are held as dynamic values, which the shapes of
+        // a tuple among them must hear of.
         let env = self.list_of(items, Elem::Object, span);
-        self.in_env -= 1;
         let env = self.coerce(
             Val {
                 node: env,

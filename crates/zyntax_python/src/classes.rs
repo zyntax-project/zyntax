@@ -709,14 +709,14 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
         Ty::Class(k as u16),
         span,
     );
-    let mut statements = vec![let_("obj", Ty::Class(k as u16), literal, span)];
+    let mut statements = vec![let_("self$new", Ty::Class(k as u16), literal, span)];
     let mut params = Vec::new();
     if let Some((sig, fn_name)) = module.method_sig(k, "__init__") {
         let owner = module.method_owner(k, "__init__").expect("found");
         let init = without_self(sig);
         let mut args = vec![lowerer.coerce(
             Val {
-                node: var(intern("obj"), Ty::Class(k as u16), span),
+                node: var(intern("self$new"), Ty::Class(k as u16), span),
                 ty: Ty::Class(k as u16),
             },
             Ty::Class(owner as u16),
@@ -727,7 +727,10 @@ fn constructor(module: &Module, k: usize, span: Span) -> TypedFunction {
         }
         statements.push(stmt(call(fn_name, args, sig.ret, span), span));
     }
-    statements.push(ret(var(intern("obj"), Ty::Class(k as u16), span), span));
+    statements.push(ret(
+        var(intern("self$new"), Ty::Class(k as u16), span),
+        span,
+    ));
     function(
         &new_name(&class.name),
         params,
