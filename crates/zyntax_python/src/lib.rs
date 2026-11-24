@@ -45,6 +45,7 @@ mod shape;
 mod stdlib;
 mod sugar;
 mod types;
+mod varargs;
 
 pub use zyntax_embed::host::{
     HostClass, HostField, HostMethod, HostModule, HostResolver, HostType, NativeBinding,
@@ -493,11 +494,13 @@ fn parse_program_once(
         }
     }
     // Sugar the frontend does not model is rewritten away before
-    // anything is typed: `**kwargs` becomes keyword parameters, class
+    // anything is typed: `*args` becomes a tuple parameter, `**kwargs`
+    // becomes keyword parameters, class
     // and static methods become module functions, a name given a class
     // becomes the class, a local rebound in straight-line code becomes
     // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
+    varargs::rewrite(&mut statements)?;
     kwargs::rewrite(&mut statements)?;
     sugar::rewrite(&mut statements, &mut origins);
     rebind::rebound_defs(&mut statements, &mut origins);

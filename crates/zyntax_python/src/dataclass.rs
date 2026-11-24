@@ -104,7 +104,7 @@ fn is_class_var(annotation: &py::Expr) -> bool {
 
 /// Replaces the placeholder names of a parsed method with the
 /// expressions they stand for.
-struct Fill(HashMap<String, py::Expr>);
+pub(crate) struct Fill(pub(crate) HashMap<String, py::Expr>);
 
 impl Transformer for Fill {
     fn visit_expr(&self, e: &mut py::Expr) {

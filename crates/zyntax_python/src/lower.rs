@@ -11313,7 +11313,21 @@ impl<'m> Lowerer<'m> {
                         });
                     }
                     ("join", 1) => {
-                        let items = self.coerce(lowered.pop().unwrap(), Ty::List(Elem::Str));
+                        let arg = lowered.pop().unwrap();
+                        // A dynamic operand may be a tuple, which only
+                        // iteration reads.
+                        let items = if arg.ty == Ty::Object {
+                            let each =
+                                call("zb_any_iter", vec![arg.node], Ty::List(Elem::Object), span);
+                            call(
+                                &list_fn("from_any", Elem::Str),
+                                vec![each],
+                                Ty::List(Elem::Str),
+                                span,
+                            )
+                        } else {
+                            self.coerce(arg, Ty::List(Elem::Str))
+                        };
                         call("zb_str_join", vec![s, items], Ty::Str, span)
                     }
                     (

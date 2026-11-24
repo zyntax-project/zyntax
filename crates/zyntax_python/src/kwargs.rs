@@ -62,12 +62,6 @@ pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
     // What each target reads of its own.
     let mut uses: HashMap<Target, Uses> = HashMap::default();
     for (target, f) in &defs {
-        if f.parameters.vararg.is_some() {
-            return Err(Error::unsupported(
-                "*args alongside **kwargs",
-                &*f.parameters,
-            ));
-        }
         let kw = f
             .parameters
             .kwarg

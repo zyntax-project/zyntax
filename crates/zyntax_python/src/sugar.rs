@@ -385,7 +385,7 @@ fn method_call(
 }
 
 /// Whether `e` reads the same twice: names and attributes of names.
-fn is_pure_path(e: &py::Expr) -> bool {
+pub(crate) fn is_pure_path(e: &py::Expr) -> bool {
     match e {
         py::Expr::Name(_) => true,
         py::Expr::Attribute(a) => is_pure_path(&a.value),
