@@ -64,6 +64,13 @@ impl Lowerer<'_> {
                         let ints = self.coerce(v, Ty::List(Elem::Int));
                         call("zb_bytes_from_ints", vec![ints], Ty::Bytes, span)
                     }
+                    // An instance answers through `__bytes__`.
+                    Ty::Class(k) if self.class_defines(k as usize, "__bytes__") => {
+                        match self.dunder(k as usize, "__bytes__", v.node, vec![], span) {
+                            Some(r) => self.coerce(r, Ty::Bytes),
+                            None => return unsupported("bytes() of an instance", c),
+                        }
+                    }
                     Ty::Str => return unsupported("bytes() of a string without an encoding", c),
                     _ => return unsupported("bytes() of this value", c),
                 }
@@ -133,7 +140,13 @@ impl Lowerer<'_> {
         for item in &w.items {
             let v = self.expr(&item.context_expr)?;
             let Ty::File(_) = v.ty else {
-                return unsupported("`with` on something other than a file", &item.context_expr);
+                return Err(Error::unsupported(
+                    "`with` on a value that is not an open file or an object of a class of the program",
+                    &item.context_expr,
+                )
+                .with_help(
+                    "zypy compiles `with` for `open(...)` and for a class that defines both `__enter__` and `__exit__`. For anything else, call the cleanup yourself in `try`/`finally`.",
+                ));
             };
             let ty = v.ty;
             // The open and its check run before the binding.

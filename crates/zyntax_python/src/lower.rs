@@ -850,6 +850,21 @@ fn one_pass(body: Vec<Stmt>, span: Span) -> Stmt {
     )
 }
 
+fn cmp_text(op: py::CmpOp) -> &'static str {
+    match op {
+        py::CmpOp::Lt => "<",
+        py::CmpOp::LtE => "<=",
+        py::CmpOp::Gt => ">",
+        py::CmpOp::GtE => ">=",
+        py::CmpOp::Eq => "==",
+        py::CmpOp::NotEq => "!=",
+        py::CmpOp::In => "in",
+        py::CmpOp::NotIn => "not in",
+        py::CmpOp::Is => "is",
+        py::CmpOp::IsNot => "is not",
+    }
+}
+
 fn op_text(op: py::Operator) -> &'static str {
     match op {
         py::Operator::Add => "+",
@@ -7391,7 +7406,8 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<Val> {
         if !keywords.is_empty() {
-            return unsupported("keyword arguments to array()", c);
+            return Err(Error::unsupported("keyword arguments to array()", c)
+                .with_help(crate::diagnostics::KEYWORD_HELP));
         }
         let (Some(first), true) = (args.first(), args.len() <= 2) else {
             return unsupported(format!("array() with {} argument(s)", args.len()), c);
@@ -7612,7 +7628,10 @@ impl<'m> Lowerer<'m> {
             None => (args, keywords),
         };
         if !keywords.is_empty() {
-            return unsupported(format!("keyword arguments to `{name}`"), c);
+            return Err(
+                Error::unsupported(format!("keyword arguments to `{name}`"), c)
+                    .with_help(crate::diagnostics::KEYWORD_HELP),
+            );
         }
         if let Some(op) = zb
             .strip_prefix("zb_bisect_")
@@ -7872,11 +7891,9 @@ impl<'m> Lowerer<'m> {
             Ty::Class(k) => {
                 match self.dunder(k as usize, "__getitem__", seq.node, vec![index], span) {
                     Some(r) => Ok(r),
-                    None => Err(Error::unsupported_span(
-                        format!(
-                            "subscript of {}, which defines no __getitem__",
-                            self.module.classes[k as usize].name
-                        ),
+                    None => Err(crate::diagnostics::no_protocol(
+                        &self.module.classes[k as usize].name,
+                        "__getitem__",
                         span,
                     )),
                 }
@@ -7999,11 +8016,9 @@ impl<'m> Lowerer<'m> {
                 ) {
                     Some(r) => r.node,
                     None => {
-                        return Err(Error::unsupported_span(
-                            format!(
-                                "item assignment on {}, which defines no __setitem__",
-                                self.module.classes[k as usize].name
-                            ),
+                        return Err(crate::diagnostics::no_protocol(
+                            &self.module.classes[k as usize].name,
+                            "__setitem__",
                             span,
                         ));
                     }
@@ -8065,6 +8080,29 @@ impl<'m> Lowerer<'m> {
             }
             _ => self.coerce(v, Ty::List(Elem::Object)),
         }
+    }
+
+    /// The name Python gives the type of a value, for what an error says.
+    fn type_name(&self, ty: Ty) -> String {
+        match ty {
+            Ty::Int => "int".to_string(),
+            Ty::Bool => "bool".to_string(),
+            Ty::Float => "float".to_string(),
+            Ty::Str => "str".to_string(),
+            Ty::Bytes => "bytes".to_string(),
+            Ty::None => "NoneType".to_string(),
+            Ty::List(_) => "list".to_string(),
+            Ty::Tuple(_) | Ty::TupleOf(_) => "tuple".to_string(),
+            Ty::Dict(_) => "dict".to_string(),
+            Ty::Set(_) => "set".to_string(),
+            Ty::Class(k) => self.module.classes[k as usize].name.clone(),
+            _ => "object".to_string(),
+        }
+    }
+
+    /// Whether class `k` has a method called `name`.
+    pub(crate) fn class_defines(&self, k: usize, name: &str) -> bool {
+        self.module.method_sig(k, name).is_some()
     }
 
     /// Whether a list of this element kind holds instances of a class
@@ -9128,16 +9166,14 @@ impl<'m> Lowerer<'m> {
                         match self.dunder(k as usize, name, operand.node, vec![], span) {
                             Some(r) => r,
                             None => {
-                                return Err(Error::unsupported_span(
-                                    format!(
-                                        "unary `{}` on {}, which defines no {name}",
-                                        match op {
-                                            UnaryOp::Minus => "-",
-                                            UnaryOp::BitNot => "~",
-                                            _ => "+",
-                                        },
-                                        self.module.classes[k as usize].name
-                                    ),
+                                return Err(crate::diagnostics::no_unary(
+                                    match op {
+                                        UnaryOp::Minus => "-",
+                                        UnaryOp::BitNot => "~",
+                                        _ => "+",
+                                    },
+                                    &self.module.classes[k as usize].name,
+                                    name,
                                     span,
                                 ));
                             }
@@ -9258,17 +9294,21 @@ impl<'m> Lowerer<'m> {
         }
         // Any other operation reads a run-time number as its box.
         let (left, right) = (self.boxed_num(left), self.boxed_num(right));
+        let (left_ty, right_ty) = (left.ty, right.ty);
         if let Ty::Class(k) = left.ty {
             let name = types::dunder_name(op);
             if let Some(r) = self.dunder(k as usize, name, left.node, vec![right], span) {
                 return Ok(r);
             }
-            return Err(Error::unsupported_span(
-                format!(
-                    "`{}` on {}, which defines no {name}",
-                    op_text(op),
-                    self.module.classes[k as usize].name
-                ),
+            let (left_name, right_name) = (
+                self.module.classes[k as usize].name.clone(),
+                self.type_name(right_ty),
+            );
+            return Err(crate::diagnostics::no_binary(
+                op_text(op),
+                &left_name,
+                &right_name,
+                name,
                 span,
             ));
         }
@@ -9290,12 +9330,15 @@ impl<'m> Lowerer<'m> {
             if let Some(r) = self.dunder(k as usize, name, right.node, vec![left], span) {
                 return Ok(r);
             }
-            return Err(Error::unsupported_span(
-                format!(
-                    "`{}` with {} on the right, which defines no {name}",
-                    op_text(op),
-                    self.module.classes[k as usize].name
-                ),
+            let (left_name, right_name) = (
+                self.type_name(left_ty),
+                self.module.classes[k as usize].name.clone(),
+            );
+            return Err(crate::diagnostics::no_binary(
+                op_text(op),
+                &left_name,
+                &right_name,
+                name,
                 span,
             ));
         }
@@ -9721,11 +9764,15 @@ impl<'m> Lowerer<'m> {
                         same
                     });
                 }
-                return Err(Error::unsupported_span(
-                    format!(
-                        "ordering {} against a {right_ty:?}, which defines no {name}",
-                        self.module.classes[k as usize].name
-                    ),
+                let (left_name, right_name) = (
+                    self.module.classes[k as usize].name.clone(),
+                    self.type_name(right_ty),
+                );
+                return Err(crate::diagnostics::no_ordering(
+                    cmp_text(op),
+                    &left_name,
+                    &right_name,
+                    name,
                     right_node.span,
                 ));
             }
@@ -11159,8 +11206,10 @@ impl<'m> Lowerer<'m> {
                         }
                     }
                     _ => {
-                        return Err(Error::unsupported_span(
-                            format!("dict.{name} with {} argument(s)", args.len()),
+                        return Err(crate::diagnostics::unsupported_method(
+                            "dict",
+                            name,
+                            args.len(),
                             span,
                         ));
                     }
@@ -11291,8 +11340,10 @@ impl<'m> Lowerer<'m> {
                         call(&tables::set_fn(f, set_ty), vec![a, b], Ty::Bool, span)
                     }
                     _ => {
-                        return Err(Error::unsupported_span(
-                            format!("set.{name} with {} argument(s)", args.len()),
+                        return Err(crate::diagnostics::unsupported_method(
+                            "set",
+                            name,
+                            args.len(),
                             span,
                         ));
                     }
@@ -11635,8 +11686,10 @@ impl<'m> Lowerer<'m> {
                     ("encode", 0) => s,
                     ("encode", 1) if self.is_utf8_name(&args[0]) => s,
                     _ => {
-                        return Err(Error::unsupported_span(
-                            format!("str.{name} with {} argument(s)", args.len()),
+                        return Err(crate::diagnostics::unsupported_method(
+                            "str",
+                            name,
+                            args.len(),
                             span,
                         ));
                     }
@@ -11654,8 +11707,10 @@ impl<'m> Lowerer<'m> {
                     ("hex" | "hexdigest", 0) => call("zb_bytes_hex", vec![b], Ty::Str, span),
                     ("digest", 0) => b,
                     _ => {
-                        return Err(Error::unsupported_span(
-                            format!("bytes.{name} with {} argument(s)", args.len()),
+                        return Err(crate::diagnostics::unsupported_method(
+                            "bytes",
+                            name,
+                            args.len(),
                             span,
                         ));
                     }
@@ -11708,8 +11763,10 @@ impl<'m> Lowerer<'m> {
                         Ty::None,
                     ),
                     _ => {
-                        return Err(Error::unsupported_span(
-                            format!("file.{name} with {} argument(s)", args.len()),
+                        return Err(crate::diagnostics::unsupported_method(
+                            "file",
+                            name,
+                            args.len(),
                             span,
                         ));
                     }
@@ -12226,7 +12283,11 @@ impl<'m> Lowerer<'m> {
                 Ty::HostModule(_) | Ty::HostClass(_, _) | Ty::HostObject(_, _)
             ) {
                 if !keywords.is_empty() {
-                    return unsupported("keyword arguments in a host call", c);
+                    return Err(Error::unsupported(
+                        "keyword arguments in a call of a function the host program supplies",
+                        c,
+                    )
+                    .with_help(crate::diagnostics::KEYWORD_HELP));
                 }
                 let receiver = Val {
                     node: self.coerce(receiver, Ty::Object),
@@ -12235,7 +12296,11 @@ impl<'m> Lowerer<'m> {
                 return self.dynamic_method(receiver, a.attr.as_str(), args, span);
             }
             if receiver.ty == Ty::Object && !keywords.is_empty() {
-                return unsupported("keyword arguments in a call through a value", c);
+                return Err(Error::unsupported(
+                    "keyword arguments in a call through a variable that holds a function",
+                    c,
+                )
+                .with_help(crate::diagnostics::KEYWORD_HELP));
             }
             if receiver.ty == Ty::Object {
                 return self.dynamic_method(receiver, a.attr.as_str(), args, span);
@@ -12267,7 +12332,8 @@ impl<'m> Lowerer<'m> {
             return Ok(v);
         }
         if !keywords.is_empty() {
-            return unsupported("keyword arguments", c);
+            return Err(Error::unsupported("keyword arguments", c)
+                .with_help(crate::diagnostics::KEYWORD_HELP));
         }
         if let py::Expr::Attribute(a) = &*c.func {
             let receiver = self.expr(&a.value)?;
@@ -12376,11 +12442,9 @@ impl<'m> Lowerer<'m> {
                             match self.dunder(k as usize, "__int__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Int),
                                 None => {
-                                    return Err(Error::unsupported_span(
-                                        format!(
-                                            "int() of {}, which defines no __int__",
-                                            self.module.classes[k as usize].name
-                                        ),
+                                    return Err(crate::diagnostics::no_protocol(
+                                        &self.module.classes[k as usize].name,
+                                        "__int__",
                                         span,
                                     ));
                                 }
@@ -12410,11 +12474,9 @@ impl<'m> Lowerer<'m> {
                             match self.dunder(k as usize, "__float__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Float),
                                 None => {
-                                    return Err(Error::unsupported_span(
-                                        format!(
-                                            "float() of {}, which defines no __float__",
-                                            self.module.classes[k as usize].name
-                                        ),
+                                    return Err(crate::diagnostics::no_protocol(
+                                        &self.module.classes[k as usize].name,
+                                        "__float__",
                                         span,
                                     ));
                                 }
@@ -12577,11 +12639,9 @@ impl<'m> Lowerer<'m> {
                             match self.dunder(k as usize, "__len__", v.node, vec![], span) {
                                 Some(r) => self.coerce(r, Ty::Int),
                                 None => {
-                                    return Err(Error::unsupported_span(
-                                        format!(
-                                            "len() of {}, which defines no __len__",
-                                            self.module.classes[k as usize].name
-                                        ),
+                                    return Err(crate::diagnostics::no_protocol(
+                                        &self.module.classes[k as usize].name,
+                                        "__len__",
                                         span,
                                     ));
                                 }
@@ -16238,13 +16298,14 @@ impl<'m> Lowerer<'m> {
                     ty: Ty::Object,
                 });
             }
-            return Err(Error::unsupported_span(
-                format!(
-                    "method `{method}` of {}, which defines none",
-                    self.module.classes[k].name
-                ),
-                span,
-            ));
+            let class_name = &self.module.classes[k].name;
+            return Err(
+                if matches!(method, "__enter__" | "__exit__" | "__call__" | "__iter__") {
+                    crate::diagnostics::no_protocol(class_name, method, span)
+                } else {
+                    crate::diagnostics::no_attribute(class_name, method, span)
+                },
+            );
         };
         let instance = self.pick_instance(fn_name, sig, 1, args, keywords);
         let sig = match &instance {
@@ -16389,7 +16450,11 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<Val> {
         if !keywords.is_empty() {
-            return unsupported("keyword arguments in a call through a value", c);
+            return Err(Error::unsupported(
+                "keyword arguments in a call through a variable that holds a function",
+                c,
+            )
+            .with_help(crate::diagnostics::KEYWORD_HELP));
         }
         if args.len() > zyntax_builtins::functions::MAX_CALL_ARITY {
             return unsupported(
@@ -16754,7 +16819,11 @@ impl<'m> Lowerer<'m> {
         at: &impl Ranged,
     ) -> Result<Vec<Node>> {
         if !keywords.is_empty() {
-            return unsupported("keyword arguments in a host call", at);
+            return Err(Error::unsupported(
+                "keyword arguments in a call of a function the host program supplies",
+                at,
+            )
+            .with_help(crate::diagnostics::KEYWORD_HELP));
         }
         if args.len() != signature.params.len() {
             return unsupported(
@@ -16803,7 +16872,11 @@ impl<'m> Lowerer<'m> {
                 .all(|ty| *ty == crate::HostType::Float)
         {
             if !keywords.is_empty() {
-                return unsupported("keyword arguments in a host call", at);
+                return Err(Error::unsupported(
+                    "keyword arguments in a call of a function the host program supplies",
+                    at,
+                )
+                .with_help(crate::diagnostics::KEYWORD_HELP));
             }
             if args.len() != signature.params.len() {
                 return unsupported(
@@ -16873,7 +16946,11 @@ impl<'m> Lowerer<'m> {
         let mut lowered = vec![self.coerce(callee, Ty::Object)];
         if all_float {
             if !keywords.is_empty() {
-                return unsupported("keyword arguments in a host constructor", at);
+                return Err(Error::unsupported(
+                    "keyword arguments in a call of a class the host program supplies",
+                    at,
+                )
+                .with_help(crate::diagnostics::KEYWORD_HELP));
             }
             if args.len() != signature.params.len() {
                 return unsupported(
@@ -16938,7 +17015,11 @@ impl<'m> Lowerer<'m> {
         span: Span,
     ) -> Result<Val> {
         if !keywords.is_empty() {
-            return unsupported("keyword arguments in a host closure call", at);
+            return Err(Error::unsupported(
+                "keyword arguments in a call of a function value the host program supplies",
+                at,
+            )
+            .with_help(crate::diagnostics::KEYWORD_HELP));
         }
         if args.len() != arity as usize {
             return unsupported(
@@ -16992,7 +17073,11 @@ impl<'m> Lowerer<'m> {
                 .all(|ty| *ty == crate::HostType::Float)
         {
             if !keywords.is_empty() {
-                return unsupported("keyword arguments in a host call", at);
+                return Err(Error::unsupported(
+                    "keyword arguments in a call of a function the host program supplies",
+                    at,
+                )
+                .with_help(crate::diagnostics::KEYWORD_HELP));
             }
             if args.len() != signature.params.len() {
                 return unsupported(

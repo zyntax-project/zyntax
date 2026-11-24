@@ -15,6 +15,8 @@ pub(crate) const OSPATH: &str = "__ospath";
 pub(crate) const JSON: &str = "__json";
 /// The module for `int(text, base)`.
 pub(crate) const INTBASE: &str = "__intbase";
+/// The module for `bytearray`.
+pub(crate) const BYTEARRAY: &str = "__bytearray";
 
 const OSPATH_NAMES: &[&str] = &["isabs", "split", "splitext", "normpath", "commonprefix"];
 const JSON_NAMES: &[&str] = &["loads", "load", "JSONDecodeError"];
@@ -104,6 +106,27 @@ impl Transformer for Redirect<'_> {
 
     fn visit_expr(&self, e: &mut py::Expr) {
         walk_expr(self, e);
+        // `bytearray` is the module's class.
+        if let py::Expr::Name(n) = e
+            && n.id.as_str() == "bytearray"
+            && n.ctx == py::ExprContext::Load
+        {
+            let range = n.range;
+            *e = py::Expr::Attribute(py::ExprAttribute {
+                node_index: Default::default(),
+                range,
+                value: Box::new(py::Expr::Name(py::ExprName {
+                    node_index: Default::default(),
+                    range,
+                    id: py::name::Name::new(BYTEARRAY),
+                    ctx: py::ExprContext::Load,
+                })),
+                attr: py::Identifier::new("bytearray", range),
+                ctx: py::ExprContext::Load,
+            });
+            self.used.borrow_mut().push(BYTEARRAY);
+            return;
+        }
         let py::Expr::Call(c) = e else {
             return;
         };

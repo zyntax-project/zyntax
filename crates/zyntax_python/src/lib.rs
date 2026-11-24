@@ -33,6 +33,7 @@ mod class_attrs;
 mod classes;
 mod dataclass;
 mod decorators;
+mod diagnostics;
 mod enums;
 mod format;
 mod host;
@@ -82,6 +83,18 @@ pub enum Error {
     #[error("{what} is not supported yet (at byte offset {}{})", span.0, in_module(module))]
     Unsupported {
         what: String,
+        /// What to write instead, when there is something to say.
+        help: Option<String>,
+        span: (usize, usize),
+        module: Option<String>,
+    },
+    /// Python that raises whatever it is run with, found while
+    /// compiling: the message is the one Python gives.
+    #[error("{exception}: {message} (at byte offset {}{})", span.0, in_module(module))]
+    Raises {
+        exception: &'static str,
+        message: String,
+        help: Option<String>,
         span: (usize, usize),
         module: Option<String>,
     },
@@ -110,7 +123,22 @@ impl Error {
         let range = at.range();
         Error::Unsupported {
             what: what.into(),
+            help: None,
             span: (range.start().to_usize(), range.end().to_usize()),
+            module: None,
+        }
+    }
+
+    pub(crate) fn raises_span(
+        exception: &'static str,
+        message: impl Into<String>,
+        span: Span,
+    ) -> Self {
+        Error::Raises {
+            exception,
+            message: message.into(),
+            help: None,
+            span: (span.start, span.end),
             module: None,
         }
     }
@@ -118,16 +146,27 @@ impl Error {
     pub(crate) fn unsupported_span(what: impl Into<String>, span: Span) -> Self {
         Error::Unsupported {
             what: what.into(),
+            help: None,
             span: (span.start, span.end),
             module: None,
         }
+    }
+
+    /// The same error with a line saying what to write instead.
+    pub(crate) fn with_help(mut self, text: impl Into<String>) -> Self {
+        if let Error::Unsupported { help, .. } | Error::Raises { help, .. } = &mut self {
+            *help = Some(text.into());
+        }
+        self
     }
 
     /// The same error, located in the named module rather than the main
     /// file.
     pub(crate) fn in_module(mut self, name: &str) -> Self {
         match &mut self {
-            Error::Syntax { module, .. } | Error::Unsupported { module, .. } => {
+            Error::Syntax { module, .. }
+            | Error::Unsupported { module, .. }
+            | Error::Raises { module, .. } => {
                 if module.is_none() {
                     *module = Some(name.to_string());
                 }
@@ -140,7 +179,9 @@ impl Error {
     /// The module the error is located in, when it is not the main file.
     pub fn module(&self) -> Option<&str> {
         match self {
-            Error::Syntax { module, .. } | Error::Unsupported { module, .. } => module.as_deref(),
+            Error::Syntax { module, .. }
+            | Error::Unsupported { module, .. }
+            | Error::Raises { module, .. } => module.as_deref(),
             Error::Library(_) => None,
         }
     }
@@ -151,12 +192,27 @@ impl Error {
     pub fn render(&self, file: &str, source: &str, use_colors: bool) -> String {
         use zyntax_typed_ast::diagnostics::{Diagnostic, render_diagnostic};
         let (message, label, span) = match self {
-            Error::Syntax { message, span, .. } => {
-                (format!("syntax error: {message}"), "here", *span)
-            }
+            Error::Syntax { message, span, .. } => (
+                format!("syntax error: {message}"),
+                "here".to_string(),
+                *span,
+            ),
             Error::Unsupported { what, span, .. } => (
                 format!("{what} is not supported yet"),
-                "this frontend does not compile this form",
+                format!(
+                    "zypy does not compile this {} yet",
+                    diagnostics::describe(source, *span)
+                ),
+                *span,
+            ),
+            Error::Raises {
+                exception,
+                message,
+                span,
+                ..
+            } => (
+                format!("{exception}: {message}"),
+                format!("this raises {exception} when the program runs"),
                 *span,
             ),
             Error::Library(message) => {
@@ -168,7 +224,16 @@ impl Error {
         let end = source.len().max(1);
         let start = span.0.min(end - 1);
         let stop = span.1.max(start + 1).min(end);
-        let diagnostic = Diagnostic::error(message).with_primary(Span::new(start, stop), label);
+        let mut diagnostic = Diagnostic::error(message).with_primary(Span::new(start, stop), label);
+        if let Error::Unsupported {
+            help: Some(help), ..
+        }
+        | Error::Raises {
+            help: Some(help), ..
+        } = self
+        {
+            diagnostic = diagnostic.with_help(help.clone());
+        }
         render_diagnostic(&diagnostic, file, source, use_colors)
     }
 }
@@ -1783,6 +1848,9 @@ fn lower_stub(
 ) -> Vec<TypedNode<TypedDeclaration>> {
     let message = match error {
         Error::Unsupported { what, .. } => format!("{what} is not supported"),
+        Error::Raises {
+            exception, message, ..
+        } => format!("{exception}: {message}"),
         other => format!("{other:?}"),
     };
     let mut variants = vec![(item.name.clone(), false)];

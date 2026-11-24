@@ -1,0 +1,5 @@
+bytearray(b'Hello! ok') 9 72 107 b'Hello! ok' Hello! ok [72, 101, 108]
+bytearray(b'') bytearray(b'\x00\x00\x00') bytearray(b'hi') bytearray(b'hi') bytearray(b'abc') bytearray(b'abab')
+99 bytearray(b'b') 97 bytearray(b'b') True True True True False
+bytearray(b'') bytearray(b'bx') True False
+6 bytearray(b'ABCDE') ABCDE

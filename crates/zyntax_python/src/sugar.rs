@@ -838,6 +838,10 @@ impl Rewriter {
                 .expect("the with template parses")
                 .into_syntax()
                 .body;
+            // An error in the template is the program's, at the manager.
+            for t in parsed.iter_mut() {
+                restamp_stmt(t, item.context_expr.range());
+            }
             if let py::Stmt::Assign(a) = &mut parsed[0] {
                 *a.value = item.context_expr;
             }
@@ -1717,4 +1721,77 @@ fn is_name(e: &py::Expr, name: &str) -> bool {
 
 fn is_super(e: &py::Expr) -> bool {
     matches!(e, py::Expr::Call(c) if is_name(&c.func, "super"))
+}
+
+/// A statement of a template, and what it holds, placed at `at`, so that
+/// what is reported about it points into the program.
+fn restamp_stmt(s: &mut py::Stmt, at: ruff_text_size::TextRange) {
+    match s {
+        py::Stmt::Assign(a) => {
+            a.range = at;
+            for t in a.targets.iter_mut() {
+                restamp_expr(t, at);
+            }
+            restamp_expr(&mut a.value, at);
+        }
+        py::Stmt::Expr(e) => {
+            e.range = at;
+            restamp_expr(&mut e.value, at);
+        }
+        py::Stmt::If(i) => {
+            i.range = at;
+            restamp_expr(&mut i.test, at);
+            for b in i.body.iter_mut() {
+                restamp_stmt(b, at);
+            }
+        }
+        py::Stmt::Raise(r) => r.range = at,
+        py::Stmt::Pass(p) => p.range = at,
+        py::Stmt::Try(t) => {
+            t.range = at;
+            for b in t.body.iter_mut().chain(t.finalbody.iter_mut()) {
+                restamp_stmt(b, at);
+            }
+            for h in t.handlers.iter_mut() {
+                let py::ExceptHandler::ExceptHandler(h) = h;
+                h.range = at;
+                if let Some(ty) = &mut h.type_ {
+                    restamp_expr(ty, at);
+                }
+                if let Some(name) = &mut h.name {
+                    *name = py::Identifier::new(name.as_str(), at);
+                }
+                for b in h.body.iter_mut() {
+                    restamp_stmt(b, at);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn restamp_expr(e: &mut py::Expr, at: ruff_text_size::TextRange) {
+    match e {
+        py::Expr::Name(n) => n.range = at,
+        py::Expr::Attribute(a) => {
+            a.range = at;
+            a.attr = py::Identifier::new(a.attr.as_str(), at);
+            restamp_expr(&mut a.value, at);
+        }
+        py::Expr::Call(c) => {
+            c.range_start = at.start();
+            c.arguments.range = at;
+            restamp_expr(&mut c.func, at);
+            for a in c.arguments.args.iter_mut() {
+                restamp_expr(a, at);
+            }
+        }
+        py::Expr::UnaryOp(u) => {
+            u.range = at;
+            restamp_expr(&mut u.operand, at);
+        }
+        py::Expr::BooleanLiteral(b) => b.range = at,
+        py::Expr::NoneLiteral(n) => n.range = at,
+        _ => {}
+    }
 }
