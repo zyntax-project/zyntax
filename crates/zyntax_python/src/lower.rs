@@ -8056,6 +8056,13 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// Whether a list of this element kind holds instances of a class
+    /// whose equality the program defines, which a search must call.
+    fn calls_eq(&self, e: Elem) -> bool {
+        matches!(e, Elem::Class(_))
+            && (0..self.module.classes.len()).any(|c| self.module.method_sig(c, "__eq__").is_some())
+    }
+
     /// Whether some class of the module has a method called `name` that
     /// takes no argument.
     fn has_method_named(&self, name: &str) -> bool {
@@ -9727,6 +9734,7 @@ impl<'m> Lowerer<'m> {
                     self.array_search(left, right.node, e, c, "contains", span)?
                 } else if let Ty::List(e) = right.ty
                     && Self::may_be_element(left.ty, e)
+                    && !self.calls_eq(e)
                 {
                     let item = self.elem_arg(left, e);
                     call(
@@ -10116,7 +10124,7 @@ impl<'m> Lowerer<'m> {
             });
         }
         if let (Some(e), Some(f)) = (seq_kind(left.ty), seq_kind(right.ty)) {
-            let (l, r, e) = if e == f {
+            let (l, r, e) = if e == f && !self.calls_eq(e) {
                 (left.node, right.node, e)
             } else {
                 (
@@ -10931,6 +10939,56 @@ impl<'m> Lowerer<'m> {
                         let i = self.expr_as(&args[0], Ty::Int)?;
                         let v = self.expr_as_elem(&args[1], e)?;
                         call(&list_fn("insert", e), vec![list, i, v], Ty::None, span)
+                    }
+                    // Instances of a class that defines `__eq__` are found
+                    // by it, as boxes are.
+                    "index" | "count" if self.calls_eq(e) => {
+                        expect(1, self)?;
+                        let item = self.expr_as(&args[0], Ty::Object)?;
+                        let boxed = self.coerce(
+                            Val {
+                                node: list,
+                                ty: Ty::List(e),
+                            },
+                            Ty::List(Elem::Object),
+                        );
+                        call(&list_fn(name, Elem::Object), vec![boxed, item], ty, span)
+                    }
+                    "remove" if self.calls_eq(e) => {
+                        expect(1, self)?;
+                        let item = self.expr_as(&args[0], Ty::Object)?;
+                        let mut pre = Vec::new();
+                        let held = self.hold(
+                            Val {
+                                node: list,
+                                ty: Ty::List(e),
+                            },
+                            &mut pre,
+                            span,
+                        );
+                        let boxed = self.coerce(held.clone(), Ty::List(Elem::Object));
+                        let at = call(
+                            &list_fn("index", Elem::Object),
+                            vec![boxed, item],
+                            Ty::Int,
+                            span,
+                        );
+                        pre.push(TypedNode::new(
+                            TypedStatement::Expression(Box::new(elem_call(
+                                "pop",
+                                e,
+                                vec![held.node, at],
+                                span,
+                            ))),
+                            Type::Unknown,
+                            span,
+                        ));
+                        let none =
+                            node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                        return Ok(Val {
+                            node: self.value_after_calls(pre, none, Ty::None, span),
+                            ty: Ty::None,
+                        });
                     }
                     "remove" | "index" | "count" => {
                         expect(1, self)?;

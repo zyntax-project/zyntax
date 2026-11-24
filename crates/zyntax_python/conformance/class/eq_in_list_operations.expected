@@ -1,0 +1,7 @@
+True False False True
+2 1 0
+[P(1), P(3)] 2
+True False False True False
+2 True 1
+ValueError
+[P(1), P(2)]
