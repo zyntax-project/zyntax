@@ -33,6 +33,7 @@ mod class_attrs;
 mod classes;
 mod dataclass;
 mod decorators;
+mod enums;
 mod format;
 mod host;
 mod infer_deps;
@@ -522,6 +523,7 @@ fn parse_program_once(
     }
     walrus::rewrite(&mut statements, &mut origins)?;
     namedtuple::rewrite(&mut statements, &mut origins);
+    enums::rewrite(&mut statements, &mut origins);
     patterns::rewrite(&mut statements, &mut origins)?;
     decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);

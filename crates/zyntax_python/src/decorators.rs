@@ -17,6 +17,7 @@ const IMPORTED: &[(&str, &[&str])] = &[
     ("functools", &["lru_cache", "cache"]),
     ("contextlib", &["contextmanager"]),
     ("abc", &["ABC", "ABCMeta", "abstractmethod"]),
+    ("enum", &["Enum", "IntEnum", "StrEnum", "auto", "unique"]),
 ];
 
 fn is_imported(module: &str, name: &str) -> bool {
@@ -356,7 +357,7 @@ fn guard(c: &mut py::StmtClassDef, class: &str, methods: &[String]) {
 }
 
 /// Remove the imports of the decorators this pass made unnecessary.
-fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
+pub(crate) fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
     let mut kept = Vec::with_capacity(body.len());
     let mut kept_origins = Vec::with_capacity(body.len());
     let mut dropped: Vec<(String, bool)> = Vec::new();

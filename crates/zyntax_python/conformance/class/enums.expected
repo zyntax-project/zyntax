@@ -1,0 +1,16 @@
+Color.RED <Color.GREEN: 2> BLUE 3
+Color.GREEN Color.BLUE True True False
+[<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>] 3 ['RED', 'GREEN', 'BLUE'] [1, 2, 3]
+red=1 True
+green=2 False
+blue=3 False
+True True
+b
+ValueError 9 is not a valid Color
+KeyError 'PURPLE'
+warm cool cool
+True True True 5 10 [<Level.LOW: 1>, <Level.HIGH: 10>]
+5 <Level.MID: 5> 2 15 2 4
+fast slow <Mode.FAST: 'fast'> slow
+[1, 2, 3] EARTH Planet.VENUS
+is green
