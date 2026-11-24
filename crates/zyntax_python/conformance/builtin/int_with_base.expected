@@ -1,0 +1,7 @@
+65 255 255 5 31 35 15 7
+5 15 255 42 -16 7 1000
+ValueError invalid literal for int() with base 2: '2'
+ValueError invalid literal for int() with base 16: 'g'
+ValueError invalid literal for int() with base 10: ''
+ValueError invalid literal for int() with base 10: '1__0'
+ValueError int() base must be >= 2 and <= 36, or 0

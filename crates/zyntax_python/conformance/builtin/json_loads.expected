@@ -1,0 +1,14 @@
+zy ['a', 'b'] 4 5.0 True None -7
+['f', 'n', 'name', 'nested', 'none', 'ok', 'tags'] 7 int float
+[] {} [1, 2, 3] 12 s True None
+line
+break A "q" \ tab	
+-50.0 1000.0 0 [1.0, 2]
+[True, False]
+ValueError
+ValueError
+ValueError
+ValueError
+ValueError
+{"k": [1, 2, {"z": null}], "s": "x"} True
+60
