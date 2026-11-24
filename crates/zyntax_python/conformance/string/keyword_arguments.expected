@@ -1,0 +1,14 @@
+['a', 'b  c d']
+['a', 'b', 'c d']
+['a', 'b', '', 'c', 'd']
+['a', 'b  c d']
+['a b  c', 'd']
+['a,b', 'c']
+['a\n', 'b\n']
+['a', 'b']
+a   b
+b'abc'
+bba
+2 a
+True False True False
+True False

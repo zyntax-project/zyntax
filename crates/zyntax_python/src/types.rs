@@ -2138,6 +2138,66 @@ pub(crate) fn builtin_method_counts(receiver: Ty, attr: &str) -> Option<(usize, 
     }
 }
 
+/// The parameters of the str methods that accept keywords, in order,
+/// each with its default as source; an empty default is a parameter
+/// that must be given.
+fn str_keyword_params(attr: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    Some(match attr {
+        "split" | "rsplit" => &[("sep", "None"), ("maxsplit", "-1")],
+        "splitlines" => &[("keepends", "False")],
+        "expandtabs" => &[("tabsize", "8")],
+        "encode" => &[("encoding", "'utf-8'"), ("errors", "'strict'")],
+        "replace" => &[("old", ""), ("new", ""), ("count", "-1")],
+        _ => return None,
+    })
+}
+
+/// The arguments of `str.attr(args, keywords)` as positional ones: each
+/// keyword placed at its parameter, the skipped parameters given their
+/// defaults. `None` where a keyword is not a parameter, is out of
+/// order (the order the arguments are evaluated in would change),
+/// repeats a positional argument, or the method takes no keywords.
+pub(crate) fn str_keywords_positional(
+    attr: &str,
+    args: &[py::Expr],
+    keywords: &[py::Keyword],
+) -> Option<Vec<py::Expr>> {
+    let params = str_keyword_params(attr)?;
+    if args.len() > params.len() {
+        return None;
+    }
+    let mut slots: Vec<Option<py::Expr>> = vec![None; params.len()];
+    for (slot, a) in slots.iter_mut().zip(args) {
+        *slot = Some(a.clone());
+    }
+    let mut after = args.len();
+    for k in keywords {
+        let name = k.arg.as_ref()?.as_str();
+        let i = params.iter().position(|(n, _)| *n == name)?;
+        // `old` and `new` of `replace` are positional only.
+        if i < after || (attr == "replace" && i < 2) {
+            return None;
+        }
+        slots[i] = Some(k.value.clone());
+        after = i + 1;
+    }
+    let last = slots.iter().rposition(Option::is_some)?;
+    let mut out = Vec::with_capacity(last + 1);
+    for (slot, (_, default)) in slots[..=last].iter().zip(params) {
+        match slot {
+            Some(e) => out.push(e.clone()),
+            None if default.is_empty() => return None,
+            None => out.push(
+                *ruff_python_parser::parse_expression(default)
+                    .ok()?
+                    .into_syntax()
+                    .body,
+            ),
+        }
+    }
+    Some(out)
+}
+
 /// Whether a value of builtin type `ty` has attribute `attr`: a method
 /// that can be bound, a data attribute, or one of the protocol names
 /// programs probe for.

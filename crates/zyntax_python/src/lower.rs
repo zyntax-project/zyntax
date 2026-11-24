@@ -11046,6 +11046,37 @@ impl<'m> Lowerer<'m> {
                 Ok(Val { node, ty })
             }
             Ty::Str => {
+                // A tuple held in a variable is the display of its
+                // elements.
+                if matches!(name, "startswith" | "endswith")
+                    && let [py::Expr::Name(n)] = args
+                    && let Ty::Tuple(k) = self.ty_of(&args[0])
+                {
+                    let range = n.range;
+                    let elts = (0..types::tuple_shape(k).len())
+                        .map(|i| {
+                            py::Expr::Subscript(py::ExprSubscript {
+                                node_index: Default::default(),
+                                range,
+                                value: Box::new(args[0].clone()),
+                                slice: Box::new(py::Expr::NumberLiteral(py::ExprNumberLiteral {
+                                    node_index: Default::default(),
+                                    range,
+                                    value: py::Number::Int(py::Int::from(i as u64)),
+                                })),
+                                ctx: py::ExprContext::Load,
+                            })
+                        })
+                        .collect();
+                    let display = py::Expr::Tuple(py::ExprTuple {
+                        elts,
+                        ctx: py::ExprContext::Load,
+                        parenthesized: true,
+                        range,
+                        node_index: Default::default(),
+                    });
+                    return self.method(receiver, name, &[display], ty, span);
+                }
                 // A tuple of affixes: any one of them is the answer, each
                 // evaluated before the test as a call's arguments are.
                 if matches!(name, "startswith" | "endswith")
@@ -11797,6 +11828,13 @@ impl<'m> Lowerer<'m> {
             } else {
                 receiver
             };
+            if receiver.ty == Ty::Str
+                && !keywords.is_empty()
+                && let Some(positional) =
+                    types::str_keywords_positional(a.attr.as_str(), args, keywords)
+            {
+                return self.method(receiver, a.attr.as_str(), &positional, ty, span);
+            }
             if let Ty::Class(k) = receiver.ty {
                 return self.method_on(
                     k as usize,
