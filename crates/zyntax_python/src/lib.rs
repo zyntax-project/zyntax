@@ -39,6 +39,7 @@ mod infer_deps;
 mod kwargs;
 mod lower;
 mod modules;
+mod namedtuple;
 mod patterns;
 mod prelude;
 mod rebind;
@@ -518,6 +519,7 @@ fn parse_program_once(
     if big {
         bigint::rewrite(&mut statements, &origins)?;
     }
+    namedtuple::rewrite(&mut statements, &mut origins);
     patterns::rewrite(&mut statements, &mut origins)?;
     decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);

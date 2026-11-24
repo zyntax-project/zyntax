@@ -1,0 +1,14 @@
+Point(x=1, y=2) Point(x=4, y=5) 6 Point(x=1, y=2) Point(x=4, y=5)
+1 2 1 2 2 2 [1, 2] (4, 5) 3
+True True True True [Point(x=0, y=9), Point(x=1, y=2), Point(x=4, y=5)]
+Point(x=10, y=2) Point(x=-1, y=0) {'x': 1, 'y': 2} ('x', 'y')
+Ann 30 Person(name='Ann', age=30)
+Config(host='localhost', port=80, debug=False) Config(host='example.org', port=80, debug=False) Config(host='h', port=1, debug=True) Config(host='localhost', port=8080, debug=False)
+Pair(left=3, right=10) 3 10 13 3 True
+['Zed', 'Bob', 'Amy'] Person(name='Amy', age=31)
+Zed 20
+Bob 25
+Amy 31
+['Amy', 'Bob', 'Zed'] 31
+IndexError tuple index out of range
+point 1 2

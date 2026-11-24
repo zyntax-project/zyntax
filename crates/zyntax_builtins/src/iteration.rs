@@ -117,29 +117,147 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
         ],
     ));
 
-    // A builtin bound to a name, `izip = zip`: calls through the name
-    // are the builtin's own, typed by the frontend, so the record the
-    // name holds is reached only by a call the frontend did not see
-    // through. Its environment holds the builtin's name for the message.
-    let held = local("held", anys.clone());
+    // A builtin type or function named as a value: `factory = list`, or
+    // `defaultdict(int)`. A frontend that makes a type's name its value
+    // calls it by `zb_builtin_name_call`; a function of the builtins is a
+    // record whose third word is its name, called through
+    // `zb_builtin_value_call`. The types a program uses as factories
+    // answer with what they build; any other is a TypeError.
+    let held = local("held", string());
+    let given = local("given", anys.clone());
+    let made = local("made", anys.clone());
+    let named = |what: &str| call("zb_str_eq", vec![held.e(), text(what)], boolean());
+    let first = || at(&given, int(0));
+    let copied = || {
+        vec![
+            made.decl(empty()),
+            expr(call(
+                "zb_list_extend_any",
+                vec![made.e(), call("zb_any_iter", vec![first()], anys.clone())],
+                unit(),
+            )),
+        ]
+    };
+    let none = || eq(len(&given), int(0));
+    let one = |build: Expr, empty_value: Expr| if_expr(none(), empty_value, build);
+    let mut body = vec![when(
+        gt(len(&given), int(1)),
+        vec![fatal(
+            "TypeError",
+            add(held.e(), text(" expected at most 1 argument")),
+        )],
+    )];
+    // list(x) and tuple(x) copy what x iterates.
+    for (builtin, boxer) in [("list", "zb_list_box_any"), ("tuple", "zb_box_tuple")] {
+        let mut arm = vec![when(none(), vec![ret(call(boxer, vec![empty()], any()))])];
+        arm.extend(copied());
+        arm.push(ret(call(boxer, vec![made.e()], any())));
+        body.push(when(named(builtin), arm));
+    }
+    body.push(when(
+        named("dict"),
+        vec![ret(one(
+            call(
+                "zb_dict_box",
+                vec![call(
+                    "zb_dict_from_any",
+                    vec![first()],
+                    crate::dicts::dict_type(list_type),
+                )],
+                any(),
+            ),
+            call(
+                "zb_dict_box",
+                vec![call(
+                    "zb_dict_new",
+                    vec![],
+                    crate::dicts::dict_type(list_type),
+                )],
+                any(),
+            ),
+        ))],
+    ));
+    body.push(when(
+        named("set"),
+        vec![ret(call(
+            "zb_set_box",
+            vec![call(
+                "zb_set_from",
+                vec![if_expr(
+                    none(),
+                    empty(),
+                    call("zb_any_iter", vec![first()], anys.clone()),
+                )],
+                crate::dicts::set_type(list_type),
+            )],
+            any(),
+        ))],
+    ));
+    body.push(when(
+        named("int"),
+        vec![ret(one(
+            call(
+                "zb_box_i64",
+                vec![call("zb_any_int", vec![first()], i64())],
+                any(),
+            ),
+            call("zb_box_i64", vec![int(0)], any()),
+        ))],
+    ));
+    body.push(when(
+        named("float"),
+        vec![ret(one(
+            call(
+                "zb_box_f64",
+                vec![call("zb_any_float", vec![first()], f64())],
+                any(),
+            ),
+            call("zb_box_f64", vec![float(0.0)], any()),
+        ))],
+    ));
+    body.push(when(
+        named("str"),
+        vec![ret(one(
+            call(
+                "zb_box_str",
+                vec![call("zb_any_str", vec![first()], string())],
+                any(),
+            ),
+            call("zb_box_str", vec![text("")], any()),
+        ))],
+    ));
+    body.push(when(
+        named("bool"),
+        vec![ret(one(
+            call("zb_box_bool", vec![truthy(first())], any()),
+            call("zb_box_bool", vec![bool(false)], any()),
+        ))],
+    ));
+    body.push(fatal(
+        "TypeError",
+        add(
+            add(text("calling "), held.e()),
+            text(" through a value is not supported here"),
+        ),
+    ));
+    d.push(define(
+        "zb_builtin_name_call",
+        &[&held, &given],
+        any(),
+        body,
+    ));
     d.push(define(
         "zb_builtin_value_call",
         &[&env, &packed],
         any(),
-        vec![
-            held.decl(env.e()),
-            expr(packed.e()),
-            fatal(
-                "TypeError",
-                add(
-                    add(
-                        text("calling "),
-                        call("zb_any_as_str", vec![at(&held, int(0))], string()),
-                    ),
-                    text(" through a value is not supported here"),
-                ),
-            ),
-        ],
+        vec![ret(call(
+            "zb_builtin_name_call",
+            vec![
+                call("zb_any_as_str", vec![idx(env.e(), int(2), any())], string()),
+                call("zb_list_unbox_any", vec![packed.e()], anys.clone()),
+            ],
+            any(),
+        ))],
     ));
 
     // A `bisect` imported as a value (for example, a function default)

@@ -8056,6 +8056,27 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// Whether some class of the module has a method called `name` that
+    /// takes no argument.
+    fn has_method_named(&self, name: &str) -> bool {
+        (0..self.module.classes.len()).any(|c| {
+            self.module
+                .method_sig(c, name)
+                .is_some_and(|(sig, _)| sig.params.len() == 1)
+        })
+    }
+
+    /// The pairs of the mapping object `value`, as a list of dynamic
+    /// values: what its `items()` returns.
+    fn mapping_items(&mut self, value: Node, span: Span) -> Node {
+        self.module
+            .dyn_methods
+            .borrow_mut()
+            .insert(("items".to_string(), 0));
+        let items = call(&callm_name("items", 0), vec![value], Ty::Object, span);
+        call("zb_any_iter", vec![items], Ty::List(Elem::Object), span)
+    }
+
     /// The typed list an iterable argument stands for: a `range(...)` is
     /// its ints, a string its characters, anything else what it holds.
     fn sequence(&mut self, e: &py::Expr, span: Span) -> Result<Val> {
@@ -12163,6 +12184,29 @@ impl<'m> Lowerer<'m> {
         if let py::Expr::Name(n) = &*c.func {
             let name = n.id.as_str();
             match name {
+                // A conversion with nothing to convert is the type's zero.
+                "int" | "float" | "str"
+                    if args.is_empty() && keywords.is_empty() && !self.is_variable(name) =>
+                {
+                    return Ok(match name {
+                        "int" => Val {
+                            node: int_lit(0, span),
+                            ty: Ty::Int,
+                        },
+                        "float" => Val {
+                            node: node(
+                                TypedExpression::Literal(TypedLiteral::Float(0.0)),
+                                Ty::Float,
+                                span,
+                            ),
+                            ty: Ty::Float,
+                        },
+                        _ => Val {
+                            node: str_lit("", span),
+                            ty: Ty::Str,
+                        },
+                    });
+                }
                 "str" => {
                     let v = self.expr(&args[0])?;
                     let node = self.str_of(v);
@@ -12690,13 +12734,59 @@ impl<'m> Lowerer<'m> {
                                     span,
                                 ),
                                 Ty::Dict(_) => self.convert_table(v, dict_ty, span),
-                                // A dynamic value is a dict or a sequence of pairs.
-                                Ty::Object => {
+                                // A mapping class gives its pairs.
+                                Ty::Class(k)
+                                    if self.module.method_sig(k as usize, "items").is_some() =>
+                                {
+                                    let boxed = self.coerce(v, Ty::Object);
+                                    let items = self.mapping_items(boxed, span);
                                     let library = types::dynamic_dict();
-                                    let made = Val {
-                                        node: call("zb_dict_from_any", vec![v.node], library, span),
+                                    let pairs = Val {
+                                        node: call(
+                                            "zb_dict_from_tuples",
+                                            vec![items],
+                                            library,
+                                            span,
+                                        ),
                                         ty: library,
                                     };
+                                    self.convert_table(pairs, dict_ty, span)
+                                }
+                                // A dynamic value is a dict, a mapping object
+                                // or a sequence of pairs.
+                                Ty::Object => {
+                                    let library = types::dynamic_dict();
+                                    let node = if self.has_method_named("items") {
+                                        let mut pre = Vec::new();
+                                        let held = self.hold(v, &mut pre, span);
+                                        let items = self.mapping_items(held.node.clone(), span);
+                                        let mapped =
+                                            call("zb_dict_from_tuples", vec![items], library, span);
+                                        let plain = call(
+                                            "zb_dict_from_any",
+                                            vec![held.node.clone()],
+                                            library,
+                                            span,
+                                        );
+                                        let picked = node(
+                                            TypedExpression::If(TypedIfExpr {
+                                                condition: Box::new(call(
+                                                    "zb_any_is_instance",
+                                                    vec![held.node],
+                                                    Ty::Bool,
+                                                    span,
+                                                )),
+                                                then_branch: Box::new(mapped),
+                                                else_branch: Box::new(plain),
+                                            }),
+                                            library,
+                                            span,
+                                        );
+                                        Self::block_value(pre, picked, library, span)
+                                    } else {
+                                        call("zb_dict_from_any", vec![v.node], library, span)
+                                    };
+                                    let made = Val { node, ty: library };
                                     self.convert_table(made, dict_ty, span)
                                 }
                                 // Anything else is a sequence of pairs.

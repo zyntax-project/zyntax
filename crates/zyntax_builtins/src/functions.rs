@@ -255,6 +255,18 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                         any(),
                     ))],
                 ),
+                // A builtin type is its name: called, it builds a value.
+                when(
+                    eq(call("zb_any_category", vec![f.e()], i64()), int(5)),
+                    vec![ret(call(
+                        "zb_builtin_name_call",
+                        vec![
+                            call("zb_any_as_str", vec![f.e()], string()),
+                            list(args[..n].iter().map(|a| a.e()).collect(), anys.clone()),
+                        ],
+                        any(),
+                    ))],
+                ),
                 rec.decl(call("zb_func_unbox", vec![f.e()], anys.clone())),
                 arity.decl(call(
                     "zb_box_get_i64",

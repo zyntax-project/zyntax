@@ -1,0 +1,26 @@
+[('a', ['apple', 'avocado']), ('b', ['banana', 'blueberry']), ('c', ['cherry'])] 3 True False
+{'a': ['apple', 'avocado'], 'b': ['banana', 'blueberry'], 'c': ['cherry']} ['apple', 'avocado'] [] 4
+['a', 'b', 'c', 'zzz'] True []
+[('i', 4), ('m', 1), ('p', 2), ('s', 4)] 11
+[('y', 2), ('z', 3)] 1
+['a', 'b']
+KeyError 'missing'
+1 -1 1 False
+[('a', 5), ('b', 2)] 5 0 5 11 11
+['a', 'a', 'a', 'a', 'a', 'b', 'b', 'c', 'd', 'r', 'r'] {'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1}
+8 1 [('a', 8)]
+[('a', 8), ('b', 1), ('c', 1), ('d', 1), ('r', 2), ('x', 3), ('y', 1)] [('y', 1)]
+[(3, 3), (1, 2), (2, 1)] []
+[('the', 3), ('quick', 2)] ['the', 'quick']
+0 4 [1, 2, 3] 3 1 3 True False
+[-2, -1, 1, 2, 3, 7, 8]
+[7, 8, -2, -1, 1, 2, 3]
+[-1, 1, 2, 3, 7, 8, -2] 1 5
+[-2, 8, 7, 3, 2, 1, -1]
+[] 0 False
+[3, 4, 5] 3 12
+[3, 2]
+IndexError pop from an empty deque
+IndexError pop from an empty deque
+4966
+['a', 'c', 'b'] [('a', 2), ('c', 3), ('b', 1)] ('b', 1) ('a', 2)
