@@ -2094,7 +2094,7 @@ pub(crate) fn builtin_method_counts(receiver: Ty, attr: &str) -> Option<(usize, 
         Ty::Str => Some(match attr {
             "upper" | "lower" | "capitalize" | "title" | "swapcase" | "casefold" | "isalpha"
             | "isalnum" | "isdigit" | "isdecimal" | "isnumeric" | "isspace" | "isupper"
-            | "islower" | "istitle" | "isascii" | "isidentifier" => (0, 0),
+            | "islower" | "istitle" | "isascii" | "isidentifier" | "isprintable" => (0, 0),
             "strip" | "lstrip" | "rstrip" | "splitlines" | "expandtabs" | "encode" => (0, 1),
             "split" | "rsplit" => (0, 2),
             "startswith" | "endswith" | "find" | "rfind" | "index" | "rindex" | "count" => (1, 3),
@@ -10329,7 +10329,7 @@ impl Typer<'_> {
                 "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" | "istitle" | "isdecimal" | "isnumeric" | "isascii"
-                | "isidentifier" => Ty::Bool,
+                | "isidentifier" | "isprintable" => Ty::Bool,
                 "split" | "rsplit" | "splitlines" => Ty::List(Elem::Str),
                 "partition" | "rpartition" => tuple_of(vec![Ty::Str, Ty::Str, Ty::Str]),
                 "encode" => Ty::Bytes,

@@ -11255,10 +11255,11 @@ impl<'m> Lowerer<'m> {
                     }
                     (
                         "isalpha" | "isalnum" | "isdigit" | "isdecimal" | "isnumeric" | "isspace"
-                        | "isupper" | "islower" | "istitle" | "isascii" | "isidentifier",
+                        | "isupper" | "islower" | "istitle" | "isascii" | "isidentifier"
+                        | "isprintable",
                         0,
                     ) => {
-                        const KINDS: [&str; 11] = [
+                        const KINDS: [&str; 12] = [
                             "isalpha",
                             "isalnum",
                             "isdigit",
@@ -11270,6 +11271,7 @@ impl<'m> Lowerer<'m> {
                             "istitle",
                             "isascii",
                             "isidentifier",
+                            "isprintable",
                         ];
                         let kind = KINDS.iter().position(|k| *k == name).unwrap_or(0);
                         call(

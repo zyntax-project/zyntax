@@ -216,6 +216,18 @@ const PRIMITIVES: &[(&str, &[(&str, &str)], &str, &str)] = &[
         "str",
         "$String$expand_tabs",
     ),
+    (
+        "zb_str_next_line_break",
+        &[("s", "str"), ("from", "i64")],
+        "i64",
+        "$String$next_line_break",
+    ),
+    (
+        "zb_str_line_break_len",
+        &[("s", "str"), ("at", "i64")],
+        "i64",
+        "$String$line_break_len",
+    ),
     // The `str.is*()` predicates, `swapcase` and `casefold`, `ljust`
     // and its kin, and the methods that take a start and an end.
     (

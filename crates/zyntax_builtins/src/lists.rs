@@ -3096,20 +3096,11 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             ret(chars.e()),
         ],
     ));
-    // splitlines: pieces between `\n`, `\r\n` and `\r`, no trailing
-    // empty piece. The next break is the nearer of the next `\n` and
-    // the next `\r`, each found by the host.
-    let nl = local("nl", i64());
-    let cr = local("cr", i64());
+    // splitlines: pieces between line boundaries (`\n`, `\r\n`, `\r`,
+    // and the vertical tab, form feed, separators and next-line and
+    // line and paragraph separators), no trailing empty piece.
     let cut = local("cut", i64());
     let after = local("after", i64());
-    let find = |what: &str, from: Expr| {
-        call(
-            "zb_str_index_of_from",
-            vec![text_in.e(), text(what), from],
-            i64(),
-        )
-    };
     for keep in [false, true] {
         d.push(define(
             if keep {
@@ -3123,29 +3114,14 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                 chars.decl(list(Vec::new(), strs.clone())),
                 n.decl(call("zb_str_len", vec![text_in.e()], i64())),
                 pos.decl(int(0)),
-                // The next `\n` and `\r` at or after `pos`, or -1 for none;
-                // each is searched for again only once `pos` has passed it.
-                nl.decl(find("\n", int(0))),
-                cr.decl(find("\r", int(0))),
                 while_(
                     lt(pos.e(), n.e()),
                     vec![
-                        when(
-                            and(ge(nl.e(), int(0)), lt(nl.e(), pos.e())),
-                            vec![nl.set(find("\n", pos.e()))],
-                        ),
-                        when(
-                            and(ge(cr.e(), int(0)), lt(cr.e(), pos.e())),
-                            vec![cr.set(find("\r", pos.e()))],
-                        ),
-                        cut.decl(nl.e()),
-                        when(
-                            and(
-                                ge(cr.e(), int(0)),
-                                or(lt(cut.e(), int(0)), lt(cr.e(), cut.e())),
-                            ),
-                            vec![cut.set(cr.e())],
-                        ),
+                        cut.decl(call(
+                            "zb_str_next_line_break",
+                            vec![text_in.e(), pos.e()],
+                            i64(),
+                        )),
                         if_(
                             lt(cut.e(), int(0)),
                             vec![
@@ -3162,12 +3138,14 @@ fn shared(_policy: &Policy, list_type: TypeId) -> Vec<Decl> {
                                 pos.set(n.e()),
                             ],
                             vec![
-                                after.decl(add(cut.e(), int(1))),
-                                // `\r\n` is one break.
-                                when(
-                                    and(eq(cut.e(), cr.e()), eq(nl.e(), add(cr.e(), int(1)))),
-                                    vec![after.set(add(cut.e(), int(2)))],
-                                ),
+                                after.decl(add(
+                                    cut.e(),
+                                    call(
+                                        "zb_str_line_break_len",
+                                        vec![text_in.e(), cut.e()],
+                                        i64(),
+                                    ),
+                                )),
                                 expr(mcall(
                                     chars.e(),
                                     "push",

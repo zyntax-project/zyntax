@@ -870,6 +870,8 @@ pub extern "C" fn string_check(s: StringPtr, kind: i64) -> i32 {
             }
             None => false,
         },
+        // Empty text is printable.
+        11 => t.chars().all(is_py_printable),
         _ => false,
     };
     result as i32
@@ -1143,6 +1145,49 @@ pub extern "C" fn string_expand_tabs(s: StringPtr, size: i64) -> StringPtr {
     string_new(&out)
 }
 
+/// Whether `c` ends a line for `str.splitlines`.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r'
+            | '\u{b}'
+            | '\u{c}'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// The byte offset of the first line boundary at or after byte `from`,
+/// or -1 when none follows.
+#[no_mangle]
+pub extern "C" fn string_next_line_break(s: StringPtr, from: i64) -> i64 {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    let from = from.max(0) as usize;
+    match t.get(from..) {
+        Some(rest) => rest
+            .char_indices()
+            .find(|&(_, c)| is_line_break(c))
+            .map_or(-1, |(i, _)| (from + i) as i64),
+        None => -1,
+    }
+}
+
+/// The byte length of the line boundary that starts at byte `at`:
+/// two for a carriage return and line feed.
+#[no_mangle]
+pub extern "C" fn string_line_break_len(s: StringPtr, at: i64) -> i64 {
+    let t = unsafe { string_as_str(s) }.unwrap_or("");
+    match t.get(at.max(0) as usize..).and_then(|r| r.chars().next()) {
+        Some('\r') if t.as_bytes().get(at as usize + 1) == Some(&b'\n') => 2,
+        Some(c) => c.len_utf8() as i64,
+        None => 0,
+    }
+}
+
 /// `str.replace(from, to, count)`: the first `count` matches, all of
 /// them when `count` is negative.
 #[no_mangle]
@@ -1229,6 +1274,8 @@ zrtl_plugin! {
         ("$String$edge_range", string_edge_range),
         ("$String$replace_n", string_replace_n),
         ("$String$expand_tabs", string_expand_tabs),
+        ("$String$next_line_break", string_next_line_break),
+        ("$String$line_break_len", string_line_break_len),
         ("$String$repr_py", string_repr_py),
 
         // Padding
@@ -1258,6 +1305,26 @@ zrtl_plugin! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_breaks_are_python_boundaries() {
+        let s = string_new("a\r\nb\u{2028}c\u{b}d");
+        assert_eq!(string_next_line_break(s, 0), 1);
+        assert_eq!(string_line_break_len(s, 1), 2);
+        assert_eq!(string_next_line_break(s, 3), 4);
+        assert_eq!(string_line_break_len(s, 4), 3);
+        assert_eq!(string_next_line_break(s, 8), 8);
+        assert_eq!(string_next_line_break(s, 10), -1);
+        assert_eq!(string_next_line_break(s, 99), -1);
+    }
+
+    #[test]
+    fn printable_text() {
+        assert_eq!(string_check(string_new(""), 11), 1);
+        assert_eq!(string_check(string_new("a b"), 11), 1);
+        assert_eq!(string_check(string_new("a\tb"), 11), 0);
+        assert_eq!(string_check(string_new("a\u{a0}b"), 11), 0);
+    }
 
     #[test]
     fn test_basic() {

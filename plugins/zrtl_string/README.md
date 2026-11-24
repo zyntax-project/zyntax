@@ -77,7 +77,7 @@ Provides comprehensive string operations including concatenation, case conversio
 
 | Symbol | Signature | Description |
 |--------|-----------|-------------|
-| `$String$check` | `(StringPtr, i64) -> i32` | An `is*` predicate: alpha, alnum, digit, decimal, numeric, space, upper, lower, title, ascii, identifier |
+| `$String$check` | `(StringPtr, i64) -> i32` | An `is*` predicate: alpha, alnum, digit, decimal, numeric, space, upper, lower, title, ascii, identifier, printable |
 | `$String$case_map` | `(StringPtr, i64) -> StringPtr` | `swapcase` (0) or `casefold` (1) |
 | `$String$justify` | `(StringPtr, i64, StringPtr, i64) -> StringPtr` | `ljust`, `rjust`, `center` or `zfill` to a width |
 | `$String$find_range` | `(StringPtr, StringPtr, i64, i64, i64) -> i64` | `find`, `rfind` or `count` over a character window |
