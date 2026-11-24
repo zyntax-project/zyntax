@@ -20,6 +20,7 @@ pub(crate) fn methods_of(ty: &str) -> Option<&'static [&'static str]> {
             "endswith",
             "expandtabs",
             "find",
+            "format_map",
             "index",
             "isalnum",
             "isalpha",
@@ -53,10 +54,54 @@ pub(crate) fn methods_of(ty: &str) -> Option<&'static [&'static str]> {
             "strip",
             "swapcase",
             "title",
+            "translate",
             "upper",
             "zfill",
         ],
-        "bytes" => &["decode", "hex", "hexdigest", "digest"],
+        "bytes" => &[
+            "capitalize",
+            "center",
+            "count",
+            "decode",
+            "digest",
+            "endswith",
+            "expandtabs",
+            "find",
+            "hex",
+            "hexdigest",
+            "index",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdigit",
+            "islower",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "partition",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
         "list" => &[
             "append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove",
             "reverse", "sort",
@@ -79,14 +124,17 @@ pub(crate) fn methods_of(ty: &str) -> Option<&'static [&'static str]> {
             "clear",
             "copy",
             "difference",
+            "difference_update",
             "discard",
             "intersection",
+            "intersection_update",
             "isdisjoint",
             "issubset",
             "issuperset",
             "pop",
             "remove",
             "symmetric_difference",
+            "symmetric_difference_update",
             "union",
             "update",
         ],
@@ -94,9 +142,16 @@ pub(crate) fn methods_of(ty: &str) -> Option<&'static [&'static str]> {
             "close",
             "flush",
             "getvalue",
+            "isatty",
             "read",
+            "readable",
             "readline",
             "readlines",
+            "seek",
+            "seekable",
+            "tell",
+            "truncate",
+            "writable",
             "write",
             "writelines",
         ],
@@ -109,7 +164,7 @@ pub(crate) fn methods_of(ty: &str) -> Option<&'static [&'static str]> {
 fn advice(ty: &str) -> &'static str {
     match ty {
         "bytes" => {
-            " To search or split the contents, decode them to `str` first, as in `data.decode().find(...)`. `data[i]` is an int and `for b in data` yields ints."
+            " To use a `str` method on the contents, decode them first, as in `data.decode().expandtabs()`. `data[i]` is an int and `for b in data` yields ints."
         }
         "file" => " Read a text file by line with `for line in f`, or all at once with `f.read()`.",
         "str" => {
@@ -148,11 +203,164 @@ fn distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// Every method Python gives the builtin type `ty`, compiled by zypy or
+/// not, for the types whose methods are all a program can call.
+pub(crate) fn python_methods_of(ty: &str) -> Option<&'static [&'static str]> {
+    Some(match ty {
+        "bytes" => &[
+            "capitalize",
+            "center",
+            "count",
+            "decode",
+            "digest",
+            "endswith",
+            "expandtabs",
+            "find",
+            "hex",
+            "hexdigest",
+            "index",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdigit",
+            "islower",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "maketrans",
+            "partition",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
+        "str" => &[
+            "capitalize",
+            "casefold",
+            "center",
+            "count",
+            "encode",
+            "endswith",
+            "expandtabs",
+            "find",
+            "format",
+            "format_map",
+            "index",
+            "isalnum",
+            "isalpha",
+            "isascii",
+            "isdecimal",
+            "isdigit",
+            "isidentifier",
+            "islower",
+            "isnumeric",
+            "isprintable",
+            "isspace",
+            "istitle",
+            "isupper",
+            "join",
+            "ljust",
+            "lower",
+            "lstrip",
+            "maketrans",
+            "partition",
+            "removeprefix",
+            "removesuffix",
+            "replace",
+            "rfind",
+            "rindex",
+            "rjust",
+            "rpartition",
+            "rsplit",
+            "rstrip",
+            "split",
+            "splitlines",
+            "startswith",
+            "strip",
+            "swapcase",
+            "title",
+            "translate",
+            "upper",
+            "zfill",
+        ],
+        "list" => &[
+            "append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove",
+            "reverse", "sort",
+        ],
+        "tuple" => &["count", "index"],
+        "dict" => &[
+            "clear",
+            "copy",
+            "fromkeys",
+            "get",
+            "items",
+            "keys",
+            "pop",
+            "popitem",
+            "setdefault",
+            "update",
+            "values",
+        ],
+        "set" => &[
+            "add",
+            "clear",
+            "copy",
+            "difference",
+            "difference_update",
+            "discard",
+            "intersection",
+            "intersection_update",
+            "isdisjoint",
+            "issubset",
+            "issuperset",
+            "pop",
+            "remove",
+            "symmetric_difference",
+            "symmetric_difference_update",
+            "union",
+            "update",
+        ],
+        _ => return None,
+    })
+}
+
 /// `ty.method(...)` with `given` arguments, which zypy does not compile.
 pub(crate) fn unsupported_method(ty: &str, method: &str, given: usize, span: Span) -> Error {
     let Some(known) = methods_of(ty) else {
         return Error::unsupported_span(format!("`{ty}.{method}()`"), span);
     };
+    // A name Python does not define is the error Python raises.
+    if let Some(all) = python_methods_of(ty)
+        && !all.contains(&method)
+    {
+        let near = all
+            .iter()
+            .filter(|m| distance(m, method) <= (method.len() / 3).max(2))
+            .min_by_key(|m| distance(m, method));
+        let error = no_attribute(ty, method, span);
+        return match near {
+            Some(near) => error.with_help(format!("Did you mean `{near}`?")),
+            None => error,
+        };
+    }
     let list = known
         .iter()
         .map(|m| format!("`{m}`"))
@@ -306,6 +514,103 @@ pub(crate) fn no_attribute(class: &str, name: &str, span: Span) -> Error {
     Error::raises_span(
         "AttributeError",
         format!("'{class}' object has no attribute '{name}'"),
+        span,
+    )
+}
+
+/// A `bytes` method given an argument that is not bytes, as CPython
+/// words it for the method.
+pub(crate) fn bytes_needed(method: &str, found: &str, span: Span) -> Error {
+    let message = match method {
+        "find" | "rfind" | "index" | "rindex" | "count" => {
+            format!("argument should be integer or bytes-like object, not '{found}'")
+        }
+        "startswith" | "endswith" => {
+            format!("{method} first arg must be bytes or a tuple of bytes, not {found}")
+        }
+        _ => format!("a bytes-like object is required, not '{found}'"),
+    };
+    let help = if found == "str" {
+        "Encode the text with `.encode()`, or write the value as a bytes literal such as `b\"...\"`."
+    } else {
+        "Pass a `bytes` value."
+    };
+    Error::raises_span("TypeError", message, span).with_help(help)
+}
+
+/// A data attribute of a builtin value that zypy does not compile: the
+/// error Python raises when the type has no such attribute, and a
+/// plain statement when it has one.
+pub(crate) fn unsupported_attribute(ty: &str, attr: &str, span: Span) -> Error {
+    if let Some(all) = python_methods_of(ty)
+        && !all.contains(&attr)
+        && !attr.starts_with("__")
+    {
+        return no_attribute(ty, attr, span);
+    }
+    Error::unsupported_span(format!("the `{ty}` attribute `{attr}`"), span)
+}
+
+/// Whether `ty.method(x, ...)` is the method called on `x`: a method
+/// every instance has, not one the type itself offers.
+pub(crate) fn is_unbound_method(ty: &str, method: &str) -> bool {
+    !matches!(method, "maketrans" | "fromkeys" | "fromhex")
+        && python_methods_of(ty).is_some_and(|all| all.contains(&method))
+}
+
+/// A method of `int` or `float` that zypy does not compile: Python's
+/// error for a name the type lacks, a plain statement otherwise.
+pub(crate) fn unsupported_number_method(ty: &str, method: &str, span: Span) -> Error {
+    const INT: &[&str] = &[
+        "as_integer_ratio",
+        "bit_count",
+        "bit_length",
+        "conjugate",
+        "denominator",
+        "from_bytes",
+        "imag",
+        "is_integer",
+        "numerator",
+        "real",
+        "to_bytes",
+    ];
+    const FLOAT: &[&str] = &[
+        "as_integer_ratio",
+        "conjugate",
+        "fromhex",
+        "hex",
+        "imag",
+        "is_integer",
+        "real",
+    ];
+    let all = if ty == "int" { INT } else { FLOAT };
+    if all.contains(&method) {
+        return Error::unsupported_span(format!("the `{ty}` method `{method}()`"), span);
+    }
+    let near = all
+        .iter()
+        .filter(|m| distance(m, method) <= (method.len() / 3).max(2))
+        .min_by_key(|m| distance(m, method));
+    let error = no_attribute(ty, method, span);
+    match near {
+        Some(near) => error.with_help(format!("Did you mean `{near}`?")),
+        None => error,
+    }
+}
+
+/// `T.method(...)` on a builtin type that is not the method called on a
+/// value, and not a class method zypy compiles.
+pub(crate) fn unsupported_class_call(ty: &str, method: &str, span: Span) -> Error {
+    let known = python_methods_of(ty).is_some_and(|all| all.contains(&method))
+        || matches!(ty, "int" | "float");
+    if known {
+        return Error::unsupported_span(format!("`{ty}.{method}()`"), span).with_help(format!(
+            "Call the method on a value, as in `x.{method}(...)`, where zypy compiles it."
+        ));
+    }
+    Error::raises_span(
+        "AttributeError",
+        format!("type object '{ty}' has no attribute '{method}'"),
         span,
     )
 }

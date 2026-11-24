@@ -47,10 +47,31 @@ extern "C" fn unreached() -> i64 {
     std::process::abort()
 }
 static HOST_INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"test_host".as_ptr());
-static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 36] = [
+static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 54] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_at".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$int_bit_length".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$int_bit_count".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$int_to_bytes".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_from_bytes_fits".as_ptr(),
+        unreached as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(c"$Host$int_from_bytes".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$float_is_integer".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_expandtabs".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_translate".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_maketrans".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_find".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_edge".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_replace_n".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_case_map".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_check".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_strip".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_justify".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_cuts".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$bytes_cut_at".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_box".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_copy_out".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_decode".as_ptr(), unreached as *const u8),

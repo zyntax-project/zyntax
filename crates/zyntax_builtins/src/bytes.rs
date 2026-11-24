@@ -203,6 +203,147 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             string(),
             "$Host$path_basename",
         ),
+        // The `bytes` methods, over bytes and not text.
+        (
+            "zb_bytes_find",
+            vec![
+                ("s", string()),
+                ("sub", string()),
+                ("start", i64()),
+                ("end", i64()),
+                ("mode", i64()),
+            ],
+            i64(),
+            "$Host$bytes_find",
+        ),
+        (
+            "zb_bytes_edge",
+            vec![
+                ("s", string()),
+                ("affix", string()),
+                ("start", i64()),
+                ("end", i64()),
+                ("ends", i64()),
+            ],
+            boolean(),
+            "$Host$bytes_edge",
+        ),
+        (
+            "zb_bytes_replace_n",
+            vec![
+                ("s", string()),
+                ("from", string()),
+                ("to", string()),
+                ("count", i64()),
+            ],
+            string(),
+            "$Host$bytes_replace_n",
+        ),
+        (
+            "zb_bytes_case_map",
+            vec![("s", string()), ("kind", i64())],
+            string(),
+            "$Host$bytes_case_map",
+        ),
+        (
+            "zb_bytes_check",
+            vec![("s", string()), ("kind", i64())],
+            boolean(),
+            "$Host$bytes_check",
+        ),
+        (
+            "zb_bytes_strip",
+            vec![("s", string()), ("chars", string()), ("mode", i64())],
+            string(),
+            "$Host$bytes_strip",
+        ),
+        (
+            "zb_bytes_justify",
+            vec![
+                ("s", string()),
+                ("width", i64()),
+                ("fill", string()),
+                ("mode", i64()),
+            ],
+            string(),
+            "$Host$bytes_justify",
+        ),
+        (
+            "zb_bytes_cuts",
+            vec![
+                ("s", string()),
+                ("sep", string()),
+                ("limit", i64()),
+                ("mode", i64()),
+            ],
+            string(),
+            "$Host$bytes_cuts",
+        ),
+        (
+            "zb_bytes_cut_at",
+            vec![("packed", string()), ("k", i64())],
+            i64(),
+            "$Host$bytes_cut_at",
+        ),
+        (
+            "zb_bytes_expandtabs",
+            vec![("s", string()), ("size", i64())],
+            string(),
+            "$Host$bytes_expandtabs",
+        ),
+        (
+            "zb_bytes_translate_raw",
+            vec![("s", string()), ("table", string()), ("delete", string())],
+            string(),
+            "$Host$bytes_translate",
+        ),
+        (
+            "zb_bytes_maketrans_raw",
+            vec![("from", string()), ("to", string())],
+            string(),
+            "$Host$bytes_maketrans",
+        ),
+        (
+            "zb_int_bit_length",
+            vec![("v", i64())],
+            i64(),
+            "$Host$int_bit_length",
+        ),
+        (
+            "zb_int_bit_count",
+            vec![("v", i64())],
+            i64(),
+            "$Host$int_bit_count",
+        ),
+        (
+            "zb_int_to_bytes_raw",
+            vec![
+                ("v", i64()),
+                ("length", i64()),
+                ("big", i64()),
+                ("signed", i64()),
+            ],
+            string(),
+            "$Host$int_to_bytes",
+        ),
+        (
+            "zb_int_from_bytes_fits",
+            vec![("b", string()), ("big", i64()), ("signed", i64())],
+            i64(),
+            "$Host$int_from_bytes_fits",
+        ),
+        (
+            "zb_int_from_bytes_raw",
+            vec![("b", string()), ("big", i64()), ("signed", i64())],
+            i64(),
+            "$Host$int_from_bytes",
+        ),
+        (
+            "zb_float_is_integer",
+            vec![("v", f64())],
+            i64(),
+            "$Host$float_is_integer",
+        ),
         // What `int()`, `float()` and `eval()` accept of a string.
         (
             "zb_str_is_int_literal",
@@ -481,6 +622,341 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
             ret(s.e()),
         ],
     ));
+
+    // index and rindex: the offset `zb_bytes_find` gives, or a ValueError.
+    {
+        let hs = local("s", string());
+        let nd = local("sub", string());
+        let from = local("start", i64());
+        let to = local("end", i64());
+        let mode = local("mode", i64());
+        let at = local("at", i64());
+        d.push(define(
+            "zb_bytes_index_range",
+            &[&hs, &nd, &from, &to, &mode],
+            i64(),
+            vec![
+                at.decl(call(
+                    "zb_bytes_find",
+                    vec![hs.e(), nd.e(), from.e(), to.e(), mode.e()],
+                    i64(),
+                )),
+                when(
+                    lt(at.e(), int(0)),
+                    vec![fatal("ValueError", text("subsection not found"))],
+                ),
+                ret(at.e()),
+            ],
+        ));
+    }
+
+    // The pieces of a split, a splitlines or a partition as a list of
+    // bytes. `mode` is that of `zb_bytes_cuts`; a separator is required
+    // for the modes that cut at one.
+    {
+        let hs = local("s", string());
+        let sep = local("sep", string());
+        let limit = local("limit", i64());
+        let mode = local("mode", i64());
+        let cuts = local("cuts", string());
+        let pieces = local("pieces", anys.clone());
+        let k = local("k", i64());
+        let count = local("count", i64());
+        let at = |offset: i64| {
+            call(
+                "zb_bytes_cut_at",
+                vec![cuts.e(), add(mul(k.e(), int(2)), int(offset))],
+                i64(),
+            )
+        };
+        let by_separator = or(
+            or(eq(mode.e(), int(0)), eq(mode.e(), int(1))),
+            or(eq(mode.e(), int(5)), eq(mode.e(), int(6))),
+        );
+        d.push(define(
+            "zb_bytes_split",
+            &[&hs, &sep, &limit, &mode],
+            anys.clone(),
+            vec![
+                when(
+                    and(
+                        by_separator,
+                        eq(call("zb_str_len", vec![sep.e()], i64()), int(0)),
+                    ),
+                    vec![fatal("ValueError", text("empty separator"))],
+                ),
+                cuts.decl(call(
+                    "zb_bytes_cuts",
+                    vec![hs.e(), sep.e(), limit.e(), mode.e()],
+                    string(),
+                )),
+                count.decl(div(call("zb_str_len", vec![cuts.e()], i64()), int(16))),
+                pieces.decl(list(Vec::new(), anys.clone())),
+                block_of(for_range(
+                    &k,
+                    int(0),
+                    count.e(),
+                    vec![expr(mcall(
+                        pieces.e(),
+                        "push",
+                        vec![call(
+                            "zb_box_bytes",
+                            vec![call(
+                                "zb_bytes_slice_raw",
+                                vec![hs.e(), at(0), at(1)],
+                                string(),
+                            )],
+                            any(),
+                        )],
+                        unit(),
+                    ))],
+                )),
+                ret(pieces.e()),
+            ],
+        ));
+    }
+
+    // sep.join(items): each item must be bytes.
+    {
+        let sep = local("sep", string());
+        let items = borrowed("items", anys.clone());
+        let strs = list_of(list_type, string());
+        let parts = local("parts", strs.clone());
+        let k = local("k", i64());
+        d.push(define(
+            "zb_bytes_join",
+            &[&sep, &items],
+            string(),
+            vec![
+                parts.decl(list(Vec::new(), strs.clone())),
+                block_of(for_range(
+                    &k,
+                    int(0),
+                    mcall(items.e(), "len", vec![], i64()),
+                    vec![
+                        when(
+                            ne(
+                                call("zb_any_category", vec![idx(items.e(), k.e(), any())], i64()),
+                                int(BYTES),
+                            ),
+                            vec![fatal(
+                                "TypeError",
+                                add(
+                                    add(
+                                        add(
+                                            text("sequence item "),
+                                            call("zb_str_of_int", vec![k.e()], string()),
+                                        ),
+                                        text(": expected a bytes-like object, "),
+                                    ),
+                                    add(
+                                        call(
+                                            "zb_any_type",
+                                            vec![idx(items.e(), k.e(), any())],
+                                            string(),
+                                        ),
+                                        text(" found"),
+                                    ),
+                                ),
+                            )],
+                        ),
+                        expr(mcall(
+                            parts.e(),
+                            "push",
+                            vec![call(
+                                "zb_any_as_bytes",
+                                vec![idx(items.e(), k.e(), any())],
+                                string(),
+                            )],
+                            unit(),
+                        )),
+                    ],
+                )),
+                ret(call("zb_str_join", vec![sep.e(), parts.e()], string())),
+            ],
+        ));
+    }
+
+    // removeprefix (`ends` 0) and removesuffix (1).
+    {
+        let hs = local("s", string());
+        let affix = local("affix", string());
+        let ends = local("ends", i64());
+        let w = local("w", i64());
+        let total = local("total", i64());
+        d.push(define(
+            "zb_bytes_remove_affix",
+            &[&hs, &affix, &ends],
+            string(),
+            vec![
+                when(
+                    not(call(
+                        "zb_bytes_edge",
+                        vec![hs.e(), affix.e(), int(0), int(i64::MAX), ends.e()],
+                        boolean(),
+                    )),
+                    vec![ret(hs.e())],
+                ),
+                w.decl(call("zb_str_len", vec![affix.e()], i64())),
+                total.decl(call("zb_str_len", vec![hs.e()], i64())),
+                if_(
+                    eq(ends.e(), int(0)),
+                    vec![ret(call(
+                        "zb_bytes_slice_raw",
+                        vec![hs.e(), w.e(), total.e()],
+                        string(),
+                    ))],
+                    vec![ret(call(
+                        "zb_bytes_slice_raw",
+                        vec![hs.e(), int(0), sub(total.e(), w.e())],
+                        string(),
+                    ))],
+                ),
+            ],
+        ));
+    }
+
+    // translate: `mapped` says a table was given, which must be 256 long.
+    {
+        let hs = local("s", string());
+        let table = local("table", string());
+        let delete = local("delete", string());
+        let mapped = local("mapped", i64());
+        d.push(define(
+            "zb_bytes_translate",
+            &[&hs, &table, &delete, &mapped],
+            string(),
+            vec![
+                when(
+                    and(
+                        ne(mapped.e(), int(0)),
+                        ne(call("zb_str_len", vec![table.e()], i64()), int(256)),
+                    ),
+                    vec![fatal(
+                        "ValueError",
+                        text("translation table must be 256 characters long"),
+                    )],
+                ),
+                ret(call(
+                    "zb_bytes_translate_raw",
+                    vec![hs.e(), table.e(), delete.e()],
+                    string(),
+                )),
+            ],
+        ));
+        let from = local("from", string());
+        let to = local("to", string());
+        d.push(define(
+            "zb_bytes_maketrans",
+            &[&from, &to],
+            string(),
+            vec![
+                when(
+                    ne(
+                        call("zb_str_len", vec![from.e()], i64()),
+                        call("zb_str_len", vec![to.e()], i64()),
+                    ),
+                    vec![fatal(
+                        "ValueError",
+                        text("maketrans arguments must have same length"),
+                    )],
+                ),
+                ret(call(
+                    "zb_bytes_maketrans_raw",
+                    vec![from.e(), to.e()],
+                    string(),
+                )),
+            ],
+        ));
+    }
+
+    // int.to_bytes(length, byteorder, signed) and int.from_bytes(bytes,
+    // byteorder, signed): the byte order is the text "big" or "little".
+    {
+        let value = local("v", i64());
+        let length = local("length", i64());
+        let order = local("order", string());
+        let signed = local("signed", i64());
+        let hs = local("b", string());
+        let big = local("big", i64());
+        let made = local("made", string());
+        let order_check = |order: &Local| {
+            vec![when(
+                and(
+                    not(call("zb_str_eq", vec![order.e(), text("big")], boolean())),
+                    not(call(
+                        "zb_str_eq",
+                        vec![order.e(), text("little")],
+                        boolean(),
+                    )),
+                ),
+                vec![fatal(
+                    "ValueError",
+                    text("byteorder must be either 'little' or 'big'"),
+                )],
+            )]
+        };
+        let is_big = |order: &Local| call("zb_str_eq", vec![order.e(), text("big")], boolean());
+        let mut to = order_check(&order);
+        to.push(big.decl(cast(is_big(&order), i64())));
+        to.push(when(
+            lt(length.e(), int(0)),
+            vec![fatal(
+                "ValueError",
+                text("length argument must be non-negative"),
+            )],
+        ));
+        to.push(when(
+            and(lt(value.e(), int(0)), eq(signed.e(), int(0))),
+            vec![fatal(
+                "OverflowError",
+                text("can't convert negative int to unsigned"),
+            )],
+        ));
+        to.push(made.decl(call(
+            "zb_int_to_bytes_raw",
+            vec![value.e(), length.e(), big.e(), signed.e()],
+            string(),
+        )));
+        to.push(when(
+            eq(made.e(), null(string())),
+            vec![fatal("OverflowError", text("int too big to convert"))],
+        ));
+        to.push(ret(made.e()));
+        d.push(define(
+            "zb_int_to_bytes",
+            &[&value, &length, &order, &signed],
+            string(),
+            to,
+        ));
+        let mut from = order_check(&order);
+        from.push(big.decl(cast(is_big(&order), i64())));
+        from.push(when(
+            eq(
+                call(
+                    "zb_int_from_bytes_fits",
+                    vec![hs.e(), big.e(), signed.e()],
+                    i64(),
+                ),
+                int(0),
+            ),
+            vec![fatal(
+                "OverflowError",
+                text("Python int too large to convert to C long"),
+            )],
+        ));
+        from.push(ret(call(
+            "zb_int_from_bytes_raw",
+            vec![hs.e(), big.e(), signed.e()],
+            i64(),
+        )));
+        d.push(define(
+            "zb_int_from_bytes",
+            &[&hs, &order, &signed],
+            i64(),
+            from,
+        ));
+    }
 
     // b % args: %d %i %c %s %x %X %o %% with an optional `-`, `0` and a
     // width. The output is built in a byte buffer.
@@ -1057,6 +1533,131 @@ pub(crate) fn declarations(list_type: TypeId) -> Vec<Decl> {
                 vec![buffer.e(), pos.e(), end.e()],
                 string(),
             )),
+        ],
+    ));
+    // tell, seek and truncate act on the position in the buffer.
+    let offset = local("offset", i64());
+    let whence = local("whence", i64());
+    let target = local("target", i64());
+    let given = local("given", i64());
+    d.push(define(
+        "zb_file_tell",
+        &[&f],
+        i64(),
+        vec![closed_check(), ret(file_pos())],
+    ));
+    d.push(define(
+        "zb_file_seek",
+        &[&f, &offset, &whence],
+        i64(),
+        vec![
+            closed_check(),
+            load(),
+            buffer.decl(file_buffer()),
+            when(
+                or(lt(whence.e(), int(0)), gt(whence.e(), int(2))),
+                vec![fatal(
+                    "ValueError",
+                    text("invalid whence, should be 0, 1 or 2"),
+                )],
+            ),
+            target.decl(offset.e()),
+            when(
+                eq(whence.e(), int(1)),
+                vec![target.set(add(file_pos(), offset.e()))],
+            ),
+            when(
+                eq(whence.e(), int(2)),
+                vec![target.set(add(mcall(buffer.e(), "len", vec![], i64()), offset.e()))],
+            ),
+            when(
+                lt(target.e(), int(0)),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        text("negative seek value "),
+                        call("zb_str_of_int", vec![target.e()], string()),
+                    ),
+                )],
+            ),
+            set_pos(target.e()),
+            ret(target.e()),
+        ],
+    ));
+    // truncate(size): `given` says a size was passed, else the position.
+    d.push(define(
+        "zb_file_truncate",
+        &[&f, &offset, &given],
+        i64(),
+        vec![
+            closed_check(),
+            load(),
+            buffer.decl(file_buffer()),
+            target.decl(file_pos()),
+            when(ne(given.e(), int(0)), vec![target.set(offset.e())]),
+            when(
+                lt(target.e(), int(0)),
+                vec![fatal(
+                    "ValueError",
+                    add(
+                        text("negative size value "),
+                        call("zb_str_of_int", vec![target.e()], string()),
+                    ),
+                )],
+            ),
+            when(
+                lt(target.e(), mcall(buffer.e(), "len", vec![], i64())),
+                vec![expr(mcall(
+                    buffer.e(),
+                    "truncate",
+                    vec![target.e()],
+                    unit(),
+                ))],
+            ),
+            ret(target.e()),
+        ],
+    ));
+    // readable, writable and seekable, which closed files refuse.
+    for (name, mask) in [
+        ("zb_file_readable", READ),
+        ("zb_file_writable", WRITE | APPEND),
+        ("zb_file_seekable", -1),
+    ] {
+        d.push(define(
+            name,
+            &[&f],
+            boolean(),
+            vec![
+                closed_check(),
+                ret(if mask < 0 {
+                    ne(int(0), int(1))
+                } else {
+                    ne(bitand(file_flags(), int(mask)), int(0))
+                }),
+            ],
+        ));
+    }
+    d.push(define(
+        "zb_file_closed",
+        &[&f],
+        boolean(),
+        vec![ret(ne(bitand(file_flags(), int(CLOSED)), int(0)))],
+    ));
+    // A file made by `open` has the path it was opened with; one that
+    // is only its buffer has no name.
+    d.push(define(
+        "zb_file_name",
+        &[&f],
+        string(),
+        vec![
+            when(
+                ne(bitand(file_flags(), int(MEMORY)), int(0)),
+                vec![fatal(
+                    "AttributeError",
+                    text("'_io.StringIO' object has no attribute 'name'"),
+                )],
+            ),
+            ret(file_path()),
         ],
     ));
     d.push(define(

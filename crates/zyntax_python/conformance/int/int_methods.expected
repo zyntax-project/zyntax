@@ -1,0 +1,15 @@
+8 0 3 41
+8 3 1
+255 0 255 1 255
+(255, 1) True
+1 1
+b'\x01\x02' b'\x02\x01' b'\x00\x01\x02'
+b'\xff' b'\xff\xff' b'\xfe\xff\xff'
+258 513
+-1 65535
+0 7
+True
+False True False 2.5 0.0 2.5
+OverflowError int too big to convert
+OverflowError can't convert negative int to unsigned
+ValueError byteorder must be either 'little' or 'big'

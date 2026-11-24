@@ -8083,6 +8083,365 @@ impl<'m> Lowerer<'m> {
     }
 
     /// The name Python gives the type of a value, for what an error says.
+    /// An argument of a `bytes` method that must be bytes, or, where
+    /// `byte` is set, an int standing for one byte.
+    fn bytes_arg(&mut self, method: &str, e: &py::Expr, byte: bool, span: Span) -> Result<Node> {
+        let v = self.consumed(e, span)?;
+        match v.ty {
+            Ty::Bytes => Ok(v.node),
+            Ty::Object => Ok(self.coerce(v, Ty::Bytes)),
+            Ty::Int | Ty::Bool if byte => {
+                let byte = call(
+                    "zb_bytes_byte",
+                    vec![self.coerce(v, Ty::Int)],
+                    Ty::Bytes,
+                    span,
+                );
+                Ok(self
+                    .guard(
+                        Val {
+                            node: byte,
+                            ty: Ty::Bytes,
+                        },
+                        span,
+                    )
+                    .node)
+            }
+            other => Err(crate::diagnostics::bytes_needed(
+                method,
+                &self.type_name(other),
+                span,
+            )),
+        }
+    }
+
+    /// An optional int argument: `none` when it is absent or `None`.
+    fn bytes_bound(&mut self, e: Option<&py::Expr>, none: i64, span: Span) -> Result<Node> {
+        match e {
+            Some(e) if !matches!(e, py::Expr::NoneLiteral(_)) => self.expr_as(e, Ty::Int),
+            _ => Ok(int_lit(none, span)),
+        }
+    }
+
+    /// The `bytes` methods: searches, edits, case and character
+    /// classes, and the splits, all over bytes and not text.
+    fn bytes_method(
+        &mut self,
+        receiver: Val,
+        name: &str,
+        args: &[py::Expr],
+        ty: Ty,
+        span: Span,
+    ) -> Result<Val> {
+        let b = receiver.node;
+        let int = |n: i64| int_lit(n, span);
+        let node = match (name, args.len()) {
+            ("decode", 0) => call("zb_bytes_decode", vec![b], Ty::Str, span),
+            ("decode", 1) if self.is_utf8_name(&args[0]) => {
+                call("zb_bytes_decode", vec![b], Ty::Str, span)
+            }
+            // A digest is bytes; its spelling is theirs.
+            ("hex" | "hexdigest", 0) => call("zb_bytes_hex", vec![b], Ty::Str, span),
+            ("digest", 0) => b,
+            ("find" | "rfind" | "count" | "index" | "rindex", 1..=3) => {
+                let sub = self.bytes_arg(name, &args[0], true, span)?;
+                let from = self.bytes_bound(args.get(1), 0, span)?;
+                let to = self.bytes_bound(args.get(2), i64::MAX, span)?;
+                let mode = match name {
+                    "find" | "index" => 0,
+                    "rfind" | "rindex" => 1,
+                    _ => 2,
+                };
+                let f = if matches!(name, "index" | "rindex") {
+                    "zb_bytes_index_range"
+                } else {
+                    "zb_bytes_find"
+                };
+                let found = call(f, vec![b, sub, from, to, int(mode)], Ty::Int, span);
+                if f == "zb_bytes_index_range" {
+                    return Ok(self.guard(
+                        Val {
+                            node: found,
+                            ty: Ty::Int,
+                        },
+                        span,
+                    ));
+                }
+                found
+            }
+            ("startswith" | "endswith", 1..=3) => {
+                let ends = i64::from(name == "endswith");
+                let from = self.bytes_bound(args.get(1), 0, span)?;
+                let to = self.bytes_bound(args.get(2), i64::MAX, span)?;
+                // Any one of a tuple of affixes, each evaluated before
+                // the test as a call's arguments are.
+                if let [py::Expr::Tuple(t), ..] = args
+                    && !t.elts.is_empty()
+                {
+                    let mut pre = Vec::new();
+                    let held = self.hold(
+                        Val {
+                            node: b,
+                            ty: Ty::Bytes,
+                        },
+                        &mut pre,
+                        span,
+                    );
+                    let mut affixes = Vec::new();
+                    for e in &t.elts {
+                        let a = self.bytes_arg(name, e, false, span)?;
+                        let a = self.hold(
+                            Val {
+                                node: a,
+                                ty: Ty::Bytes,
+                            },
+                            &mut pre,
+                            span,
+                        );
+                        affixes.push(a.node);
+                    }
+                    let mut any: Option<Node> = None;
+                    for a in affixes {
+                        let test = call(
+                            "zb_bytes_edge",
+                            vec![held.node.clone(), a, from.clone(), to.clone(), int(ends)],
+                            Ty::Bool,
+                            span,
+                        );
+                        any = Some(match any {
+                            Some(prev) => binary(BinaryOp::Or, prev, test, Ty::Bool, span),
+                            None => test,
+                        });
+                    }
+                    let node = Self::block_value(pre, any.expect("one"), Ty::Bool, span);
+                    return Ok(Val { node, ty });
+                }
+                let affix = self.bytes_arg(name, &args[0], false, span)?;
+                call(
+                    "zb_bytes_edge",
+                    vec![b, affix, from, to, int(ends)],
+                    Ty::Bool,
+                    span,
+                )
+            }
+            ("replace", 2 | 3) => {
+                let old = self.bytes_arg(name, &args[0], false, span)?;
+                let new = self.bytes_arg(name, &args[1], false, span)?;
+                let count = self.bytes_bound(args.get(2), -1, span)?;
+                call(
+                    "zb_bytes_replace_n",
+                    vec![b, old, new, count],
+                    Ty::Bytes,
+                    span,
+                )
+            }
+            ("upper" | "lower" | "swapcase" | "capitalize" | "title", 0) => {
+                let kind = ["upper", "lower", "swapcase", "capitalize", "title"]
+                    .iter()
+                    .position(|k| *k == name)
+                    .unwrap_or(0);
+                call(
+                    "zb_bytes_case_map",
+                    vec![b, int(kind as i64)],
+                    Ty::Bytes,
+                    span,
+                )
+            }
+            (
+                "isalpha" | "isalnum" | "isdigit" | "isspace" | "isupper" | "islower" | "istitle"
+                | "isascii",
+                0,
+            ) => {
+                let kind = [
+                    "isalpha", "isalnum", "isdigit", "isspace", "isupper", "islower", "istitle",
+                    "isascii",
+                ]
+                .iter()
+                .position(|k| *k == name)
+                .unwrap_or(0);
+                call("zb_bytes_check", vec![b, int(kind as i64)], Ty::Bool, span)
+            }
+            ("strip" | "lstrip" | "rstrip", 0 | 1) => {
+                let sides = match name {
+                    "lstrip" => 1,
+                    "rstrip" => 2,
+                    _ => 3,
+                };
+                // No set of bytes, or None, strips whitespace.
+                let (chars, mode) = match args.first() {
+                    Some(e) if !matches!(e, py::Expr::NoneLiteral(_)) => {
+                        (self.bytes_arg(name, e, false, span)?, sides)
+                    }
+                    _ => (str_lit("", span), sides | 4),
+                };
+                call("zb_bytes_strip", vec![b, chars, int(mode)], Ty::Bytes, span)
+            }
+            ("ljust" | "rjust" | "center", 1 | 2) | ("zfill", 1) => {
+                let mode = ["ljust", "rjust", "center", "zfill"]
+                    .iter()
+                    .position(|m| *m == name)
+                    .unwrap_or(0);
+                let width = self.expr_as(&args[0], Ty::Int)?;
+                let fill = match args.get(1) {
+                    Some(e) => self.bytes_arg(name, e, false, span)?,
+                    None => str_lit(if mode == 3 { "0" } else { " " }, span),
+                };
+                call(
+                    "zb_bytes_justify",
+                    vec![b, width, fill, int(mode as i64)],
+                    Ty::Bytes,
+                    span,
+                )
+            }
+            ("expandtabs", 0 | 1) => {
+                let size = self.bytes_bound(args.first(), 8, span)?;
+                call("zb_bytes_expandtabs", vec![b, size], Ty::Bytes, span)
+            }
+            ("translate", 1 | 2) => {
+                // A table of None only deletes.
+                let (table, mapped) = match &args[0] {
+                    py::Expr::NoneLiteral(_) => (str_lit("", span), 0),
+                    e => (self.bytes_arg(name, e, false, span)?, 1),
+                };
+                let delete = match args.get(1) {
+                    Some(e) => self.bytes_arg(name, e, false, span)?,
+                    None => str_lit("", span),
+                };
+                let out = call(
+                    "zb_bytes_translate",
+                    vec![b, table, delete, int(mapped)],
+                    Ty::Bytes,
+                    span,
+                );
+                return Ok(self.guard(
+                    Val {
+                        node: out,
+                        ty: Ty::Bytes,
+                    },
+                    span,
+                ));
+            }
+            ("removeprefix" | "removesuffix", 1) => {
+                let affix = self.bytes_arg(name, &args[0], false, span)?;
+                let ends = i64::from(name == "removesuffix");
+                call(
+                    "zb_bytes_remove_affix",
+                    vec![b, affix, int(ends)],
+                    Ty::Bytes,
+                    span,
+                )
+            }
+            ("split" | "rsplit", 0..=2) => {
+                let right = name == "rsplit";
+                // No separator, or None, splits on whitespace.
+                let by_space = args
+                    .first()
+                    .is_none_or(|a| matches!(a, py::Expr::NoneLiteral(_)));
+                let sep = if by_space {
+                    str_lit("", span)
+                } else {
+                    self.bytes_arg(name, &args[0], false, span)?
+                };
+                let limit = self.bytes_bound(args.get(1), -1, span)?;
+                let mode = match (by_space, right) {
+                    (false, false) => 0,
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                };
+                let list = Ty::List(Elem::Object);
+                let pieces = call("zb_bytes_split", vec![b, sep, limit, int(mode)], list, span);
+                return Ok(self.guard(
+                    Val {
+                        node: pieces,
+                        ty: list,
+                    },
+                    span,
+                ));
+            }
+            ("splitlines", 0 | 1) => {
+                let keep = match args.first() {
+                    Some(e) => {
+                        let v = self.expr_as(e, Ty::Bool)?;
+                        let as_int = |n: i64| int_lit(n, span);
+                        node(
+                            TypedExpression::If(TypedIfExpr {
+                                condition: Box::new(v),
+                                then_branch: Box::new(as_int(1)),
+                                else_branch: Box::new(as_int(0)),
+                            }),
+                            Ty::Int,
+                            span,
+                        )
+                    }
+                    None => int(0),
+                };
+                call(
+                    "zb_bytes_split",
+                    vec![b, str_lit("", span), keep, int(4)],
+                    Ty::List(Elem::Object),
+                    span,
+                )
+            }
+            ("partition" | "rpartition", 1) => {
+                let sep = self.bytes_arg(name, &args[0], false, span)?;
+                let mode = if name == "rpartition" { 6 } else { 5 };
+                let list = Ty::List(Elem::Object);
+                let parts = Val {
+                    node: call(
+                        "zb_bytes_split",
+                        vec![b, sep, int(-1), int(mode)],
+                        list,
+                        span,
+                    ),
+                    ty: list,
+                };
+                let parts = self.guard(parts, span);
+                let mut pre = Vec::new();
+                let held = self.hold(parts, &mut pre, span);
+                let items: Vec<Val> = (0..3)
+                    .map(|i| Val {
+                        node: call(
+                            "zb_any_as_bytes",
+                            vec![elem_call(
+                                "get",
+                                Elem::Object,
+                                vec![held.node.clone(), int(i)],
+                                span,
+                            )],
+                            Ty::Bytes,
+                            span,
+                        ),
+                        ty: Ty::Bytes,
+                    })
+                    .collect();
+                let tuple = self.tuple_of_items(items, ty, span);
+                return Ok(Val {
+                    node: Self::block_value(pre, tuple, ty, span),
+                    ty,
+                });
+            }
+            ("join", 1) => {
+                let items = self.consumed(&args[0], span)?;
+                let items = self.iterable(items, span);
+                let guarded = Val {
+                    node: call("zb_bytes_join", vec![b, items], Ty::Bytes, span),
+                    ty: Ty::Bytes,
+                };
+                return Ok(self.guard(guarded, span));
+            }
+            _ => {
+                return Err(crate::diagnostics::unsupported_method(
+                    "bytes",
+                    name,
+                    args.len(),
+                    span,
+                ));
+            }
+        };
+        Ok(Val { node, ty })
+    }
+
     fn type_name(&self, ty: Ty) -> String {
         match ty {
             Ty::Int => "int".to_string(),
@@ -8090,6 +8449,7 @@ impl<'m> Lowerer<'m> {
             Ty::Float => "float".to_string(),
             Ty::Str => "str".to_string(),
             Ty::Bytes => "bytes".to_string(),
+            Ty::File(_) => "file".to_string(),
             Ty::None => "NoneType".to_string(),
             Ty::List(_) => "list".to_string(),
             Ty::Tuple(_) | Ty::TupleOf(_) => "tuple".to_string(),
@@ -11299,6 +11659,58 @@ impl<'m> Lowerer<'m> {
                             node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
                         Self::block_value(pre, none, Ty::None, span)
                     }
+                    // The in-place forms: the result of the operation
+                    // replaces the contents, so every holder sees it.
+                    (
+                        "intersection_update" | "difference_update" | "symmetric_difference_update",
+                        1..,
+                    ) => {
+                        let op = match name {
+                            "intersection_update" => "and",
+                            "difference_update" => "sub",
+                            _ => "xor",
+                        };
+                        let outer = std::mem::take(&mut self.hoisted);
+                        let mut pre = Vec::new();
+                        let held = self.hold(st, &mut pre, span);
+                        for a in args {
+                            let other = self.expr(a)?;
+                            pre.append(&mut self.hoisted);
+                            let other = Val {
+                                node: self.as_set_of(other, set_ty, span),
+                                ty: set_ty,
+                            };
+                            pre.append(&mut self.hoisted);
+                            let fresh = self.set_arith(op, held.clone(), other, set_ty, span);
+                            pre.append(&mut self.hoisted);
+                            let fresh = self.hold(
+                                Val {
+                                    node: fresh,
+                                    ty: set_ty,
+                                },
+                                &mut pre,
+                                span,
+                            );
+                            for (f, operand) in [("clear", None), ("update", Some(fresh.node))] {
+                                let mut operands = vec![held.node.clone()];
+                                operands.extend(operand);
+                                pre.push(TypedNode::new(
+                                    TypedStatement::Expression(Box::new(call(
+                                        &tables::set_fn(f, set_ty),
+                                        operands,
+                                        Ty::None,
+                                        span,
+                                    ))),
+                                    Type::Unknown,
+                                    span,
+                                ));
+                            }
+                        }
+                        self.hoisted = outer;
+                        let none =
+                            node(TypedExpression::Literal(TypedLiteral::Null), Ty::None, span);
+                        Self::block_value(pre, none, Ty::None, span)
+                    }
                     ("union" | "intersection" | "difference" | "symmetric_difference", 1) => {
                         let result = match ty {
                             Ty::Set(_) => ty.settled(),
@@ -11681,6 +12093,19 @@ impl<'m> Lowerer<'m> {
                         let a = self.coerce(lowered.pop().unwrap(), Ty::Str);
                         call("zb_str_replace_n", vec![s, a, b, count], Ty::Str, span)
                     }
+                    // Each character looked up in a table of ordinals.
+                    ("translate", 1) => {
+                        let table = self.consumed(&args[0], span)?;
+                        let table = self.coerce(table, Ty::Object);
+                        let made = call("zb_str_translate", vec![s, table], Ty::Str, span);
+                        return Ok(self.guard(
+                            Val {
+                                node: made,
+                                ty: Ty::Str,
+                            },
+                            span,
+                        ));
+                    }
                     // A string is its UTF-8 already; any other encoding
                     // is refused below.
                     ("encode", 0) => s,
@@ -11696,27 +12121,7 @@ impl<'m> Lowerer<'m> {
                 };
                 Ok(Val { node, ty })
             }
-            Ty::Bytes => {
-                let b = receiver.node;
-                let node = match (name, args.len()) {
-                    ("decode", 0) => call("zb_bytes_decode", vec![b], Ty::Str, span),
-                    ("decode", 1) if self.is_utf8_name(&args[0]) => {
-                        call("zb_bytes_decode", vec![b], Ty::Str, span)
-                    }
-                    // A digest is bytes; its spelling is theirs.
-                    ("hex" | "hexdigest", 0) => call("zb_bytes_hex", vec![b], Ty::Str, span),
-                    ("digest", 0) => b,
-                    _ => {
-                        return Err(crate::diagnostics::unsupported_method(
-                            "bytes",
-                            name,
-                            args.len(),
-                            span,
-                        ));
-                    }
-                };
-                Ok(Val { node, ty })
-            }
+            Ty::Bytes => self.bytes_method(receiver, name, args, ty, span),
             Ty::File(mode) => {
                 let f = receiver.node;
                 let node = match (name, args.len()) {
@@ -11755,6 +12160,41 @@ impl<'m> Lowerer<'m> {
                     }
                     ("getvalue", 0) => call("zb_file_getvalue", vec![f], mode.content(), span),
                     ("close", 0) => call("zb_file_close", vec![f], Ty::None, span),
+                    ("tell", 0) => call("zb_file_tell", vec![f], Ty::Int, span),
+                    ("seek", 1 | 2) => {
+                        let offset = self.expr_as(&args[0], Ty::Int)?;
+                        let whence = match args.get(1) {
+                            Some(w) => self.expr_as(w, Ty::Int)?,
+                            None => int_lit(0, span),
+                        };
+                        call("zb_file_seek", vec![f, offset, whence], Ty::Int, span)
+                    }
+                    ("truncate", 0 | 1) => {
+                        let (size, given) = match args.first() {
+                            Some(e) if !matches!(e, py::Expr::NoneLiteral(_)) => {
+                                (self.expr_as(e, Ty::Int)?, 1)
+                            }
+                            _ => (int_lit(0, span), 0),
+                        };
+                        call(
+                            "zb_file_truncate",
+                            vec![f, size, int_lit(given, span)],
+                            Ty::Int,
+                            span,
+                        )
+                    }
+                    ("readable" | "writable" | "seekable", 0) => {
+                        call(&format!("zb_file_{name}"), vec![f], Ty::Bool, span)
+                    }
+                    ("isatty", 0) => Self::after_none(
+                        f,
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(false)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        Ty::Bool,
+                    ),
                     ("__enter__", 0) => f,
                     ("__exit__", 3) => call("zb_file_close", vec![f], Ty::None, span),
                     ("flush", 0) => Self::after_none(
@@ -11786,8 +12226,97 @@ impl<'m> Lowerer<'m> {
                     ty,
                 })
             }
-            _ => Err(Error::unsupported_span(
+            Ty::Int | Ty::Bool => {
+                let v = self.coerce(receiver, Ty::Int);
+                let node = match (name, args.len()) {
+                    ("bit_length", 0) => call("zb_int_bit_length", vec![v], Ty::Int, span),
+                    ("bit_count", 0) => call("zb_int_bit_count", vec![v], Ty::Int, span),
+                    ("conjugate", 0) => v,
+                    ("is_integer", 0) => Self::after_none(
+                        v,
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Bool(true)),
+                            Ty::Bool,
+                            span,
+                        ),
+                        Ty::Bool,
+                    ),
+                    ("as_integer_ratio", 0) => {
+                        let items = vec![
+                            Val {
+                                node: v,
+                                ty: Ty::Int,
+                            },
+                            Val {
+                                node: int_lit(1, span),
+                                ty: Ty::Int,
+                            },
+                        ];
+                        return Ok(Val {
+                            node: self.tuple_of_items(items, ty, span),
+                            ty,
+                        });
+                    }
+                    ("to_bytes", 0..=3) => {
+                        let length = match args.first() {
+                            Some(e) => self.expr_as(e, Ty::Int)?,
+                            None => int_lit(1, span),
+                        };
+                        let order = match args.get(1) {
+                            Some(e) => self.expr_as(e, Ty::Str)?,
+                            None => str_lit("big", span),
+                        };
+                        let signed = match args.get(2) {
+                            Some(e) => self.expr_as(e, Ty::Int)?,
+                            None => int_lit(0, span),
+                        };
+                        let made = call(
+                            "zb_int_to_bytes",
+                            vec![v, length, order, signed],
+                            Ty::Bytes,
+                            span,
+                        );
+                        return Ok(self.guard(
+                            Val {
+                                node: made,
+                                ty: Ty::Bytes,
+                            },
+                            span,
+                        ));
+                    }
+                    _ => {
+                        return Err(crate::diagnostics::unsupported_number_method(
+                            "int", name, span,
+                        ));
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Float => {
+                let v = receiver.node;
+                let node = match (name, args.len()) {
+                    ("conjugate", 0) => v,
+                    ("is_integer", 0) => binary(
+                        BinaryOp::Ne,
+                        call("zb_float_is_integer", vec![v], Ty::Int, span),
+                        int_lit(0, span),
+                        Ty::Bool,
+                        span,
+                    ),
+                    _ => {
+                        return Err(crate::diagnostics::unsupported_number_method(
+                            "float", name, span,
+                        ));
+                    }
+                };
+                Ok(Val { node, ty })
+            }
+            Ty::Object => Err(Error::unsupported_span(
                 format!("method `{name}` on a dynamic value"),
+                span,
+            )),
+            other => Err(Error::unsupported_span(
+                format!("the `{}` method `{name}()`", self.type_name(other)),
                 span,
             )),
         }
@@ -11950,6 +12479,90 @@ impl<'m> Lowerer<'m> {
         }
         let args = &c.arguments.args;
         let keywords = &c.arguments.keywords;
+        // `int.from_bytes(data, byteorder, signed=...)`.
+        if let py::Expr::Attribute(a) = &*c.func
+            && types::is_name(&a.value, "int")
+            && a.attr.as_str() == "from_bytes"
+            && !self.is_variable("int")
+            && let Some(positional) = types::keywords_positional(
+                &[("bytes", ""), ("byteorder", "'big'"), ("signed", "False")],
+                0,
+                true,
+                args,
+                keywords,
+            )
+        {
+            let data = self.bytes_arg("from_bytes", &positional[0], false, span)?;
+            let order = self.expr_as(&positional[1], Ty::Str)?;
+            let signed = self.expr_as(&positional[2], Ty::Int)?;
+            let made = call(
+                "zb_int_from_bytes",
+                vec![data, order, signed],
+                Ty::Int,
+                span,
+            );
+            return Ok(self.guard(
+                Val {
+                    node: made,
+                    ty: Ty::Int,
+                },
+                span,
+            ));
+        }
+        // `bytes.fromhex(text)` and `bytes.maketrans(old, new)`.
+        if let py::Expr::Attribute(a) = &*c.func
+            && types::is_name(&a.value, "bytes")
+            && !self.is_variable("bytes")
+            && keywords.is_empty()
+        {
+            match (a.attr.as_str(), args.len()) {
+                ("fromhex", 1) => {
+                    // The digits are text, which a string holds as bytes.
+                    let v = self.expr(&args[0])?;
+                    let data = match v.ty {
+                        Ty::Str | Ty::Bytes => v.node,
+                        _ => self.coerce(v, Ty::Str),
+                    };
+                    let made = call("zb_bytes_from_hex", vec![data], Ty::Bytes, span);
+                    return Ok(self.guard(
+                        Val {
+                            node: made,
+                            ty: Ty::Bytes,
+                        },
+                        span,
+                    ));
+                }
+                ("maketrans", 2) => {
+                    let from = self.bytes_arg("maketrans", &args[0], false, span)?;
+                    let to = self.bytes_arg("maketrans", &args[1], false, span)?;
+                    let made = call("zb_bytes_maketrans", vec![from, to], Ty::Bytes, span);
+                    return Ok(self.guard(
+                        Val {
+                            node: made,
+                            ty: Ty::Bytes,
+                        },
+                        span,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // A method of a builtin type that is not a call on a value.
+        if let py::Expr::Attribute(a) = &*c.func
+            && let py::Expr::Name(t) = &*a.value
+            && matches!(
+                t.id.as_str(),
+                "int" | "float" | "str" | "bytes" | "list" | "dict" | "set" | "tuple"
+            )
+            && !self.is_variable(t.id.as_str())
+            && !a.attr.as_str().starts_with("__")
+        {
+            return Err(crate::diagnostics::unsupported_class_call(
+                t.id.as_str(),
+                a.attr.as_str(),
+                span,
+            ));
+        }
         if let py::Expr::Attribute(a) = &*c.func
             && types::is_name(&a.value, "frozenset")
             && a.attr.as_str() == "union"
@@ -12002,6 +12615,44 @@ impl<'m> Lowerer<'m> {
                 ),
                 ty,
             });
+        }
+        // `"...{name}".format_map(d)` reads each field from the mapping.
+        if let py::Expr::Attribute(a) = &*c.func
+            && a.attr.as_str() == "format_map"
+            && let py::Expr::StringLiteral(template) = &*a.value
+            && let [mapping] = &args[..]
+            && keywords.is_empty()
+        {
+            if !crate::sugar::is_pure_path(mapping) {
+                return unsupported("format_map of a mapping that is not a plain name", c);
+            }
+            let template = template.value.to_str().to_string();
+            let range = c.range();
+            let fields: Vec<py::Keyword> = crate::format::template_names(&template)
+                .into_iter()
+                .map(|name| py::Keyword {
+                    range,
+                    node_index: Default::default(),
+                    arg: Some(py::Identifier::new(name.as_str(), range)),
+                    value: py::Expr::Subscript(py::ExprSubscript {
+                        node_index: Default::default(),
+                        range,
+                        value: Box::new(mapping.clone()),
+                        slice: Box::new(py::Expr::StringLiteral(py::ExprStringLiteral {
+                            node_index: Default::default(),
+                            range,
+                            value: py::StringLiteralValue::single(py::StringLiteral {
+                                range,
+                                node_index: Default::default(),
+                                value: name.clone().into_boxed_str(),
+                                flags: py::StringLiteralFlags::empty(),
+                            }),
+                        })),
+                        ctx: py::ExprContext::Load,
+                    }),
+                })
+                .collect();
+            return self.str_format(&template, &[], &fields, span);
         }
         // `"...{}".format(args)` with a literal template is built here.
         if let py::Expr::Attribute(a) = &*c.func
@@ -12215,7 +12866,7 @@ impl<'m> Lowerer<'m> {
             } else {
                 receiver
             };
-            if receiver.ty == Ty::Str
+            if matches!(receiver.ty, Ty::Str | Ty::Bytes | Ty::Int | Ty::Bool)
                 && !keywords.is_empty()
                 && let Some(positional) =
                     types::str_keywords_positional(a.attr.as_str(), args, keywords)
@@ -15389,8 +16040,47 @@ impl<'m> Lowerer<'m> {
                     ty,
                 })
             }
-            other => Err(Error::unsupported_span(
-                format!("attribute `{attr}` of a {other:?}"),
+            // The parts of a real number as a complex one has them.
+            Ty::Int | Ty::Bool if matches!(attr, "real" | "imag" | "numerator" | "denominator") => {
+                let v = self.coerce(object, Ty::Int);
+                let node = match attr {
+                    "real" | "numerator" => v,
+                    "imag" => Self::after_none(v, int_lit(0, span), Ty::Int),
+                    _ => Self::after_none(v, int_lit(1, span), Ty::Int),
+                };
+                Ok(Val { node, ty: Ty::Int })
+            }
+            Ty::Float if matches!(attr, "real" | "imag") => {
+                let node = if attr == "real" {
+                    object.node
+                } else {
+                    Self::after_none(
+                        object.node,
+                        node(
+                            TypedExpression::Literal(TypedLiteral::Float(0.0)),
+                            Ty::Float,
+                            span,
+                        ),
+                        Ty::Float,
+                    )
+                };
+                Ok(Val {
+                    node,
+                    ty: Ty::Float,
+                })
+            }
+            // A file's state, as `closed` and `name` read it.
+            Ty::File(_) if attr == "closed" => Ok(Val {
+                node: call("zb_file_closed", vec![object.node], Ty::Bool, span),
+                ty: Ty::Bool,
+            }),
+            Ty::File(_) if attr == "name" => Ok(Val {
+                node: call("zb_file_name", vec![object.node], Ty::Str, span),
+                ty: Ty::Str,
+            }),
+            other => Err(crate::diagnostics::unsupported_attribute(
+                &self.type_name(other),
+                attr,
                 span,
             )),
         }

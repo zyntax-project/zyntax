@@ -560,7 +560,79 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 36] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 54] = [
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_bit_length".as_ptr(),
+        crate::host_numbers::host_int_bit_length as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_bit_count".as_ptr(),
+        crate::host_numbers::host_int_bit_count as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_to_bytes".as_ptr(),
+        crate::host_numbers::host_int_to_bytes as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_from_bytes_fits".as_ptr(),
+        crate::host_numbers::host_int_from_bytes_fits as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$int_from_bytes".as_ptr(),
+        crate::host_numbers::host_int_from_bytes as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$float_is_integer".as_ptr(),
+        crate::host_numbers::host_float_is_integer as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_expandtabs".as_ptr(),
+        crate::host_bytes::host_bytes_expandtabs as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_translate".as_ptr(),
+        crate::host_bytes::host_bytes_translate as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_maketrans".as_ptr(),
+        crate::host_bytes::host_bytes_maketrans as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_find".as_ptr(),
+        crate::host_bytes::host_bytes_find as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_edge".as_ptr(),
+        crate::host_bytes::host_bytes_edge as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_replace_n".as_ptr(),
+        crate::host_bytes::host_bytes_replace_n as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_case_map".as_ptr(),
+        crate::host_bytes::host_bytes_case_map as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_check".as_ptr(),
+        crate::host_bytes::host_bytes_check as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_strip".as_ptr(),
+        crate::host_bytes::host_bytes_strip as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_justify".as_ptr(),
+        crate::host_bytes::host_bytes_justify as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_cuts".as_ptr(),
+        crate::host_bytes::host_bytes_cuts as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$bytes_cut_at".as_ptr(),
+        crate::host_bytes::host_bytes_cut_at as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), host_argc as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), host_argv as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$time".as_ptr(), host_time as *const u8),

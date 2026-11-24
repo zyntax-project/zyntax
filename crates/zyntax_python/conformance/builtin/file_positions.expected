@@ -1,0 +1,16 @@
+11
+hello 5
+world
+'hello' 0
+hello!
+''
+True True True False
+True
+True True False False
+6
+True
+True False
+cd 4
+abcdef 6
+6 ''
+ValueError I/O operation on closed file

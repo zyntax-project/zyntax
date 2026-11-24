@@ -9,16 +9,36 @@ fn render(source: &str) -> String {
 
 #[test]
 fn a_method_zypy_lacks_names_the_type_and_the_methods_it_has() {
-    let shown = render("data = bytes([104, 105])\nprint(data.find(b\"i\"))\n");
+    let shown = render("f = open(\"x\")\nprint(f.fileno())\n");
     assert!(
-        shown.contains("the `bytes` method `find()`"),
+        shown.contains("the `file` method `fileno()`"),
         "got: {shown}"
     );
     assert!(shown.contains("method call"), "got: {shown}");
-    assert!(shown.contains("`decode`"), "got: {shown}");
-    assert!(shown.contains("decode them to `str` first"), "got: {shown}");
+    assert!(shown.contains("`readline`"), "got: {shown}");
     assert!(!shown.contains("this frontend"), "got: {shown}");
     assert!(!shown.contains("argument(s)"), "got: {shown}");
+}
+
+#[test]
+fn a_method_python_does_not_define_is_the_error_python_raises() {
+    let shown = render("data = bytes([104, 105])\nprint(data.encode())\n");
+    assert!(
+        shown.contains("'bytes' object has no attribute 'encode'"),
+        "got: {shown}"
+    );
+    assert!(shown.contains("Did you mean `decode`?"), "got: {shown}");
+    assert!(!shown.contains("not supported yet"), "got: {shown}");
+}
+
+#[test]
+fn a_bytes_method_given_text_is_the_type_error_python_raises() {
+    let shown = render("data = b\"abc\"\nprint(data.find(\"a\"))\n");
+    assert!(
+        shown.contains("argument should be integer or bytes-like object, not 'str'"),
+        "got: {shown}"
+    );
+    assert!(shown.contains("`.encode()`"), "got: {shown}");
 }
 
 #[test]

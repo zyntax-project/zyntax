@@ -1076,6 +1076,45 @@ fn has_call(e: &py::Expr) -> bool {
     v.0
 }
 
+/// The names a template's fields read, first segment only, in order and
+/// once each; the empty and numbered fields are left out.
+pub(crate) fn template_names(template: &str) -> Vec<String> {
+    let chars: Vec<char> = template.chars().collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match (chars[i], chars.get(i + 1)) {
+            ('{', Some('{')) | ('}', Some('}')) => i += 2,
+            ('{', _) => {
+                let mut depth = 1;
+                let mut end = i + 1;
+                while end < chars.len() && depth > 0 {
+                    match chars[end] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                let field: String = chars[i + 1..end.saturating_sub(1).max(i + 1)]
+                    .iter()
+                    .collect();
+                let name = field
+                    .split(['!', ':', '.', '['])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.is_empty() && name.parse::<usize>().is_err() && !names.contains(&name) {
+                    names.push(name);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_spec;

@@ -1,0 +1,10 @@
+ABC abc x ['a', 'b', 'c']
+delta, Alpha, charlie, Bravo a-b True
+['Alpha', 'Bravo', 'charlie', 'delta'] ['DELTA', 'ALPHA', 'CHARLIE', 'BRAVO']
+1-2 3 2
+[1, 2, 3, 4] 2 1
+[8, 9, 4, 3, 2] 1
+{'b': 2} 1 0 ['a', 'b'] 1
+[1, 2, 3] True
+b'AB' b'ab' hi
+2 1

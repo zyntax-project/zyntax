@@ -1697,7 +1697,7 @@ impl Transformer for Renamer<'_> {
 }
 
 /// Whether a module-level statement binds `name`.
-fn binds_module_name(body: &[py::Stmt], name: &str) -> bool {
+pub(crate) fn binds_module_name(body: &[py::Stmt], name: &str) -> bool {
     body.iter().any(|s| match s {
         py::Stmt::FunctionDef(f) => f.name.as_str() == name,
         py::Stmt::ClassDef(c) => c.name.as_str() == name,

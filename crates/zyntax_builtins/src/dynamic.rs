@@ -2641,6 +2641,78 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
             k.ty(),
         )
     };
+    // str.translate(table): each character's ordinal is looked up in the
+    // table, which maps it to an ordinal, a string, or None to drop it.
+    {
+        let strs = list_of(list_type, string());
+        let text_in = local("s", string());
+        let table = local("table", any());
+        let parts = local("parts", strs.clone());
+        let n = local("n", i64());
+        let pos = local("pos", i64());
+        let ch = local("ch", string());
+        let key = local("key", any());
+        let mapped = local("mapped", any());
+        let found = local("found", i64());
+        let push = |piece: Expr| expr(mcall(parts.e(), "push", vec![piece], unit()));
+        d.push(define(
+            "zb_str_translate",
+            &[&text_in, &table],
+            string(),
+            vec![
+                parts.decl(list(Vec::new(), strs.clone())),
+                n.decl(call("zb_str_len", vec![text_in.e()], i64())),
+                pos.decl(int(0)),
+                while_(
+                    lt(pos.e(), n.e()),
+                    vec![
+                        ch.decl(call(
+                            "zb_str_char_at_byte",
+                            vec![text_in.e(), pos.e()],
+                            string(),
+                        )),
+                        key.decl(box_i64(cast(
+                            call("zb_str_code_at", vec![ch.e(), int(0)], i32()),
+                            i64(),
+                        ))),
+                        if_(
+                            call("zb_any_contains", vec![table.e(), key.e()], boolean()),
+                            vec![
+                                mapped.decl(call(
+                                    "zb_any_getitem",
+                                    vec![table.e(), key.e()],
+                                    any(),
+                                )),
+                                found.decl(category(mapped.e())),
+                                when(
+                                    or(eq(found.e(), int(INT)), eq(found.e(), int(UINT))),
+                                    vec![push(call(
+                                        "zb_str_of_code",
+                                        vec![cast(get_i64(mapped.e()), i32())],
+                                        string(),
+                                    ))],
+                                ),
+                                when(eq(found.e(), int(STR)), vec![push(get_str(mapped.e()))]),
+                                when(
+                                    and(
+                                        and(ne(found.e(), int(INT)), ne(found.e(), int(UINT))),
+                                        and(ne(found.e(), int(STR)), ne(found.e(), int(NONE))),
+                                    ),
+                                    vec![fatal(
+                                        "TypeError",
+                                        text("character mapping must return integer, None or str"),
+                                    )],
+                                ),
+                            ],
+                            vec![push(ch.e())],
+                        ),
+                        pos.set(call("zb_str_next_byte", vec![text_in.e(), pos.e()], i64())),
+                    ],
+                ),
+                ret(call("zb_str_join", vec![text(""), parts.e()], string())),
+            ],
+        ));
+    }
     d.push(define(
         "zb_any_getitem",
         &[&x, &i],

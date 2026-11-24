@@ -28,6 +28,7 @@ use zyntax_typed_ast::{
 
 mod aliases;
 mod bigint;
+mod builtin_calls;
 mod bytes;
 mod class_attrs;
 mod classes;
@@ -37,6 +38,8 @@ mod diagnostics;
 mod enums;
 mod format;
 mod host;
+mod host_bytes;
+mod host_numbers;
 mod infer_deps;
 mod kwargs;
 mod lower;
@@ -594,6 +597,7 @@ fn parse_program_once(
     patterns::rewrite(&mut statements, &mut origins)?;
     decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);
+    builtin_calls::rewrite(&mut statements);
     varargs::rewrite(&mut statements)?;
     spreads::rewrite(&mut statements, &mut origins);
     kwargs::rewrite(&mut statements)?;

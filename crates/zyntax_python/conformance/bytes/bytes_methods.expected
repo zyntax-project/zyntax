@@ -1,0 +1,45 @@
+0 14 14 -1
+8 18 4 0
+2 5 20 2
+7 14
+True False True
+True True True
+False True
+b'bye, world, bye'
+b'heLLo, world, hello'
+b'-a-b-c-'
+b'-a-bc'
+b'HELLO WORLD' b'hello world' b'hELLO wORLD'
+b'Hello world' b'Hello World-X 1A'
+b'CAF\xc3\xa9' b'Caf\xc3\xa9'
+True False True True False
+True True True True
+True False True
+b'padded' b'padded \n' b'  padded'
+b'abc' b'abc' b'abcxx' b'xxabc'
+b'x'
+b'ab   ' b'...ab' b'**ab**' b'**ab*'
+b'-00042' b'007' b'abc'
+[b'a', b'b', b'', b'c'] [b'a', b'b,c'] [b'a,b', b'c']
+[b'a', b'b', b'c'] [b'a', b'b c '] [b'  a  b', b'c']
+[b'a', b'b', b'c'] [b''] []
+[b'line1', b'line2', b'line3', b'line4'] [b'a\n', b'b\n']
+(b'key', b'=', b'value=x') (b'key=value', b'=', b'x')
+(b'novalue', b'', b'') (b'', b'', b'novalue')
+[b'a', b'b c'] [b'x\n', b'y']
+b'a, b, c' b'xy' b''
+b'p-q' b'ab cd'
+b'body' b'body' b'body'
+3 b'two' b'TWO'
+a 1
+b 1
+b'a   bc  d' b'a       b'
+256 b'xxyyzzdd' b'xxyyzz'
+b'heo' b'Hello'
+1 3 [b'', b'', b'ab\xff\x00', b''] b'..ab\xff\x00.'
+b'\x80\x80AB\xff\x00\x80' False (b'\x80\x80', b'ab', b'\xff\x00\x80')
+[b'\xc3', b'']
+ValueError subsection not found
+ValueError subsection not found
+ValueError empty separator
+TypeError sequence item 1: expected a bytes-like object, int found

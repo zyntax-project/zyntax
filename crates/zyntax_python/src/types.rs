@@ -2149,6 +2149,8 @@ fn str_keyword_params(attr: &str) -> Option<&'static [(&'static str, &'static st
         "expandtabs" => &[("tabsize", "8")],
         "encode" => &[("encoding", "'utf-8'"), ("errors", "'strict'")],
         "replace" => &[("old", ""), ("new", ""), ("count", "-1")],
+        "translate" => &[("table", ""), ("delete", "b''")],
+        "to_bytes" => &[("length", "1"), ("byteorder", "'big'"), ("signed", "False")],
         _ => return None,
     })
 }
@@ -2165,7 +2167,11 @@ pub(crate) fn str_keywords_positional(
 ) -> Option<Vec<py::Expr>> {
     let params = str_keyword_params(attr)?;
     // `old` and `new` of `replace` are positional only.
-    let positional_only = if attr == "replace" { 2 } else { 0 };
+    let positional_only = match attr {
+        "replace" => 2,
+        "translate" => 1,
+        _ => 0,
+    };
     keywords_positional(params, positional_only, false, args, keywords)
 }
 
@@ -2235,7 +2241,8 @@ pub(crate) fn builtin_presence(module: &Module, ty: Ty, attr: &str) -> bool {
         "real" | "imag" => matches!(ty, Ty::Int | Ty::Bool | Ty::Float),
         "numerator" | "denominator" => matches!(ty, Ty::Int | Ty::Bool),
         "typecode" | "itemsize" => matches!(ty, Ty::List(Elem::Array(_))),
-        "read" | "write" | "close" | "flush" => matches!(ty, Ty::File(_)),
+        "read" | "write" | "close" | "flush" | "closed" | "name" | "tell" | "seek" | "truncate"
+        | "readable" | "writable" | "seekable" | "isatty" => matches!(ty, Ty::File(_)),
         _ => false,
     }
 }
@@ -9583,6 +9590,17 @@ impl Typer<'_> {
                     // An array's typecode and element size.
                     Ty::List(Elem::Array(_)) if a.attr.as_str() == "typecode" => Ty::Str,
                     Ty::List(Elem::Array(_)) if a.attr.as_str() == "itemsize" => Ty::Int,
+                    Ty::Int | Ty::Bool
+                        if matches!(
+                            a.attr.as_str(),
+                            "real" | "imag" | "numerator" | "denominator"
+                        ) =>
+                    {
+                        Ty::Int
+                    }
+                    Ty::Float if matches!(a.attr.as_str(), "real" | "imag") => Ty::Float,
+                    Ty::File(_) if a.attr.as_str() == "closed" => Ty::Bool,
+                    Ty::File(_) if a.attr.as_str() == "name" => Ty::Str,
                     _ => Ty::Object,
                 }
             }
@@ -9828,6 +9846,18 @@ impl Typer<'_> {
     }
 
     fn call(&self, c: &py::ExprCall) -> Ty {
+        if let py::Expr::Attribute(a) = &*c.func
+            && is_name(&a.value, "int")
+            && a.attr.as_str() == "from_bytes"
+        {
+            return Ty::Int;
+        }
+        if let py::Expr::Attribute(a) = &*c.func
+            && is_name(&a.value, "bytes")
+            && matches!(a.attr.as_str(), "fromhex" | "maketrans")
+        {
+            return Ty::Bytes;
+        }
         if let py::Expr::Attribute(a) = &*c.func
             && is_name(&a.value, "frozenset")
             && a.attr.as_str() == "union"
@@ -10330,7 +10360,14 @@ impl Typer<'_> {
             Ty::Set(k) => {
                 let (elem, frozen) = set_shape(k);
                 match attr {
-                    "add" | "remove" | "discard" | "clear" | "update" => Ty::None,
+                    "add"
+                    | "remove"
+                    | "discard"
+                    | "clear"
+                    | "update"
+                    | "intersection_update"
+                    | "difference_update"
+                    | "symmetric_difference_update" => Ty::None,
                     "copy" => receiver,
                     "pop" => elem,
                     // Of this set's kind, of the elements of every
@@ -10345,7 +10382,8 @@ impl Typer<'_> {
             Ty::Str => match attr {
                 "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace" | "join"
                 | "capitalize" | "title" | "swapcase" | "format" | "zfill" | "center" | "ljust"
-                | "rjust" | "casefold" | "removeprefix" | "removesuffix" | "expandtabs" => Ty::Str,
+                | "rjust" | "casefold" | "removeprefix" | "removesuffix" | "expandtabs"
+                | "translate" | "format_map" => Ty::Str,
                 "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
                 "startswith" | "endswith" | "isdigit" | "isalpha" | "isalnum" | "isspace"
                 | "isupper" | "islower" | "istitle" | "isdecimal" | "isnumeric" | "isascii"
@@ -10357,13 +10395,36 @@ impl Typer<'_> {
             },
             Ty::Bytes => match attr {
                 "decode" | "hex" | "hexdigest" => Ty::Str,
-                "digest" => Ty::Bytes,
+                "digest" | "upper" | "lower" | "swapcase" | "capitalize" | "title" | "strip"
+                | "lstrip" | "rstrip" | "replace" | "join" | "ljust" | "rjust" | "center"
+                | "zfill" | "removeprefix" | "removesuffix" | "expandtabs" | "translate" => {
+                    Ty::Bytes
+                }
+                "find" | "rfind" | "index" | "rindex" | "count" => Ty::Int,
+                "startswith" | "endswith" | "isalpha" | "isalnum" | "isdigit" | "isspace"
+                | "isupper" | "islower" | "istitle" | "isascii" => Ty::Bool,
+                "split" | "rsplit" | "splitlines" => Ty::List(Elem::of(Ty::Bytes)),
+                "partition" | "rpartition" => tuple_of(vec![Ty::Bytes, Ty::Bytes, Ty::Bytes]),
+                _ => Ty::Object,
+            },
+            Ty::Int | Ty::Bool => match attr {
+                "bit_length" | "bit_count" | "conjugate" => Ty::Int,
+                "to_bytes" => Ty::Bytes,
+                "is_integer" => Ty::Bool,
+                "as_integer_ratio" => tuple_of(vec![Ty::Int, Ty::Int]),
+                _ => Ty::Object,
+            },
+            Ty::Float => match attr {
+                "is_integer" => Ty::Bool,
+                "conjugate" => Ty::Float,
                 _ => Ty::Object,
             },
             Ty::File(mode) => match attr {
                 "read" | "readline" | "getvalue" => mode.content(),
                 "readlines" => Ty::List(Elem::of(mode.content())),
                 "write" | "close" | "flush" => Ty::None,
+                "tell" | "seek" | "truncate" => Ty::Int,
+                "readable" | "writable" | "seekable" | "isatty" => Ty::Bool,
                 _ => Ty::Object,
             },
             _ => Ty::Object,
