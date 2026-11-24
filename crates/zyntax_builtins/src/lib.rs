@@ -10,6 +10,7 @@
 //! runtime boundary except the string plugin's primitives, which are the
 //! same primitives every frontend's strings rest on.
 
+mod bignum;
 pub mod build;
 mod bytes;
 pub mod dicts;
@@ -282,6 +283,7 @@ pub fn library(policy: &Policy) -> Library {
     declarations.extend(math::declarations());
     declarations.extend(random::declarations(list_type));
     declarations.extend(bytes::declarations(list_type));
+    declarations.extend(bignum::declarations(list_type));
     declarations.extend(json::declarations(list_type));
     declarations.extend(foreign::declarations(list_type));
     // The hooks a frontend defines are declared here as externs, so the

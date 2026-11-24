@@ -5,6 +5,8 @@
 # fits 64 bits comes back as the machine int, so a BigInt is never equal to
 # one.
 
+import __bignative
+
 BASE = 1073741824
 MASK = 1073741823
 MIN = -9223372036854775807 - 1
@@ -288,84 +290,23 @@ def _limb_bits(x: int) -> int:
 
 
 def _cmp_mag(a: list[int], b: list[int]) -> int:
-    if len(a) != len(b):
-        if len(a) > len(b):
-            return 1
-        return -1
-    i = len(a) - 1
-    while i >= 0:
-        if a[i] != b[i]:
-            if a[i] > b[i]:
-                return 1
-            return -1
-        i -= 1
-    return 0
+    return __bignative.cmp(a, b)
 
 
 def _add_mag(a: list[int], b: list[int]) -> list[int]:
-    if len(a) < len(b):
-        t = a
-        a = b
-        b = t
-    out: list[int] = []
-    carry = 0
-    i = 0
-    while i < len(a):
-        s = a[i] + carry
-        if i < len(b):
-            s += b[i]
-        out.append(s & MASK)
-        carry = s >> 30
-        i += 1
-    if carry > 0:
-        out.append(carry)
-    return out
+    n = len(a)
+    if len(b) > n:
+        n = len(b)
+    out = [0] * (n + 1)
+    __bignative.add(a, b, out)
+    return _trim(out)
 
 
 def _sub_mag(a: list[int], b: list[int]) -> list[int]:
     # a >= b
-    out: list[int] = []
-    borrow = 0
-    i = 0
-    while i < len(a):
-        d = a[i] - borrow
-        if i < len(b):
-            d -= b[i]
-        if d < 0:
-            d += BASE
-            borrow = 1
-        else:
-            borrow = 0
-        out.append(d)
-        i += 1
+    out = [0] * len(a)
+    __bignative.sub(a, b, out)
     return _trim(out)
-
-
-def _mul_school(a: list[int], b: list[int]) -> list[int]:
-    n = len(a)
-    m = len(b)
-    out = [0] * (n + m)
-    i = 0
-    while i < n:
-        ai = a[i]
-        carry = 0
-        j = 0
-        while j < m:
-            t = out[i + j] + ai * b[j] + carry
-            out[i + j] = t & MASK
-            carry = t >> 30
-            j += 1
-        out[i + m] = carry
-        i += 1
-    return _trim(out)
-
-
-def _shift_limbs(a: list[int], k: int) -> list[int]:
-    if len(a) == 0:
-        return []
-    out = [0] * k
-    out.extend(a)
-    return out
 
 
 def _mul_mag(a: list[int], b: list[int]) -> list[int]:
@@ -373,130 +314,37 @@ def _mul_mag(a: list[int], b: list[int]) -> list[int]:
     m = len(b)
     if n == 0 or m == 0:
         return []
-    if n < 48 or m < 48:
-        return _mul_school(a, b)
-    # Karatsuba on the low half's length.
-    k = n
-    if m < k:
-        k = m
-    k = k // 2
-    a0 = _trim(a[:k])
-    a1 = a[k:]
-    b0 = _trim(b[:k])
-    b1 = b[k:]
-    z0 = _mul_mag(a0, b0)
-    z2 = _mul_mag(a1, b1)
-    sa = _add_mag(a0, a1)
-    sb = _add_mag(b0, b1)
-    z1 = _sub_mag(_sub_mag(_mul_mag(sa, sb), z0), z2)
-    r = _add_mag(z0, _shift_limbs(z1, k))
-    return _add_mag(r, _shift_limbs(z2, 2 * k))
+    out = [0] * (n + m)
+    __bignative.mul(a, b, out)
+    return _trim(out)
 
 
 def _divmod_small(a: list[int], d: int) -> tuple[list[int], int]:
     q = [0] * len(a)
-    r = 0
-    i = len(a) - 1
-    while i >= 0:
-        cur = (r << 30) | a[i]
-        qi = cur // d
-        q[i] = qi
-        r = cur - qi * d
-        i -= 1
+    r = __bignative.divmod_small(a, d, q)
     return _trim(q), r
 
 
 def _shl_mag(a: list[int], n: int) -> list[int]:
     if len(a) == 0:
         return []
-    limbs = n // 30
-    bits = n % 30
-    out = [0] * limbs
-    carry = 0
-    i = 0
-    while i < len(a):
-        t = (a[i] << bits) | carry
-        out.append(t & MASK)
-        carry = t >> 30
-        i += 1
-    if carry > 0:
-        out.append(carry)
-    return out
+    out = [0] * (len(a) + n // 30 + 1)
+    __bignative.shl(a, n, out)
+    return _trim(out)
 
 
 def _shr_mag(a: list[int], n: int) -> list[int]:
-    limbs = n // 30
-    bits = n % 30
-    out: list[int] = []
-    i = limbs
-    while i < len(a):
-        v = a[i] >> bits
-        if i + 1 < len(a):
-            v = v | ((a[i + 1] << (30 - bits)) & MASK)
-        out.append(v)
-        i += 1
+    out = [0] * len(a)
+    __bignative.shr(a, n, out)
     return _trim(out)
 
 
 def _divmod_mag(a: list[int], b: list[int]) -> tuple[list[int], list[int]]:
     # b is not empty.
-    if _cmp_mag(a, b) < 0:
-        return [], list(a)
-    n = len(b)
-    if n == 1:
-        q, r = _divmod_small(a, b[0])
-        if r == 0:
-            return q, []
-        return q, [r]
-    s = 30 - _limb_bits(b[n - 1])
-    v = _shl_mag(b, s)
-    u = _shl_mag(a, s)
-    if len(u) == len(a):
-        u.append(0)
-    m = len(a) - n
-    q = [0] * (m + 1)
-    vtop = v[n - 1]
-    vsec = v[n - 2]
-    j = m
-    while j >= 0:
-        num = u[j + n] * BASE + u[j + n - 1]
-        qhat = num // vtop
-        rhat = num - qhat * vtop
-        while qhat >= BASE or qhat * vsec > rhat * BASE + u[j + n - 2]:
-            qhat -= 1
-            rhat += vtop
-            if rhat >= BASE:
-                break
-        borrow = 0
-        carry = 0
-        i = 0
-        while i < n:
-            p = qhat * v[i] + carry
-            carry = p >> 30
-            t = u[i + j] - (p & MASK) - borrow
-            if t < 0:
-                t += BASE
-                borrow = 1
-            else:
-                borrow = 0
-            u[i + j] = t
-            i += 1
-        t = u[j + n] - carry - borrow
-        u[j + n] = t
-        if t < 0:
-            qhat -= 1
-            carry = 0
-            i = 0
-            while i < n:
-                t2 = u[i + j] + v[i] + carry
-                u[i + j] = t2 & MASK
-                carry = t2 >> 30
-                i += 1
-            u[j + n] = u[j + n] + carry
-        q[j] = qhat
-        j -= 1
-    r = _shr_mag(_trim(u[:n]), s)
-    return _trim(q), r
+    q = [0] * (len(a) + 1)
+    r = [0] * len(b)
+    __bignative.divmod(a, b, q, r)
+    return _trim(q), _trim(r)
 
 
 def _addsub(a: object, b: object, negate: bool) -> object:
@@ -680,13 +528,7 @@ def _mag_str(m: list[int]) -> str:
 
 
 def _mul_small_add(m: list[int], k: int, add: int):
-    carry = add
-    i = 0
-    while i < len(m):
-        t = m[i] * k + carry
-        m[i] = t & MASK
-        carry = t >> 30
-        i += 1
+    carry = __bignative.mul_small_add(m, k, add)
     while carry > 0:
         m.append(carry & MASK)
         carry = carry >> 30

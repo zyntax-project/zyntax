@@ -560,7 +560,43 @@ extern "C" fn host_file_exists(path: StringConstPtr) -> i64 {
 }
 
 static INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"python_host".as_ptr());
-static SYMBOLS: [zrtl::ZrtlSymbol; 54] = [
+static SYMBOLS: [zrtl::ZrtlSymbol; 63] = [
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_cmp".as_ptr(),
+        crate::host_bignum::host_big_cmp as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_add".as_ptr(),
+        crate::host_bignum::host_big_add as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_sub".as_ptr(),
+        crate::host_bignum::host_big_sub as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_mul".as_ptr(),
+        crate::host_bignum::host_big_mul as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_divmod_small".as_ptr(),
+        crate::host_bignum::host_big_divmod_small as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_shl".as_ptr(),
+        crate::host_bignum::host_big_shl as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_shr".as_ptr(),
+        crate::host_bignum::host_big_shr as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_divmod".as_ptr(),
+        crate::host_bignum::host_big_divmod as *const u8,
+    ),
+    zrtl::ZrtlSymbol::new(
+        c"$Host$big_mul_small_add".as_ptr(),
+        crate::host_bignum::host_big_mul_small_add as *const u8,
+    ),
     zrtl::ZrtlSymbol::new(
         c"$Host$int_bit_length".as_ptr(),
         crate::host_numbers::host_int_bit_length as *const u8,

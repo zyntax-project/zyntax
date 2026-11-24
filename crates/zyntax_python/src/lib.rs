@@ -38,6 +38,7 @@ mod diagnostics;
 mod enums;
 mod format;
 mod host;
+mod host_bignum;
 mod host_bytes;
 mod host_numbers;
 mod infer_deps;

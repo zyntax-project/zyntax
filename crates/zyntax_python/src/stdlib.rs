@@ -66,6 +66,7 @@ pub(crate) fn is_known(module: &str) -> bool {
             | "codecs"
             | "json"
             | "struct"
+            | "__bignative"
             | "__future__"
     )
 }
@@ -135,6 +136,8 @@ const F: Ty = Ty::Float;
 const I: Ty = Ty::Int;
 const B: Ty = Ty::Bool;
 const S: Ty = Ty::Str;
+/// A list of ints: limbs, for the big-int library.
+const L: Ty = Ty::List(Elem::Int);
 
 pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
     let func = |params: &'static [Ty], ret: Ty, zb: &'static str| Member::Func { params, ret, zb };
@@ -213,6 +216,16 @@ pub(crate) fn member(module: &str, name: &str) -> Option<Member> {
         ("os", "path.basename") => func(&[S], S, "zb_path_basename"),
         ("os", "path.exists") => func(&[S], B, "zb_path_exists"),
         // A digest is the bytes it hashes to: `hexdigest()` spells them.
+        // The big-int library's magnitude arithmetic, over lists of limbs.
+        ("__bignative", "cmp") => func(&[L, L], I, "zb_big_cmp"),
+        ("__bignative", "add") => func(&[L, L, L], Ty::None, "zb_big_add"),
+        ("__bignative", "sub") => func(&[L, L, L], Ty::None, "zb_big_sub"),
+        ("__bignative", "mul") => func(&[L, L, L], Ty::None, "zb_big_mul"),
+        ("__bignative", "divmod_small") => func(&[L, I, L], I, "zb_big_divmod_small"),
+        ("__bignative", "shl") => func(&[L, I, L], Ty::None, "zb_big_shl"),
+        ("__bignative", "shr") => func(&[L, I, L], Ty::None, "zb_big_shr"),
+        ("__bignative", "divmod") => func(&[L, L, L, L], Ty::None, "zb_big_divmod"),
+        ("__bignative", "mul_small_add") => func(&[L, I, I], I, "zb_big_mul_small_add"),
         ("hashlib", "md5") => func(&[Ty::Bytes], Ty::Bytes, "zb_md5"),
         ("json", "dumps") => func(&[Ty::Object], S, "zb_json_dumps"),
         // The format is a literal the lowering reads; the result is the

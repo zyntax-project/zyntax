@@ -1535,16 +1535,37 @@ fn kind_declarations(k: &KindOps) -> Vec<Decl> {
         ],
     ));
     let times = local("times", i64());
+    // The result has its room before the first copy and is built by
+    // doubling: the half repeated, twice, and the list once more when
+    // the count is odd, so the copies are few and each is one block.
+    let half = local("half", k.list.clone());
     d.push(define(&name("repeat"), &[&xs, &times], k.list.clone(), {
-        let mut s = vec![out.decl(empty())];
-        s.extend(for_range(
-            &i,
-            int(0),
-            times.e(),
-            vec![expr(call(&name("extend"), vec![out.e(), xs.e()], unit()))],
-        ));
-        s.push(ret(out.e()));
-        s
+        vec![
+            when(lt(times.e(), int(0)), vec![times.set(int(0))]),
+            out.decl(with_capacity(mul(len(xs.e()), times.e()))),
+            when(
+                le(times.e(), int(1)),
+                vec![
+                    when(
+                        eq(times.e(), int(1)),
+                        vec![expr(call(&name("extend"), vec![out.e(), xs.e()], unit()))],
+                    ),
+                    ret(out.e()),
+                ],
+            ),
+            half.decl(call(
+                &name("repeat"),
+                vec![xs.e(), div(times.e(), int(2))],
+                k.list.clone(),
+            )),
+            expr(call(&name("extend"), vec![out.e(), half.e()], unit())),
+            expr(call(&name("extend"), vec![out.e(), half.e()], unit())),
+            when(
+                eq(rem(times.e(), int(2)), int(1)),
+                vec![expr(call(&name("extend"), vec![out.e(), xs.e()], unit()))],
+            ),
+            ret(out.e()),
+        ]
     }));
     let low = local("low", i64());
     let high = local("high", i64());

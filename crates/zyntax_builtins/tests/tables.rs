@@ -47,10 +47,19 @@ extern "C" fn unreached() -> i64 {
     std::process::abort()
 }
 static HOST_INFO: zrtl::ZrtlInfo = zrtl::ZrtlInfo::new(c"test_host".as_ptr());
-static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 54] = [
+static HOST_SYMBOLS: [zrtl::ZrtlSymbol; 63] = [
     zrtl::ZrtlSymbol::new(c"$Host$argc".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$argv".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$bytes_at".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_cmp".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_add".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_sub".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_mul".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_divmod_small".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_shl".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_shr".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_divmod".as_ptr(), unreached as *const u8),
+    zrtl::ZrtlSymbol::new(c"$Host$big_mul_small_add".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$int_bit_length".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$int_bit_count".as_ptr(), unreached as *const u8),
     zrtl::ZrtlSymbol::new(c"$Host$int_to_bytes".as_ptr(), unreached as *const u8),
