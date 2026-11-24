@@ -1072,6 +1072,7 @@ fn parse_program_once(
     inferred.adapters.take();
     inferred.attr_reads.take();
     inferred.attr_writes.take();
+    inferred.attr_probes.take();
     inferred.dyn_methods.take();
     inferred.abstract_calls.take();
     inferred.class_adapters.take();

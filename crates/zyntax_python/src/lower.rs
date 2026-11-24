@@ -795,6 +795,16 @@ pub(crate) fn dispatch_name(method_fn: &str) -> String {
 pub(crate) fn getattr_name(attr: &str) -> String {
     format!("py$getattr${attr}")
 }
+/// Whether a value has an attribute: settled by its type, or to be
+/// tested when the program runs.
+enum Presence {
+    Known(bool),
+    Test(Box<Node>),
+}
+
+pub(crate) fn hasattr_name(attr: &str) -> String {
+    format!("py$hasattr${attr}")
+}
 pub(crate) fn setattr_name(attr: &str) -> String {
     format!("py$setattr${attr}")
 }
@@ -12054,6 +12064,17 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     return self.isinstance(v, &args[1], span);
                 }
+                "hasattr" | "getattr" | "setattr"
+                    if keywords.is_empty()
+                        && matches!(args.get(1), Some(py::Expr::StringLiteral(_)))
+                        && match name {
+                            "hasattr" => args.len() == 2,
+                            "getattr" => (2..=3).contains(&args.len()),
+                            _ => args.len() == 3,
+                        } =>
+                {
+                    return self.attribute_builtin(name, args, span);
+                }
                 "next" if !args.is_empty() && args.len() <= 2 => {
                     let g = self.expr(&args[0])?;
                     let Ty::Gen(k) = g.ty else {
@@ -13662,6 +13683,169 @@ impl<'m> Lowerer<'m> {
         }
     }
 
+    /// `hasattr`, `getattr` and `setattr` with the name a literal: the
+    /// attribute read or written as `v.name` does, and the presence test
+    /// by the receiver's type or, for a dynamic receiver, by its class.
+    fn attribute_builtin(&mut self, name: &str, args: &[py::Expr], span: Span) -> Result<Val> {
+        let py::Expr::StringLiteral(lit) = &args[1] else {
+            unreachable!("the caller checked the name is a literal");
+        };
+        let attr = lit.value.to_str().to_string();
+        let object = self.expr(&args[0])?;
+        if name == "setattr" {
+            let value = self.expr(&args[2])?;
+            let node = self.set_attribute_via(object, &attr, value, None, span)?;
+            return Ok(Val { node, ty: Ty::None });
+        }
+        if name == "getattr" && args.len() == 2 {
+            // A name the class does not have is for the program to
+            // find out: the dispatcher raises the AttributeError.
+            let object = match object.ty {
+                Ty::Class(k)
+                    if self
+                        .module
+                        .field_via(self.module.class_range(k as usize), &attr)
+                        .is_none()
+                        && self.module.class_attr(k as usize, &attr).is_none()
+                        && types::bound_method_arity(self.module, object.ty, &attr).is_none() =>
+                {
+                    Val {
+                        node: self.coerce(object, Ty::Object),
+                        ty: Ty::Object,
+                    }
+                }
+                _ => object,
+            };
+            let value = self.attribute(object, &attr, span)?;
+            let node = self.coerce(value, Ty::Object);
+            return Ok(Val {
+                node,
+                ty: Ty::Object,
+            });
+        }
+        let (receiver, present) = self.presence(object, &attr, span)?;
+        if name == "hasattr" {
+            let node = match present {
+                Presence::Known(b) => node(
+                    TypedExpression::Literal(TypedLiteral::Bool(b)),
+                    Ty::Bool,
+                    span,
+                ),
+                Presence::Test(test) => *test,
+            };
+            return Ok(Val { node, ty: Ty::Bool });
+        }
+        // `getattr(v, name, default)`: the default is evaluated first,
+        // and is the result where the receiver lacks the attribute.
+        let default = self.expr_as(&args[2], Ty::Object)?;
+        let default = if matches!(
+            default.node,
+            TypedExpression::Literal(_) | TypedExpression::Variable(_)
+        ) {
+            default
+        } else {
+            let mut pre = Vec::new();
+            let held = self.hold(
+                Val {
+                    node: default,
+                    ty: Ty::Object,
+                },
+                &mut pre,
+                span,
+            );
+            self.hoisted.extend(pre);
+            held.node
+        };
+        let read = |this: &mut Self| {
+            let value = this.attribute(receiver, &attr, span)?;
+            Ok::<_, Error>(this.coerce(value, Ty::Object))
+        };
+        let node = match present {
+            Presence::Known(false) => default,
+            Presence::Known(true) => read(self)?,
+            Presence::Test(test) => {
+                let outer = std::mem::take(&mut self.hoisted);
+                let value = read(self)?;
+                let inner = std::mem::replace(&mut self.hoisted, outer);
+                let mut out = Vec::new();
+                let node = self.conditional_value(
+                    *test,
+                    (inner, value),
+                    (Vec::new(), default),
+                    Ty::Object,
+                    span,
+                    &mut out,
+                );
+                self.hoisted.extend(out);
+                node
+            }
+        };
+        Ok(Val {
+            node,
+            ty: Ty::Object,
+        })
+    }
+
+    /// The receiver held for reading, and whether it has `attr`: known
+    /// from a builtin type, or tested by the dispatcher over the classes
+    /// and builtin kinds for a value of any other type.
+    fn presence(&mut self, object: Val, attr: &str, span: Span) -> Result<(Val, Presence)> {
+        let mut pre = Vec::new();
+        let builtin = matches!(
+            object.ty,
+            Ty::Int
+                | Ty::Bool
+                | Ty::Float
+                | Ty::Str
+                | Ty::Bytes
+                | Ty::List(_)
+                | Ty::Dict(_)
+                | Ty::Set(_)
+                | Ty::Tuple(_)
+                | Ty::File(_)
+        );
+        if builtin {
+            let known = types::builtin_presence(self.module, object.ty, attr);
+            let held = self.hold(object, &mut pre, span);
+            self.hoisted.extend(pre);
+            return Ok((held, Presence::Known(known)));
+        }
+        if !matches!(
+            object.ty,
+            Ty::Class(_)
+                | Ty::Classes(_)
+                | Ty::Object
+                | Ty::Unknown
+                | Ty::None
+                | Ty::HostObject(..)
+                | Ty::HostClass(..)
+        ) {
+            return Err(Error::unsupported_span(
+                format!("hasattr() of a {:?}", object.ty),
+                span,
+            ));
+        }
+        let boxed = Val {
+            node: self.coerce(object, Ty::Object),
+            ty: Ty::Object,
+        };
+        let held = self.hold(boxed, &mut pre, span);
+        self.hoisted.extend(pre);
+        self.module
+            .attr_probes
+            .borrow_mut()
+            .insert(attr.to_string());
+        let test = call(&hasattr_name(attr), vec![held.node.clone()], Ty::Bool, span);
+        let test = self.guard(
+            Val {
+                node: test,
+                ty: Ty::Bool,
+            },
+            span,
+        );
+        Ok((held, Presence::Test(Box::new(test.node))))
+    }
+
     /// `isinstance(v, T)` for a type name or a class, or a tuple of
     /// them, which holds when any member does.
     fn isinstance(&mut self, v: Val, ty_expr: &py::Expr, span: Span) -> Result<Val> {
@@ -14344,7 +14528,7 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `obj.attr` read.
-    fn attribute(&mut self, object: Val, attr: &str, span: Span) -> Result<Val> {
+    pub(crate) fn attribute(&mut self, object: Val, attr: &str, span: Span) -> Result<Val> {
         self.attribute_via(object, attr, None, span)
     }
 

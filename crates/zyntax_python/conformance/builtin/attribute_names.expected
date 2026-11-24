@@ -1,0 +1,32 @@
+(True, False, True, True, False, False, False, False, False, False)
+(True, True, True, True, False, False, False, False, False, False)
+(True, False, False, False, False, False, False, False, False, False)
+(False, False, False, False, False, True, True, False, False, True)
+(False, False, False, False, True, True, False, False, False, True)
+(False, False, False, False, False, True, False, False, True, False)
+(False, False, False, False, False, True, False, False, False, False)
+(False, False, False, False, False, True, False, False, False, True)
+(False, False, False, False, False, False, False, True, False, False)
+(False, False, False, False, False, False, False, True, False, False)
+(False, False, False, False, False, False, False, False, False, False)
+(1, -1)
+(1, 2.5)
+('text', -1)
+('none', -1)
+('none', -1)
+('none', -1)
+42 42
+2.5 1
+AttributeError 'Base' object has no attribute 'zzz'
+1 2 2
+True
+3.5
+run
+run
+extra
+base base
+[True, False, False, False]
+[1, 0, 0, 0]
+ABC
+True
+False dflt

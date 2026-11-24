@@ -1801,6 +1801,8 @@ pub(crate) struct Module {
     /// dispatcher over the classes that have it.
     pub(crate) attr_reads: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) attr_writes: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// Attribute names `hasattr` asks of dynamic receivers.
+    pub(crate) attr_probes: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) dyn_methods: std::cell::RefCell<std::collections::BTreeSet<(String, usize)>>,
     /// The native functions host members are bound to, by the name the
     /// program calls them: the symbol they link against, their operand
@@ -2133,6 +2135,28 @@ pub(crate) fn builtin_method_counts(receiver: Ty, attr: &str) -> Option<(usize, 
             })
         }
         _ => None,
+    }
+}
+
+/// Whether a value of builtin type `ty` has attribute `attr`: a method
+/// that can be bound, a data attribute, or one of the protocol names
+/// programs probe for.
+pub(crate) fn builtin_presence(module: &Module, ty: Ty, attr: &str) -> bool {
+    if bound_method_arity(module, ty, attr).is_some() {
+        return true;
+    }
+    let sized = matches!(
+        ty,
+        Ty::Str | Ty::Bytes | Ty::List(_) | Ty::Dict(_) | Ty::Set(_) | Ty::Tuple(_)
+    );
+    match attr {
+        "__len__" | "__iter__" | "__contains__" => sized,
+        "__getitem__" => sized && !matches!(ty, Ty::Set(_)),
+        "real" | "imag" => matches!(ty, Ty::Int | Ty::Bool | Ty::Float),
+        "numerator" | "denominator" => matches!(ty, Ty::Int | Ty::Bool),
+        "typecode" | "itemsize" => matches!(ty, Ty::List(Elem::Array(_))),
+        "read" | "write" | "close" | "flush" => matches!(ty, Ty::File(_)),
+        _ => false,
     }
 }
 

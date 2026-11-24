@@ -7,8 +7,8 @@
 
 use crate::lower::{
     self, Lowerer, Node, Val, binary, call, callm_name, cast, dispatch_name, field_storage,
-    getattr_name, int_lit, ir, method_call, new_name, node, setattr_name, str_lit, var,
-    without_self,
+    getattr_name, hasattr_name, int_lit, ir, method_call, new_name, node, setattr_name, str_lit,
+    var, without_self,
 };
 use crate::scope::Scope;
 use crate::types::{ClassInfo, Elem, Locals, Module, Sig, Ty, method_fn};
@@ -571,6 +571,9 @@ pub(crate) fn generated(module: &Module) -> Vec<TypedFunction> {
     }
     for attr in module.attr_writes.borrow().iter() {
         out.push(setattr(module, attr, span));
+    }
+    for attr in module.attr_probes.borrow().iter() {
+        out.push(hasattr(module, attr, span));
     }
     for (method, arity) in module.dyn_methods.borrow().iter() {
         out.push(dynamic_call(module, method, *arity, span));
@@ -1212,11 +1215,32 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
     let mut statements = per_class(
         module,
         x.clone(),
-        |c| module.field(c, attr).is_some(),
+        |c| {
+            module.field(c, attr).is_some()
+                || module.class_attr(c, attr).is_some()
+                || crate::types::bound_method_arity(module, Ty::Class(c as u16), attr).is_some()
+        },
         |lowerer, c, obj| {
-            let (_, ty) = module.field_exact(c, attr).expect("picked");
-            let value = lowerer.field_out(field(obj, attr, ty, span), ty, span);
-            let boxed = lowerer.coerce(Val { node: value, ty }, Ty::Object);
+            // An instance field, else what the class has by the name: a
+            // method bound to the instance, or the class's attribute.
+            let value = match module.field_exact(c, attr) {
+                Some((_, ty)) => Val {
+                    node: lowerer.field_out(field(obj, attr, ty, span), ty, span),
+                    ty,
+                },
+                None => match lowerer.attribute(
+                    Val {
+                        node: obj,
+                        ty: Ty::Class(c as u16),
+                    },
+                    attr,
+                    span,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return Vec::new(),
+                },
+            };
+            let boxed = lowerer.coerce(value, Ty::Object);
             vec![ret(boxed, span)]
         },
         span,
@@ -1241,6 +1265,64 @@ fn getattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
         &getattr_name(attr),
         vec![param("x", Ty::Object, span)],
         Ty::Object,
+        statements,
+        span,
+    )
+}
+
+/// `py$hasattr$attr`: whether the instance or builtin value in the box
+/// has `attr`, by the class it is of or the type it holds.
+fn hasattr(module: &Module, attr: &str, span: Span) -> TypedFunction {
+    let x = var(intern("x"), Ty::Object, span);
+    let truth = |b: bool| {
+        node(
+            TypedExpression::Literal(TypedLiteral::Bool(b)),
+            Ty::Bool,
+            span,
+        )
+    };
+    let mut statements = per_class(
+        module,
+        x.clone(),
+        |c| {
+            module.field(c, attr).is_some()
+                || module.class_attr(c, attr).is_some()
+                || crate::types::bound_method_arity(module, Ty::Class(c as u16), attr).is_some()
+        },
+        |_, _, _| vec![ret(truth(true), span)],
+        span,
+    );
+    statements.extend(arms_over_builtins(
+        module,
+        attr,
+        &[],
+        true,
+        true,
+        x.clone(),
+        span,
+    ));
+    // A host object keeps its members in the host.
+    statements.push(when(
+        is_foreign(x.clone(), span),
+        vec![stmt(
+            call(
+                "zb_fatal",
+                vec![
+                    str_lit("TypeError", span),
+                    str_lit("hasattr() of a host object is not supported", span),
+                ],
+                Ty::None,
+                span,
+            ),
+            span,
+        )],
+        span,
+    ));
+    statements.push(ret(truth(false), span));
+    function(
+        &hasattr_name(attr),
+        vec![param("x", Ty::Object, span)],
+        Ty::Bool,
         statements,
         span,
     )
@@ -1445,6 +1527,7 @@ fn builtin_arms(
         &source,
         &args,
         matches!(method, "count" | "index"),
+        false,
         x,
         span,
     )
@@ -1458,25 +1541,33 @@ fn builtin_attribute_arms(
     x: Node,
     span: Span,
 ) -> Vec<TypedNode<TypedStatement>> {
-    arms_over_builtins(module, &format!("s.{attr}"), &[], false, x, span)
+    arms_over_builtins(module, &format!("s.{attr}"), &[], false, false, x, span)
 }
 
 /// One arm per kind of builtin a box may hold: the test on the box, and
 /// `source` lowered with `s` the unboxed value and `args` the dynamic
 /// arguments. A kind the lowering refuses gets no arm.
+///
+/// With `presence`, `source` is an attribute name and each kind that has
+/// it answers `True`; the others have no arm.
 fn arms_over_builtins(
     module: &Module,
     source: &str,
     args: &[String],
     tuple_methods: bool,
+    presence: bool,
     x: Node,
     span: Span,
 ) -> Vec<TypedNode<TypedStatement>> {
     use crate::types::Elem;
-    let Ok(parsed) = ruff_python_parser::parse_expression(source) else {
-        return Vec::new();
+    let expr = if presence {
+        None
+    } else {
+        let Ok(parsed) = ruff_python_parser::parse_expression(source) else {
+            return Vec::new();
+        };
+        Some(parsed.into_syntax().body)
     };
-    let expr = parsed.into_syntax().body;
     let category = |c: i64| {
         binary(
             BinaryOp::Eq,
@@ -1532,6 +1623,15 @@ fn arms_over_builtins(
             None,
         ),
     ];
+    // Numbers have data attributes and no methods the lowering binds.
+    if presence {
+        receivers.extend([
+            (category(1), Ty::Bool, None),
+            (category(2), Ty::Int, None),
+            (category(3), Ty::Int, None),
+            (category(4), Ty::Float, None),
+        ]);
+    }
     // A boxed file reads text or bytes by the mode it was opened in.
     let is_file = kind(zyntax_builtins::FILE_TAG >> 8);
     let is_text = call("zb_file_is_text", vec![x.clone()], Ty::Bool, span);
@@ -1610,6 +1710,26 @@ fn arms_over_builtins(
     }
     let mut arms = Vec::new();
     for (test, ty, raw) in receivers {
+        let Some(expr) = &expr else {
+            // A boxed tuple stands as a list here, but has two methods.
+            let has = if raw.as_deref() == Some("zb_unbox_tuple_raw") {
+                matches!(
+                    source,
+                    "count" | "index" | "__len__" | "__iter__" | "__contains__" | "__getitem__"
+                )
+            } else {
+                crate::types::builtin_presence(module, ty, source)
+            };
+            if has {
+                let yes = node(
+                    TypedExpression::Literal(TypedLiteral::Bool(true)),
+                    Ty::Bool,
+                    span,
+                );
+                arms.push(when(test, vec![ret(yes, span)], span));
+            }
+            continue;
+        };
         let mut vars: Vec<(&str, Ty)> = vec![("s", ty)];
         for a in args {
             vars.push((a.as_str(), Ty::Object));
@@ -1629,7 +1749,7 @@ fn arms_over_builtins(
         };
         let mut then = std::mem::take(&mut lowerer.hoisted);
         then.push(let_("s", ty, receiver, span));
-        let Ok(value) = lowerer.expr(&expr) else {
+        let Ok(value) = lowerer.expr(expr) else {
             continue;
         };
         let boxed = lowerer.coerce(value, Ty::Object);
