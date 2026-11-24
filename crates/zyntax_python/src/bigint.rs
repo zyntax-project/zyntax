@@ -211,6 +211,7 @@ fn operator_function(op: py::Operator) -> Option<&'static str> {
         py::Operator::Mult => "mul",
         py::Operator::Pow => "power",
         py::Operator::LShift => "lshift",
+        py::Operator::FloorDiv => "floordiv",
         _ => return None,
     })
 }
@@ -223,6 +224,7 @@ fn folds_small(op: py::Operator, l: i128, r: i128) -> bool {
         py::Operator::Mult => l.checked_mul(r),
         py::Operator::Pow if (0..128).contains(&r) => l.checked_pow(r as u32),
         py::Operator::LShift if (0..64).contains(&r) => l.checked_mul(1i128 << r),
+        py::Operator::FloorDiv => l.checked_div(r),
         _ => None,
     };
     value.is_some_and(|v| i64::try_from(v).is_ok())
@@ -240,6 +242,10 @@ impl Rewriter {
     fn operation(&self, op: py::Operator, l: &py::Expr, r: &py::Expr) -> Option<py::Expr> {
         let f = operator_function(op)?;
         if not_int(l) || not_int(r) {
+            return None;
+        }
+        // Only the smallest int divided by -1 leaves 64 bits.
+        if op == py::Operator::FloorDiv && int_literal(r).is_some_and(|k| k != -1) {
             return None;
         }
         if let (Some(a), Some(b)) = (int_literal(l), int_literal(r))
@@ -344,6 +350,16 @@ impl Transformer for Rewriter {
                     *e = combined;
                 }
             }
+            // Negating the smallest int leaves 64 bits.
+            py::Expr::UnaryOp(u)
+                if u.op == py::UnaryOp::USub
+                    && !not_int(&u.operand)
+                    && int_literal(&u.operand).is_none()
+                    && !matches!(&*u.operand, py::Expr::NumberLiteral(_)) =>
+            {
+                let operand = (*u.operand).clone();
+                *e = call(&function("neg"), vec![operand], range);
+            }
             py::Expr::Call(_) => self.builtin(e, range),
             _ => {}
         }
@@ -375,6 +391,9 @@ impl Rewriter {
                 } else {
                     match (id, n) {
                         ("abs", 1) => Some("abs_".to_string()),
+                        ("hex", 1) => Some("hex_".to_string()),
+                        ("oct", 1) => Some("oct_".to_string()),
+                        ("bin", 1) => Some("bin_".to_string()),
                         ("sum", 1 | 2) => Some("sum_".to_string()),
                         ("pow", 2) => Some("power".to_string()),
                         ("pow", 3) => Some("powmod".to_string()),

@@ -10269,7 +10269,7 @@ impl Typer<'_> {
                 tuple_of(vec![q, q])
             }
             "type" => Ty::Str,
-            "str" | "repr" | "input" | "chr" | "hex" | "oct" | "bin" => Ty::Str,
+            "str" | "repr" | "input" | "chr" | "hex" | "oct" | "bin" | "format" => Ty::Str,
             // A dict of the module's variables, looked up by name.
             "globals" => Ty::Object,
             "bytes" => Ty::Bytes,

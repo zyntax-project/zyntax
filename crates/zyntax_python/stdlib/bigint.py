@@ -724,14 +724,27 @@ def _format(x: BigInt, spec: str) -> str:
 
 
 def _digits_in(m: list[int], base: int) -> str:
+    # A limb is a whole number of digits of base 16, 8 and 2.
     if len(m) == 0:
         return "0"
+    width = 15
+    if base == 8:
+        width = 20
+    elif base == 2:
+        width = 60
     out: list[str] = []
-    cur = list(m)
-    while len(cur) > 0:
-        cur, r = _divmod_small(cur, base)
-        out.append("0123456789abcdef"[r])
-    out.reverse()
+    i = len(m) - 1
+    while i >= 0:
+        if base == 16:
+            s = hex(m[i])[2:]
+        elif base == 8:
+            s = oct(m[i])[2:]
+        else:
+            s = bin(m[i])[2:]
+        if i < len(m) - 1:
+            s = "0" * (width - len(s)) + s
+        out.append(s)
+        i -= 1
     return "".join(out)
 
 
@@ -834,6 +847,47 @@ def abs_(x):
             return _make(1, [0, 8])
         return abs(x)
     return abs(x)
+
+
+def neg(a):
+    if isinstance(a, int):
+        if a == MIN:
+            return _make(1, [0, 8])
+        return -a
+    return -a
+
+
+def floordiv(a, b):
+    if isinstance(a, int) and isinstance(b, int):
+        if b == -1 and a == MIN:
+            return _make(1, [0, 8])
+        return a // b
+    return a // b
+
+
+def _radix(x: BigInt, base: int, prefix: str) -> str:
+    text = prefix + _digits_in(x.mag, base)
+    if x.sign < 0:
+        return "-" + text
+    return text
+
+
+def hex_(x):
+    if isinstance(x, BigInt):
+        return _radix(x, 16, "0x")
+    return hex(x)
+
+
+def oct_(x):
+    if isinstance(x, BigInt):
+        return _radix(x, 8, "0o")
+    return oct(x)
+
+
+def bin_(x):
+    if isinstance(x, BigInt):
+        return _radix(x, 2, "0b")
+    return bin(x)
 
 
 def to_int(x):

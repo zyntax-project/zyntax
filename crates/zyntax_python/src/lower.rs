@@ -7819,6 +7819,7 @@ impl<'m> Lowerer<'m> {
             "str" | "int" | "float" | "bool" | "list" | "tuple" | "set" | "frozenset" | "dict" => {
                 args.len() <= 1
             }
+            "format" => matches!(args.len(), 1 | 2),
             "sorted" | "reversed" | "enumerate" | "sum" | "any" | "all" => {
                 (1..=2).contains(&args.len())
             }
@@ -13033,6 +13034,41 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     let node = self.str_of(v);
                     return Ok(Val { node, ty: Ty::Str });
+                }
+                // `format(value, spec)` with the spec written out: what
+                // an f-string field of that spec is.
+                "format" if matches!(args.len(), 1 | 2) => {
+                    let v = self.expr(&args[0])?;
+                    let spec = match args.get(1) {
+                        None => {
+                            return Ok(Val {
+                                node: self.str_of(v),
+                                ty: Ty::Str,
+                            });
+                        }
+                        Some(py::Expr::StringLiteral(s)) => s.value.to_str().to_string(),
+                        Some(_) => {
+                            return unsupported(
+                                "format() with a spec that is not a string literal",
+                                c,
+                            );
+                        }
+                    };
+                    // A spec that is not one raises when the call runs.
+                    let Ok(spec) = crate::format::parse_spec(&spec) else {
+                        let node = self.raised_value(
+                            vec![v.node],
+                            "ValueError",
+                            "Invalid format specifier",
+                            Ty::Str,
+                            span,
+                        );
+                        return Ok(Val { node, ty: Ty::Str });
+                    };
+                    return Ok(Val {
+                        node: self.format(v, &spec, span),
+                        ty: Ty::Str,
+                    });
                 }
                 // The module the embedding program has by that name: what
                 // an import of a module the program does not have becomes

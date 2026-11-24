@@ -1304,11 +1304,52 @@ pub(crate) fn declarations(policy: &Policy, list_type: TypeId) -> Vec<Decl> {
     ));
     // `hash(x)`: the value a table uses, but never -1, which marks an
     // error to a C caller.
+    // An int hashes as its value modulo 2 ** 61 - 1, with the sign of
+    // the value, as Python's does; a table keys by the value itself.
+    let wide = local("wide", i64());
+    let rest = local("rest", i64());
+    d.push(define(
+        "zb_int_hash",
+        &[&wide],
+        i64(),
+        vec![
+            when(
+                and(
+                    ge(wide.e(), int(0)),
+                    lt(wide.e(), int(2_305_843_009_213_693_951)),
+                ),
+                vec![ret(wide.e())],
+            ),
+            // 2 ** 63 is 4 modulo the modulus.
+            when(eq(wide.e(), int(i64::MIN)), vec![ret(int(-4))]),
+            if_(
+                lt(wide.e(), int(0)),
+                vec![
+                    rest.decl(sub(
+                        int(0),
+                        rem(sub(int(0), wide.e()), int(2_305_843_009_213_693_951)),
+                    )),
+                    when(eq(rest.e(), int(-1)), vec![ret(int(-2))]),
+                    ret(rest.e()),
+                ],
+                vec![ret(rem(wide.e(), int(2_305_843_009_213_693_951)))],
+            ),
+        ],
+    ));
     d.push(define(
         "zb_hash_builtin",
         &[&x],
         i64(),
         vec![
+            cat.decl(category(x.e())),
+            when(
+                is_integral(&cat),
+                vec![ret(call(
+                    "zb_int_hash",
+                    vec![number_i64(x.e(), cat.e())],
+                    i64(),
+                ))],
+            ),
             h.decl(call("zb_any_hash", vec![x.e()], i64())),
             when(eq(h.e(), int(-1)), vec![ret(int(-2))]),
             ret(h.e()),
