@@ -12102,6 +12102,27 @@ impl<'m> Lowerer<'m> {
                     let v = self.expr(&args[0])?;
                     return self.isinstance(v, &args[1], span);
                 }
+                "callable" if args.len() == 1 && keywords.is_empty() => {
+                    // A function, class or builtin named is callable
+                    // without being read.
+                    if let py::Expr::Name(n) = &args[0]
+                        && !self.is_variable(n.id.as_str())
+                        && (self.module.funcs.contains_key(n.id.as_str())
+                            || self.module.class_index.contains_key(n.id.as_str())
+                            || types::builtin_index(n.id.as_str()).is_some())
+                    {
+                        return Ok(Val {
+                            node: node(
+                                TypedExpression::Literal(TypedLiteral::Bool(true)),
+                                Ty::Bool,
+                                span,
+                            ),
+                            ty: Ty::Bool,
+                        });
+                    }
+                    let v = self.expr(&args[0])?;
+                    return self.callable(v, span);
+                }
                 "hasattr" | "getattr" | "setattr"
                     if keywords.is_empty()
                         && matches!(args.get(1), Some(py::Expr::StringLiteral(_)))
@@ -13719,6 +13740,117 @@ impl<'m> Lowerer<'m> {
             ),
             ty: sig.ret,
         }
+    }
+
+    /// `callable(v)`: settled by the type of a function, a builtin value
+    /// or a number, string or container; for an instance, by its class
+    /// having `__call__`; for a dynamic value, by its box.
+    fn callable(&mut self, v: Val, span: Span) -> Result<Val> {
+        let lit = |b: bool| Val {
+            node: node(
+                TypedExpression::Literal(TypedLiteral::Bool(b)),
+                Ty::Bool,
+                span,
+            ),
+            ty: Ty::Bool,
+        };
+        let has_call = |this: &Self, c: usize| this.module.method_sig(c, "__call__").is_some();
+        let always = matches!(
+            v.ty,
+            Ty::Closure(_)
+                | Ty::Func(_)
+                | Ty::Funcs(_)
+                | Ty::Bound(_)
+                | Ty::Builtin(_)
+                | Ty::HostFunction(..)
+                | Ty::HostFloatCallable(_)
+                | Ty::HostClass(..)
+        );
+        let never = matches!(
+            v.ty,
+            Ty::Int
+                | Ty::Float
+                | Ty::Bool
+                | Ty::Str
+                | Ty::Bytes
+                | Ty::File(_)
+                | Ty::None
+                | Ty::List(_)
+                | Ty::MaybeList(_)
+                | Ty::Tuple(_)
+                | Ty::MaybeTuple(_)
+                | Ty::Dict(_)
+                | Ty::Set(_)
+                | Ty::Gen(_)
+                | Ty::Num(_)
+        );
+        if always || never {
+            // The value is evaluated for its effects as the call would.
+            let mut pre = Vec::new();
+            self.hold(v, &mut pre, span);
+            self.hoisted.extend(pre);
+            return Ok(lit(always));
+        }
+        // The classes an instance may be, each tested by its tag: only
+        // those with `__call__` answer True.
+        let candidates: Vec<usize> = match v.ty {
+            Ty::Class(k) => self.module.class_range(k as usize).collect(),
+            Ty::Classes(s) => types::class_set_members(s)
+                .iter()
+                .flat_map(|&m| self.module.class_range(m as usize))
+                .collect(),
+            Ty::Object | Ty::Unknown => (0..self.module.classes.len()).collect(),
+            other => {
+                return Err(Error::unsupported_span(
+                    format!("callable() of a {other:?}"),
+                    span,
+                ));
+            }
+        };
+        let callers: Vec<usize> = candidates
+            .into_iter()
+            .filter(|&c| has_call(self, c))
+            .collect();
+        let dynamic = matches!(v.ty, Ty::Object | Ty::Unknown);
+        let boxed = Val {
+            node: self.coerce(v, Ty::Object),
+            ty: Ty::Object,
+        };
+        let mut pre = Vec::new();
+        let held = self.hold(boxed, &mut pre, span);
+        self.hoisted.extend(pre);
+        let kind = call("zb_any_kind", vec![held.node], Ty::Int, span);
+        let mut pre = Vec::new();
+        let kind = self.hold(
+            Val {
+                node: kind,
+                ty: Ty::Int,
+            },
+            &mut pre,
+            span,
+        );
+        self.hoisted.extend(pre);
+        let is_kind = |k: i64| {
+            binary(
+                BinaryOp::Eq,
+                kind.node.clone(),
+                int_lit(k, span),
+                Ty::Bool,
+                span,
+            )
+        };
+        let mut any: Option<Node> = dynamic.then(|| is_kind(zyntax_builtins::FUNC_TAG >> 8));
+        for c in callers {
+            let test = is_kind(zyntax_builtins::INSTANCE_KIND_BASE + c as i64);
+            any = Some(match any {
+                Some(prev) => binary(BinaryOp::Or, prev, test, Ty::Bool, span),
+                None => test,
+            });
+        }
+        Ok(match any {
+            Some(node) => Val { node, ty: Ty::Bool },
+            None => lit(false),
+        })
     }
 
     /// `hasattr`, `getattr` and `setattr` with the name a literal: the
