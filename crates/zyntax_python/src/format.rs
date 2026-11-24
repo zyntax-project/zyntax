@@ -46,6 +46,48 @@ impl Spec {
     }
 }
 
+/// The width and precision a spec takes from fields nested in it
+/// (`{:>{w}.{p}f}`), which are known when the program runs.
+#[derive(Default)]
+pub(crate) struct Nested {
+    pub width: Option<Node>,
+    pub precision: Option<Node>,
+}
+
+/// A spec's text with each nested field replaced by `1`, and the fields
+/// in order: whether each is the precision (it follows the `.`) and what
+/// it holds. A field anywhere but the width or precision is refused.
+pub(crate) fn split_nested<T>(
+    parts: impl IntoIterator<Item = SpecPart<T>>,
+) -> std::result::Result<(String, Vec<(bool, T)>), String> {
+    let mut text = String::new();
+    let mut fields: Vec<(bool, T)> = Vec::new();
+    for part in parts {
+        match part {
+            SpecPart::Text(t) => text.push_str(&t),
+            SpecPart::Field(source) => {
+                let precision = text.ends_with('.');
+                // A lone `0` before the field is the zero flag.
+                let digits = text.chars().rev().take_while(char::is_ascii_digit).count();
+                if (digits > 0 && !(digits == 1 && text.ends_with('0')))
+                    || fields.iter().any(|(p, _)| *p == precision)
+                {
+                    return Err("a nested field must be the whole width or precision".to_string());
+                }
+                text.push('1');
+                fields.push((precision, source));
+            }
+        }
+    }
+    Ok((text, fields))
+}
+
+/// A piece of a spec: literal text, or a nested field.
+pub(crate) enum SpecPart<T> {
+    Text(String),
+    Field(T),
+}
+
 /// One conversion of a `%` format: `%[flags][width][.precision]type`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PercentField {
@@ -59,6 +101,11 @@ pub(crate) struct PercentField {
     /// -1 when unset.
     pub precision: i64,
     pub conversion: char,
+    /// `%(key)s`: the mapping key the value is read by.
+    pub key: Option<String>,
+    /// `%*d`, `%.*f`: the width or precision is the next value.
+    pub star_width: bool,
+    pub star_precision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,8 +115,7 @@ pub(crate) enum Percent {
 }
 
 /// Split a `%` format into its literal text and its conversions. A
-/// `*` width, a mapping key `%(name)s` and a length modifier are not
-/// taken.
+/// length modifier is not taken.
 pub(crate) fn parse_percent(text: &str) -> std::result::Result<Vec<Percent>, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
@@ -99,7 +145,17 @@ pub(crate) fn parse_percent(text: &str) -> std::result::Result<Vec<Percent>, Str
             width: -1,
             precision: -1,
             conversion: ' ',
+            key: None,
+            star_width: false,
+            star_precision: false,
         };
+        if i < chars.len() && chars[i] == '(' {
+            let Some(close) = chars[i..].iter().position(|&c| c == ')') else {
+                return Err("an unclosed mapping key".to_string());
+            };
+            field.key = Some(chars[i + 1..i + close].iter().collect());
+            i += close + 1;
+        }
         while i < chars.len() && matches!(chars[i], '-' | '0' | '+' | ' ' | '#') {
             match chars[i] {
                 '-' => field.left = true,
@@ -118,17 +174,21 @@ pub(crate) fn parse_percent(text: &str) -> std::result::Result<Vec<Percent>, Str
             chars[start..*i].iter().collect::<String>().parse().ok()
         };
         if i < chars.len() && chars[i] == '*' {
-            return Err("a `*` width".to_string());
-        }
-        if let Some(w) = number(&mut i) {
+            field.star_width = true;
+            field.width = 1;
+            i += 1;
+        } else if let Some(w) = number(&mut i) {
             field.width = w;
         }
         if i < chars.len() && chars[i] == '.' {
             i += 1;
-            field.precision = number(&mut i).unwrap_or(0);
-        }
-        if i < chars.len() && chars[i] == '(' {
-            return Err("a mapping key".to_string());
+            if i < chars.len() && chars[i] == '*' {
+                field.star_precision = true;
+                field.precision = 1;
+                i += 1;
+            } else {
+                field.precision = number(&mut i).unwrap_or(0);
+            }
         }
         let Some(&conversion) = chars.get(i) else {
             return Err("an incomplete conversion".to_string());
@@ -387,17 +447,39 @@ impl Lowerer<'_> {
                 }
                 None => (None, rest.strip_prefix(':').unwrap_or(rest)),
             };
-            let arg = if name.is_empty() {
-                let a = args.get(next_positional);
-                next_positional += 1;
-                a
-            } else if let Ok(index) = name.parse::<usize>() {
-                args.get(index)
-            } else {
-                keywords
-                    .iter()
-                    .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name))
-                    .map(|k| &k.value)
+            let lookup = |name: &str, next: &mut usize| -> Option<&py::Expr> {
+                if name.is_empty() {
+                    let a = args.get(*next);
+                    *next += 1;
+                    a
+                } else if let Ok(index) = name.parse::<usize>() {
+                    args.get(index)
+                } else {
+                    keywords
+                        .iter()
+                        .find(|k| k.arg.as_ref().is_some_and(|a| a.as_str() == name))
+                        .map(|k| &k.value)
+                }
+            };
+            // `{0.attr}` and `{1[key]}` read from the argument.
+            let (name, accessors) = match name.find(['.', '[']) {
+                Some(at) => (&name[..at], &name[at..]),
+                None => (name, ""),
+            };
+            let arg = lookup(name, &mut next_positional);
+            let owned;
+            let arg = match arg {
+                Some(base) if !accessors.is_empty() => {
+                    let Some(read) = field_accessors(base, accessors) else {
+                        return Err(Error::unsupported_span(
+                            format!("str.format field `{{{field}}}`"),
+                            span,
+                        ));
+                    };
+                    owned = read;
+                    Some(&owned)
+                }
+                other => other,
             };
             let Some(arg) = arg else {
                 return Err(Error::unsupported_span(
@@ -426,10 +508,43 @@ impl Lowerer<'_> {
             if spec.is_empty() {
                 pieces.push(self.str_of(value));
             } else {
-                let parsed = parse_spec(spec).map_err(|message| {
-                    Error::unsupported_span(format!("format spec `{spec}` ({message})"), span)
+                // Fields nested in the spec name arguments too.
+                let mut parts = Vec::new();
+                let mut rest = spec;
+                while let Some(open) = rest.find('{') {
+                    parts.push(SpecPart::Text(rest[..open].to_string()));
+                    let Some(close) = rest[open..].find('}') else {
+                        return Err(Error::unsupported_span(
+                            "str.format with an unclosed `{` in a spec".to_string(),
+                            span,
+                        ));
+                    };
+                    let inner = &rest[open + 1..open + close];
+                    let Some(e) = lookup(inner, &mut next_positional) else {
+                        return Err(Error::unsupported_span(
+                            format!("str.format with no argument for `{{{inner}}}`"),
+                            span,
+                        ));
+                    };
+                    parts.push(SpecPart::Field(e));
+                    rest = &rest[open + close + 1..];
+                }
+                parts.push(SpecPart::Text(rest.to_string()));
+                let (text, fields) = split_nested(parts)
+                    .map_err(|message| Error::unsupported_span(message, span))?;
+                let parsed = parse_spec(&text).map_err(|message| {
+                    Error::unsupported_span(format!("format spec `{text}` ({message})"), span)
                 })?;
-                pieces.push(self.format(value, &parsed, span));
+                let mut nested = Nested::default();
+                for (is_precision, e) in fields {
+                    let n = self.expr_as(e, Ty::Int)?;
+                    if is_precision {
+                        nested.precision = Some(n);
+                    } else {
+                        nested.width = Some(n);
+                    }
+                }
+                pieces.push(self.format_with(value, &parsed, &nested, span));
             }
         }
         if !literal.is_empty() {
@@ -447,13 +562,22 @@ impl Lowerer<'_> {
             }
             py::InterpolatedStringElement::Interpolation(e) => {
                 let span = span_of(e);
-                let value = self.expr(&e.expression)?;
-                if e.debug_text.is_some() {
-                    return Err(Error::unsupported_span(
-                        "the `=` debug form in an f-string".to_string(),
-                        span,
-                    ));
+                // `{x=}` shows the source text first, and converts with
+                // `!r` unless it has a spec or a conversion.
+                if let Some(debug) = &e.debug_text {
+                    let text = crate::lower::str_lit(debug.as_str(), span);
+                    let mut inner = e.clone();
+                    inner.debug_text = None;
+                    if inner.format_spec.is_none()
+                        && matches!(inner.conversion, py::ConversionFlag::None)
+                    {
+                        inner.conversion = py::ConversionFlag::Repr;
+                    }
+                    let shown =
+                        self.fstring_element(&py::InterpolatedStringElement::Interpolation(inner))?;
+                    return Ok(concat_pieces(vec![text, shown], Ty::Str, span).expect("two pieces"));
                 }
+                let value = self.expr(&e.expression)?;
                 // `!r` and `!a` convert before formatting; `!s` is str().
                 let value = match e.conversion {
                     py::ConversionFlag::None => value,
@@ -469,11 +593,42 @@ impl Lowerer<'_> {
                 let Some(spec) = &e.format_spec else {
                     return Ok(self.str_of(value));
                 };
-                let spec = self.spec_text(spec)?;
-                let spec = parse_spec(&spec).map_err(|message| {
-                    Error::unsupported_span(format!("format spec `{spec}` ({message})"), span)
+                let mut parts = Vec::new();
+                for element in spec.elements.iter() {
+                    parts.push(match element {
+                        py::InterpolatedStringElement::Literal(l) => {
+                            SpecPart::Text(l.value.to_string())
+                        }
+                        py::InterpolatedStringElement::Interpolation(n)
+                            if n.format_spec.is_none()
+                                && matches!(n.conversion, py::ConversionFlag::None)
+                                && n.debug_text.is_none() =>
+                        {
+                            SpecPart::Field(&*n.expression)
+                        }
+                        py::InterpolatedStringElement::Interpolation(n) => {
+                            return Err(Error::unsupported(
+                                "a conversion or spec inside a format spec".to_string(),
+                                &n,
+                            ));
+                        }
+                    });
+                }
+                let (text, fields) = split_nested(parts)
+                    .map_err(|message| Error::unsupported_span(message, span))?;
+                let parsed = parse_spec(&text).map_err(|message| {
+                    Error::unsupported_span(format!("format spec `{text}` ({message})"), span)
                 })?;
-                Ok(self.format(value, &spec, span))
+                let mut nested = Nested::default();
+                for (is_precision, e) in fields {
+                    let n = self.expr_as(e, Ty::Int)?;
+                    if is_precision {
+                        nested.precision = Some(n);
+                    } else {
+                        nested.width = Some(n);
+                    }
+                }
+                Ok(self.format_with(value, &parsed, &nested, span))
             }
         }
     }
@@ -494,11 +649,24 @@ impl Lowerer<'_> {
             .iter()
             .filter(|p| matches!(p, Percent::Field(_)))
             .count();
+        let keyed = conversions
+            .iter()
+            .any(|p| matches!(p, Percent::Field(f) if f.key.is_some()));
+        if keyed {
+            return self.percent_format_keyed(conversions, values, span);
+        }
         let args: Vec<&py::Expr> = match values {
             py::Expr::Tuple(t) => t.elts.iter().collect(),
             single => vec![single],
         };
-        if args.len() != wanted {
+        let stars: usize = conversions
+            .iter()
+            .map(|p| match p {
+                Percent::Field(f) => f.star_width as usize + f.star_precision as usize,
+                Percent::Text(_) => 0,
+            })
+            .sum();
+        if args.len() != wanted + stars {
             return Err(Error::unsupported_span(
                 format!(
                     "`%` format with {wanted} conversion(s) and {} value(s)",
@@ -513,10 +681,94 @@ impl Lowerer<'_> {
             match piece {
                 Percent::Text(t) => pieces.push(crate::lower::str_lit(&t, span)),
                 Percent::Field(field) => {
+                    // A `*` takes its number from the values, ahead of
+                    // the value it formats.
+                    let mut nested = Nested::default();
+                    if field.star_width {
+                        nested.width = Some(self.expr_as(next.next().expect("counted"), Ty::Int)?);
+                    }
+                    if field.star_precision {
+                        nested.precision =
+                            Some(self.expr_as(next.next().expect("counted"), Ty::Int)?);
+                    }
                     let value = self.expr(next.next().expect("counted"))?;
-                    pieces.push(self.percent_field(value, &field, span)?);
+                    pieces.push(self.percent_field_with(value, &field, &nested, span)?);
                 }
             }
+        }
+        let node =
+            concat_pieces(pieces, Ty::Str, span).unwrap_or_else(|| crate::lower::str_lit("", span));
+        Ok(Val { node, ty: Ty::Str })
+    }
+
+    /// `"%(a)s %(b)d" % mapping`: each conversion reads its key from a
+    /// dict display or from a name bound to a dict.
+    fn percent_format_keyed(
+        &mut self,
+        conversions: Vec<Percent>,
+        values: &py::Expr,
+        span: Span,
+    ) -> Result<Val> {
+        let refused = |what: &str| Error::unsupported_span(format!("`%` format ({what})"), span);
+        let mut pieces: Vec<Node> = Vec::new();
+        for piece in conversions {
+            let Percent::Field(field) = piece else {
+                let Percent::Text(t) = piece else {
+                    unreachable!()
+                };
+                pieces.push(crate::lower::str_lit(&t, span));
+                continue;
+            };
+            let Some(key) = &field.key else {
+                return Err(refused("a mapping key mixed with a positional one"));
+            };
+            if field.star_width || field.star_precision {
+                return Err(refused("a `*` beside a mapping key"));
+            }
+            let read = match values {
+                py::Expr::Dict(d) => {
+                    // The last entry of a key wins. The display is not
+                    // built, so no value in it may call.
+                    let mut found = None;
+                    for item in &d.items {
+                        let Some(k) = &item.key else {
+                            return Err(refused("a `**` in the mapping"));
+                        };
+                        let py::Expr::StringLiteral(lit) = k else {
+                            return Err(refused("a mapping with a key that is not a string"));
+                        };
+                        if lit.value.to_str() == key {
+                            found = Some(&item.value);
+                        }
+                    }
+                    let Some(e) = found else {
+                        return Err(refused("a key the mapping does not have"));
+                    };
+                    if d.items.iter().any(|i| has_call(&i.value)) {
+                        return Err(refused("a mapping whose values call"));
+                    }
+                    e.clone()
+                }
+                py::Expr::Name(n) => py::Expr::Subscript(py::ExprSubscript {
+                    node_index: Default::default(),
+                    range: n.range,
+                    value: Box::new(values.clone()),
+                    slice: Box::new(py::Expr::StringLiteral(py::ExprStringLiteral {
+                        node_index: Default::default(),
+                        range: n.range,
+                        value: py::StringLiteralValue::single(py::StringLiteral {
+                            range: n.range,
+                            node_index: Default::default(),
+                            value: key.clone().into_boxed_str(),
+                            flags: py::StringLiteralFlags::empty(),
+                        }),
+                    })),
+                    ctx: py::ExprContext::Load,
+                }),
+                _ => return Err(refused("a mapping that is not a dict display or a name")),
+            };
+            let value = self.expr(&read)?;
+            pieces.push(self.percent_field(value, &field, span)?);
         }
         let node =
             concat_pieces(pieces, Ty::Str, span).unwrap_or_else(|| crate::lower::str_lit("", span));
@@ -527,6 +779,16 @@ impl Lowerer<'_> {
         &mut self,
         value: Val,
         field: &PercentField,
+        span: Span,
+    ) -> Result<Node> {
+        self.percent_field_with(value, field, &Nested::default(), span)
+    }
+
+    fn percent_field_with(
+        &mut self,
+        value: Val,
+        field: &PercentField,
+        nested: &Nested,
         span: Span,
     ) -> Result<Node> {
         let mut spec = Spec {
@@ -620,28 +882,23 @@ impl Lowerer<'_> {
                 return Ok(value.node);
             }
         }
-        Ok(self.format(value, &spec, span))
-    }
-
-    /// The spec's text, which must be literal here.
-    fn spec_text(&self, spec: &py::InterpolatedStringFormatSpec) -> Result<String> {
-        let mut text = String::new();
-        for element in spec.elements.iter() {
-            match element {
-                py::InterpolatedStringElement::Literal(l) => text.push_str(&l.value),
-                py::InterpolatedStringElement::Interpolation(e) => {
-                    return Err(Error::unsupported(
-                        "a nested expression in a format spec".to_string(),
-                        &e,
-                    ));
-                }
-            }
-        }
-        Ok(text)
+        Ok(self.format_with(value, &spec, nested, span))
     }
 
     /// `format(value, spec)`.
     pub(crate) fn format(&mut self, value: Val, spec: &Spec, span: Span) -> Node {
+        self.format_with(value, spec, &Nested::default(), span)
+    }
+
+    /// `format(value, spec)`, the width and precision of `nested` taking
+    /// the place of the spec's own.
+    pub(crate) fn format_with(
+        &mut self,
+        value: Val,
+        spec: &Spec,
+        nested: &Nested,
+        span: Span,
+    ) -> Node {
         let lit_str = |s: &str| crate::lower::str_lit(s, span);
         let lit_int = |v: i64| crate::lower::int_lit(v, span);
         let lit_bool = |b: bool| {
@@ -650,6 +907,13 @@ impl Lowerer<'_> {
                 Ty::Bool,
                 span,
             )
+        };
+        let width = || nested.width.clone().unwrap_or_else(|| lit_int(spec.width));
+        let precision = || {
+            nested
+                .precision
+                .clone()
+                .unwrap_or_else(|| lit_int(spec.precision))
         };
         let common =
             |spec: &Spec| vec![lit_str(&spec.fill), lit_int(spec.align), lit_int(spec.sign)];
@@ -660,21 +924,22 @@ impl Lowerer<'_> {
                 args.extend(common(spec));
                 args.extend([
                     lit_bool(spec.zero),
-                    lit_int(spec.width),
+                    width(),
                     lit_int(spec.grouping),
-                    lit_int(spec.precision),
+                    precision(),
                     lit_int(spec.ty),
                 ]);
                 crate::lower::call("zb_fmt_float", args, Ty::Str, span)
             }
             Ty::Bool if spec.ty == 0 => {
                 let text = self.str_of(value);
-                self.format(
+                self.format_with(
                     Val {
                         node: text,
                         ty: Ty::Str,
                     },
                     spec,
+                    nested,
                     span,
                 )
             }
@@ -685,7 +950,7 @@ impl Lowerer<'_> {
                 args.extend([
                     lit_bool(spec.alt),
                     lit_bool(spec.zero),
-                    lit_int(spec.width),
+                    width(),
                     lit_int(spec.grouping),
                     lit_int(spec.ty),
                 ]);
@@ -696,9 +961,9 @@ impl Lowerer<'_> {
                 args.extend(common(spec));
                 args.extend([
                     lit_bool(spec.zero),
-                    lit_int(spec.width),
+                    width(),
                     lit_int(spec.grouping),
-                    lit_int(spec.precision),
+                    precision(),
                     lit_int(spec.ty),
                 ]);
                 crate::lower::call("zb_fmt_float", args, Ty::Str, span)
@@ -709,9 +974,9 @@ impl Lowerer<'_> {
                 args.extend([
                     lit_bool(spec.alt),
                     lit_bool(spec.zero),
-                    lit_int(spec.width),
+                    width(),
                     lit_int(spec.grouping),
-                    lit_int(spec.precision),
+                    precision(),
                     lit_int(spec.ty),
                 ]);
                 crate::lower::call("zb_any_fmt", args, Ty::Str, span)
@@ -724,8 +989,8 @@ impl Lowerer<'_> {
                         text,
                         lit_str(&spec.fill),
                         lit_int(spec.align),
-                        lit_int(spec.width),
-                        lit_int(spec.precision),
+                        width(),
+                        precision(),
                     ],
                     Ty::Str,
                     span,
@@ -733,6 +998,82 @@ impl Lowerer<'_> {
             }
         }
     }
+}
+
+/// `base` read through the accessors of a replacement field: `.name`
+/// and `[index]`, a number or a string key.
+fn field_accessors(base: &py::Expr, mut rest: &str) -> Option<py::Expr> {
+    use ruff_text_size::Ranged;
+    let range = base.range();
+    let mut read = base.clone();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('.') {
+            let end = after.find(['.', '[']).unwrap_or(after.len());
+            let name = &after[..end];
+            if name.is_empty() {
+                return None;
+            }
+            read = py::Expr::Attribute(py::ExprAttribute {
+                node_index: Default::default(),
+                range,
+                value: Box::new(read),
+                attr: py::Identifier::new(name, range),
+                ctx: py::ExprContext::Load,
+            });
+            rest = &after[end..];
+        } else {
+            let after = rest.strip_prefix('[')?;
+            let end = after.find(']')?;
+            let key = &after[..end];
+            let slice = match key.parse::<u64>() {
+                Ok(n) => py::Expr::NumberLiteral(py::ExprNumberLiteral {
+                    node_index: Default::default(),
+                    range,
+                    value: py::Number::Int(py::Int::from(n)),
+                }),
+                Err(_) if !key.is_empty() => py::Expr::StringLiteral(py::ExprStringLiteral {
+                    node_index: Default::default(),
+                    range,
+                    value: py::StringLiteralValue::single(py::StringLiteral {
+                        range,
+                        node_index: Default::default(),
+                        value: key.to_string().into_boxed_str(),
+                        flags: py::StringLiteralFlags::empty(),
+                    }),
+                }),
+                Err(_) => return None,
+            };
+            read = py::Expr::Subscript(py::ExprSubscript {
+                node_index: Default::default(),
+                range,
+                value: Box::new(read),
+                slice: Box::new(slice),
+                ctx: py::ExprContext::Load,
+            });
+            rest = &after[end + 1..];
+        }
+    }
+    Some(read)
+}
+
+/// Whether evaluating `e` may call into the program.
+fn has_call(e: &py::Expr) -> bool {
+    use ruff_python_ast::visitor::{Visitor, walk_expr};
+    struct Calls(bool);
+    impl<'a> Visitor<'a> for Calls {
+        fn visit_expr(&mut self, e: &'a py::Expr) {
+            if matches!(
+                e,
+                py::Expr::Call(_) | py::Expr::Await(_) | py::Expr::Yield(_) | py::Expr::Named(_)
+            ) {
+                self.0 = true;
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = Calls(false);
+    v.visit_expr(e);
+    v.0
 }
 
 #[cfg(test)]
