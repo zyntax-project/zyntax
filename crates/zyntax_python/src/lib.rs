@@ -27,6 +27,7 @@ use zyntax_typed_ast::{
 };
 
 mod aliases;
+mod bigint;
 mod bytes;
 mod class_attrs;
 mod classes;
@@ -465,7 +466,11 @@ fn parse_program_once(
     types::reset_tuple_shapes();
     scope::reset_cache();
     let mut module = parsed.into_syntax();
-    let main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
+    let mut main: Vec<py::Stmt> = std::mem::take(&mut module.body).into_iter().collect();
+    let big = bigint::requested(source);
+    if big {
+        main.insert(0, bigint::import());
+    }
     let linked = modules::link(main, modules, hosts)?;
     // The program's source files: the main file first, then each module
     // in the order it was loaded; a span names its file by that index.
@@ -478,6 +483,11 @@ fn parse_program_once(
         files.insert(name.clone(), source_files.len() as u32);
         source_files.push(zyntax_typed_ast::source::SourceFile::new(name, text));
     }
+    bigint::set_file(if big {
+        files.get(bigint::MODULE).copied()
+    } else {
+        None
+    });
     // The prelude's declarations come first. `origins` names, for each
     // statement of the body, the program's module it came from.
     let prelude = ruff_python_parser::parse_module(prelude::SOURCE)
@@ -505,6 +515,9 @@ fn parse_program_once(
     // becomes the class, a local rebound in straight-line code becomes
     // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
+    if big {
+        bigint::rewrite(&mut statements, &origins)?;
+    }
     patterns::rewrite(&mut statements, &mut origins)?;
     decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);

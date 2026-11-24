@@ -292,6 +292,7 @@ impl Elem {
     /// address.
     pub(crate) fn of(ty: Ty) -> Elem {
         match ty {
+            Ty::Int if crate::bigint::boxes_ints() => Elem::Object,
             Ty::Int => Elem::Int,
             Ty::Float => Elem::Float,
             Ty::Str => Elem::Str,

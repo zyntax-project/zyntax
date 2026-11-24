@@ -53,7 +53,7 @@ SUITE = {
     "meteor-contest": ("meteor-contest.py", [], 1.0, []),
     "nbody_modified": ("nbody_modified.py", [], 1.0, []),
     "nqueens": ("nqueens.py", [], 0.1, []),
-    "pidigits": ("pidigits.py", [], 0.1, []),  # needs an int wider than 64 bits
+    "pidigits": ("pidigits.py", [], 0.1, []),
     "pyflate-fast": ("pyflate-fast.py", [], 1.0, ["interpreter.tar.bz2"]),
     "raytrace-simple": ("raytrace-simple.py", [], 1.0, []),
     "richards": ("bm_richards.py", [], 1.0, ["richards.py"]),
@@ -75,9 +75,11 @@ SUITE = {
 # What a kernel computes with that zypy does not have: run on zypy it
 # would finish with the wrong answer, which the kernel does not print,
 # so the row says this instead of a time.
-UNMET = {
-    "pidigits": "int is 64 bits; the digits need arbitrary precision",
-}
+UNMET = {}
+
+# Kernels whose ints must not stop at 64 bits: zypy runs them with big
+# ints on, which no other interpreter needs asking for.
+BIGINT = {"pidigits"}
 
 
 def interpreters(args):
@@ -213,6 +215,9 @@ def main():
                 results[name][interp] = {"status": "unsupported", "error": UNMET[name]}
                 print(f"    {interp:<8} unsupported: {UNMET[name]}", file=sys.stderr)
                 continue
+            # zypy runs a kernel that needs wide ints with them on.
+            if interp == "zypy" and name in BIGINT:
+                os.environ["ZYPY_BIGINT"] = "1"
             d = stage(kernel, files, shim)
             try:
                 r = run_one(prefix, d, kernel, trials, extra, args.timeout)
@@ -221,12 +226,14 @@ def main():
             if interp == "zypy" and r["status"] == "ok":
                 python = [i for i in interps if i[0] == "cpython"][0][1][0]
                 outputs = check(prefix, python, kernel, files, name, args.timeout)
+                os.environ.pop("ZYPY_BIGINT", None)
                 if outputs is None:
                     r["status"] = "unchecked"
                     r["error"] = "no checks/" + name + ".py to compare the answer with CPython's"
                 elif outputs[0] != outputs[1]:
                     r["status"] = "wrong"
                     r["error"] = "check prints " + outputs[0].strip()[:60] + " where CPython prints " + outputs[1].strip()[:60]
+            os.environ.pop("ZYPY_BIGINT", None)
             results[name][interp] = r
             if r["status"] == "ok":
                 print(f"    {interp:<8} mean {r['mean_ms']:9.2f} ms  min {r['min_ms']:9.2f} ms  wall {r['wall_ms']:9.1f} ms", file=sys.stderr)

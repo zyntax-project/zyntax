@@ -395,4 +395,5 @@ categories! {
     array,
     json,
     matching,
+    bigint,
 }

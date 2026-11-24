@@ -1,3 +1,4 @@
+# zypy: bigint
 # test_long: values past 64 bits
 print(2 ** 62)
 print(2 ** 63)
