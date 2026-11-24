@@ -35,6 +35,32 @@ struct Uses {
     forwards: Vec<(Target, ruff_text_size::TextRange)>,
 }
 
+/// What the body of `f` does with its `**kwargs`: whether it reads it
+/// as a dict (any way other than a key with a constant default, or
+/// passing it on), and the functions it passes it on to, by name.
+pub(crate) fn kwarg_use(f: &py::StmtFunctionDef) -> Option<(bool, Vec<String>)> {
+    let kw = f.parameters.kwarg.as_ref()?;
+    let found = Finder {
+        kw: kw.name.to_string(),
+        uses: RefCell::new(Uses::default()),
+        error: RefCell::new(None),
+    };
+    for s in &f.body {
+        found.stmt(s);
+    }
+    let forwards = found
+        .uses
+        .borrow()
+        .forwards
+        .iter()
+        .map(|(t, _)| match t {
+            Target::Function(n) => n.clone(),
+            Target::Method(_, m) => m.clone(),
+        })
+        .collect();
+    Some((found.error.into_inner().is_some(), forwards))
+}
+
 /// Rewrite every `**kwargs` function in `body`.
 pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
     let mut defs: Vec<(Target, &mut py::StmtFunctionDef)> = Vec::new();

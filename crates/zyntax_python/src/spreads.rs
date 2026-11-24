@@ -110,7 +110,7 @@ fn display(items: Vec<py::DictItem>, range: TextRange) -> py::Expr {
     })
 }
 
-fn key(k: &str, range: TextRange) -> py::Expr {
+pub(crate) fn key(k: &str, range: TextRange) -> py::Expr {
     py::Expr::StringLiteral(py::ExprStringLiteral {
         node_index: Default::default(),
         range,

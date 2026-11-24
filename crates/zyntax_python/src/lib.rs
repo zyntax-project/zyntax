@@ -53,6 +53,7 @@ mod types;
 mod unpack;
 mod varargs;
 mod walk;
+mod walrus;
 
 pub use zyntax_embed::host::{
     HostClass, HostField, HostMethod, HostModule, HostResolver, HostType, NativeBinding,
@@ -519,12 +520,13 @@ fn parse_program_once(
     if big {
         bigint::rewrite(&mut statements, &origins)?;
     }
+    walrus::rewrite(&mut statements, &mut origins)?;
     namedtuple::rewrite(&mut statements, &mut origins);
     patterns::rewrite(&mut statements, &mut origins)?;
     decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);
-    spreads::rewrite(&mut statements, &mut origins);
     varargs::rewrite(&mut statements)?;
+    spreads::rewrite(&mut statements, &mut origins);
     kwargs::rewrite(&mut statements)?;
     sugar::rewrite(&mut statements, &mut origins);
     rebind::rebound_defs(&mut statements, &mut origins);

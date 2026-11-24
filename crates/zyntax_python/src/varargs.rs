@@ -61,7 +61,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "write",
 ];
 
-/// A function that takes `*rest`.
+/// A function that takes `*rest`, or `**kw` used as a dict.
 #[derive(Clone, PartialEq, Debug)]
 struct Variadic {
     /// The positional parameters before `*rest`.
@@ -70,8 +70,12 @@ struct Variadic {
     /// class, does not give: the receiver.
     via_instance: usize,
     via_class: usize,
-    /// The name of the parameter the surplus goes to.
-    name: String,
+    /// The parameter the surplus positional arguments go to, as a tuple.
+    rest: Option<String>,
+    /// The parameter the surplus keywords go to, as a dict.
+    kw: Option<String>,
+    /// The names a call may give by keyword.
+    named: Vec<String>,
 }
 
 #[derive(Default)]
@@ -106,11 +110,22 @@ impl Tables {
     }
 }
 
-/// The `*args` of `f`, when it has them.
-fn variadic(f: &py::StmtFunctionDef, method: bool) -> Result<Option<Variadic>> {
-    let Some(rest) = &f.parameters.vararg else {
+/// The `*args` and the dict-valued `**kwargs` of `f`, when it has them.
+fn variadic(
+    f: &py::StmtFunctionDef,
+    method: bool,
+    dicts: &HashSet<String>,
+) -> Result<Option<Variadic>> {
+    let rest = f.parameters.vararg.as_ref().map(|r| r.name.to_string());
+    let kw = f
+        .parameters
+        .kwarg
+        .as_ref()
+        .filter(|_| dicts.contains(f.name.as_str()))
+        .map(|k| k.name.to_string());
+    if rest.is_none() && kw.is_none() {
         return Ok(None);
-    };
+    }
     let (mut via_instance, mut via_class) = (usize::from(method), 0);
     for d in &f.decorator_list {
         match &d.expression {
@@ -118,25 +133,73 @@ fn variadic(f: &py::StmtFunctionDef, method: bool) -> Result<Option<Variadic>> {
             py::Expr::Name(n) if method && n.id.as_str() == "classmethod" => via_class = 1,
             other => {
                 return Err(Error::unsupported(
-                    "a decorated function that takes *args",
+                    "a decorated function that takes *args or a dict of **kwargs",
                     other,
                 ));
             }
         }
     }
+    let named = f
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(f.parameters.args.iter())
+        .chain(f.parameters.kwonlyargs.iter())
+        .map(|p| p.parameter.name.to_string())
+        .collect();
     Ok(Some(Variadic {
         positional: f.parameters.posonlyargs.len() + f.parameters.args.len(),
         via_instance,
         via_class,
-        name: rest.name.to_string(),
+        rest,
+        kw,
+        named,
     }))
+}
+
+/// The names of the functions whose `**kwargs` is a dict: those that
+/// read it as one, and those that pass it on to one.
+fn dict_kwargs(body: &[py::Stmt]) -> HashSet<String> {
+    struct V(Vec<(String, bool, Vec<String>)>);
+    impl<'a> Visitor<'a> for V {
+        fn visit_stmt(&mut self, s: &'a py::Stmt) {
+            if let py::Stmt::FunctionDef(f) = s
+                && let Some((needs, forwards)) = crate::kwargs::kwarg_use(f)
+            {
+                self.0.push((f.name.to_string(), needs, forwards));
+            }
+            read_stmt(self, s);
+        }
+    }
+    let mut v = V(Vec::new());
+    for s in body {
+        v.visit_stmt(s);
+    }
+    let mut dicts: HashSet<String> =
+        v.0.iter()
+            .filter(|(_, needs, _)| *needs)
+            .map(|(n, _, _)| n.clone())
+            .collect();
+    loop {
+        let before = dicts.len();
+        for (name, _, forwards) in &v.0 {
+            if forwards.iter().any(|f| dicts.contains(f)) {
+                dicts.insert(name.clone());
+            }
+        }
+        if dicts.len() == before {
+            return dicts;
+        }
+    }
 }
 
 /// Rewrite every function of `body` that takes `*args`, and the calls
 /// to it.
 pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
+    let dicts = dict_kwargs(body);
     let mut collect = Collect {
         tables: Tables::default(),
+        dicts: &dicts,
         error: None,
     };
     for s in body.iter() {
@@ -160,6 +223,7 @@ pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
     let mut values = Values {
         functions: &functions,
         methods: &methods,
+        shadowed: Vec::new(),
         error: None,
     };
     for s in body.iter() {
@@ -170,6 +234,7 @@ pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
     }
     let rewriter = Rewriter {
         tables: &tables,
+        dicts: &dicts,
         classes: RefCell::new(Vec::new()),
         error: RefCell::new(None),
     };
@@ -183,14 +248,15 @@ pub(crate) fn rewrite(body: &mut [py::Stmt]) -> Result<()> {
 }
 
 /// Finds the functions, classes and methods the program defines.
-struct Collect {
+struct Collect<'d> {
     tables: Tables,
+    dicts: &'d HashSet<String>,
     error: Option<Error>,
 }
 
-impl Collect {
+impl Collect<'_> {
     fn note(&mut self, f: &py::StmtFunctionDef, method: bool) -> Option<Variadic> {
-        match variadic(f, method) {
+        match variadic(f, method, self.dicts) {
             Ok(v) => v,
             Err(e) => {
                 self.error.get_or_insert(e);
@@ -200,7 +266,7 @@ impl Collect {
     }
 }
 
-impl<'a> Visitor<'a> for Collect {
+impl<'a> Visitor<'a> for Collect<'_> {
     fn visit_stmt(&mut self, s: &'a py::Stmt) {
         match s {
             py::Stmt::FunctionDef(f) => {
@@ -246,14 +312,41 @@ impl<'a> Visitor<'a> for Collect {
 }
 
 /// Refuses a function that takes `*args` named anywhere but as the
-/// function of a call.
+/// function of a call. A name a function binds itself, as a parameter
+/// or by assignment, is not the module's.
 struct Values<'t> {
     functions: &'t HashSet<String>,
     methods: &'t HashSet<String>,
+    /// The names bound by the functions the walk is inside.
+    shadowed: Vec<HashSet<String>>,
     error: Option<Error>,
 }
 
+impl Values<'_> {
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed.iter().any(|s| s.contains(name))
+    }
+}
+
 impl<'a> Visitor<'a> for Values<'_> {
+    fn visit_stmt(&mut self, s: &'a py::Stmt) {
+        if let py::Stmt::FunctionDef(f) = s {
+            let mut names: HashSet<String> = f
+                .parameters
+                .iter_non_variadic_params()
+                .map(|p| p.parameter.name.to_string())
+                .collect();
+            names.extend(f.parameters.vararg.iter().map(|v| v.name.to_string()));
+            names.extend(f.parameters.kwarg.iter().map(|k| k.name.to_string()));
+            names.extend(crate::scope::Scope::of_function(f).bound);
+            self.shadowed.push(names);
+            read_stmt(self, s);
+            self.shadowed.pop();
+            return;
+        }
+        read_stmt(self, s);
+    }
+
     fn visit_expr(&mut self, e: &'a py::Expr) {
         match e {
             py::Expr::Call(c) => {
@@ -270,10 +363,12 @@ impl<'a> Visitor<'a> for Values<'_> {
                 }
             }
             py::Expr::Name(n)
-                if n.ctx == py::ExprContext::Load && self.functions.contains(n.id.as_str()) =>
+                if n.ctx == py::ExprContext::Load
+                    && self.functions.contains(n.id.as_str())
+                    && !self.is_shadowed(n.id.as_str()) =>
             {
                 self.error.get_or_insert(Error::unsupported(
-                    "a function that takes *args used as a value",
+                    "a function that takes *args or a dict of **kwargs used as a value",
                     e,
                 ));
             }
@@ -281,7 +376,7 @@ impl<'a> Visitor<'a> for Values<'_> {
                 if a.ctx == py::ExprContext::Load && self.methods.contains(a.attr.as_str()) =>
             {
                 self.error.get_or_insert(Error::unsupported(
-                    "a method that takes *args used as a value",
+                    "a method that takes *args or a dict of **kwargs used as a value",
                     e,
                 ));
             }
@@ -294,6 +389,7 @@ impl<'a> Visitor<'a> for Values<'_> {
 /// to its function.
 struct Rewriter<'t> {
     tables: &'t Tables,
+    dicts: &'t HashSet<String>,
     /// The classes the walk is inside, innermost last.
     classes: RefCell<Vec<String>>,
     error: RefCell<Option<Error>>,
@@ -395,39 +491,61 @@ impl Rewriter<'_> {
         Some(substitute(&format!("tuple(__vs[{need}:])"), &seq))
     }
 
-    /// Replace the `*rest` parameter of `f` with a positional one.
+    /// Replace the `*rest` parameter of `f` with a positional one, and a
+    /// `**kw` that is read as a dict with a keyword-only one.
     fn parameter(&self, f: &mut py::StmtFunctionDef, method: bool) {
-        if variadic(f, method).ok().flatten().is_none() {
-            return;
-        }
-        let Some(rest) = f.parameters.vararg.take() else {
+        let Some(v) = variadic(f, method, self.dicts).ok().flatten() else {
             return;
         };
-        let range = rest.range;
-        let ordered = f
-            .parameters
-            .posonlyargs
-            .iter()
-            .chain(f.parameters.args.iter())
-            .any(|p| p.default.is_some());
-        let default = ordered.then(|| {
-            Box::new(py::Expr::Tuple(py::ExprTuple {
-                node_index: Default::default(),
+        if v.rest.is_some()
+            && let Some(rest) = f.parameters.vararg.take()
+        {
+            let range = rest.range;
+            let ordered = f
+                .parameters
+                .posonlyargs
+                .iter()
+                .chain(f.parameters.args.iter())
+                .any(|p| p.default.is_some());
+            let default = ordered.then(|| {
+                Box::new(py::Expr::Tuple(py::ExprTuple {
+                    node_index: Default::default(),
+                    range,
+                    elts: Vec::new(),
+                    ctx: py::ExprContext::Load,
+                    parenthesized: true,
+                }))
+            });
+            f.parameters.args.push(py::ParameterWithDefault {
                 range,
-                elts: Vec::new(),
+                node_index: Default::default(),
+                parameter: py::Parameter {
+                    annotation: None,
+                    ..*rest
+                },
+                default,
+            });
+        }
+        if v.kw.is_some()
+            && let Some(kw) = f.parameters.kwarg.take()
+        {
+            // Its values are of any kind: the dict is the dynamic one.
+            let dynamic = py::Expr::Name(py::ExprName {
+                node_index: Default::default(),
+                range: kw.range,
+                id: py::name::Name::new("dict"),
                 ctx: py::ExprContext::Load,
-                parenthesized: true,
-            }))
-        });
-        f.parameters.args.push(py::ParameterWithDefault {
-            range,
-            node_index: Default::default(),
-            parameter: py::Parameter {
-                annotation: None,
-                ..*rest
-            },
-            default,
-        });
+            });
+            f.parameters.kwonlyargs.push(py::ParameterWithDefault {
+                range: kw.range,
+                node_index: Default::default(),
+                parameter: py::Parameter {
+                    annotation: Some(Box::new(dynamic)),
+                    ..*kw
+                },
+                default: None,
+            });
+        }
     }
 }
 
@@ -491,41 +609,127 @@ impl Transformer for Rewriter<'_> {
         let Some((v, fixed)) = self.resolve(&c.func, &range) else {
             return;
         };
-        let mut args = std::mem::take(&mut c.arguments.args).into_vec();
-        let packed = match args
-            .iter()
-            .position(|a| matches!(a, py::Expr::Starred(_)))
-            .filter(|at| *at < fixed)
-        {
-            // `f(*xs)` gives the parameters before the tuple from the
-            // front of `xs` and the tuple from the rest.
-            Some(at) => match self.spread(&mut args, at, fixed) {
-                Some(rest) => rest,
-                None => {
-                    c.arguments.args = args.into_boxed_slice();
-                    self.fail(
-                        "a `*` argument of a function that takes *args, unless it is a name and the last argument",
-                        &range,
-                    );
-                    return;
+        // `f(*[1, 2])` is `f(1, 2)`.
+        let mut flat: Vec<py::Expr> = Vec::new();
+        for a in std::mem::take(&mut c.arguments.args).into_vec() {
+            match a {
+                py::Expr::Starred(star)
+                    if matches!(&*star.value, py::Expr::List(l)
+                        if !l.elts.iter().any(|x| matches!(x, py::Expr::Starred(_))))
+                        || matches!(&*star.value, py::Expr::Tuple(t)
+                        if !t.elts.iter().any(|x| matches!(x, py::Expr::Starred(_)))) =>
+                {
+                    match *star.value {
+                        py::Expr::List(l) => flat.extend(l.elts),
+                        py::Expr::Tuple(t) => flat.extend(t.elts),
+                        _ => unreachable!("matched a display"),
+                    }
                 }
-            },
-            None => {
-                let extras = args.split_off(fixed.min(args.len()));
-                pack(extras, range)
+                other => flat.push(other),
+            }
+        }
+        c.arguments.args = flat.into_boxed_slice();
+        if let Some(rest) = &v.rest {
+            let mut args = std::mem::take(&mut c.arguments.args).into_vec();
+            let packed = match args
+                .iter()
+                .position(|a| matches!(a, py::Expr::Starred(_)))
+                .filter(|at| *at < fixed)
+            {
+                // `f(*xs)` gives the parameters before the tuple from the
+                // front of `xs` and the tuple from the rest.
+                Some(at) => match self.spread(&mut args, at, fixed) {
+                    Some(rest) => rest,
+                    None => {
+                        c.arguments.args = args.into_boxed_slice();
+                        self.fail(
+                            "a `*` argument of a function that takes *args, unless it is a name and the last argument",
+                            &range,
+                        );
+                        return;
+                    }
+                },
+                None => {
+                    let extras = args.split_off(fixed.min(args.len()));
+                    pack(extras, range)
+                }
+            };
+            if args.len() < fixed {
+                // The parameters before the tuple are given by keyword.
+                c.arguments.keywords.push(py::Keyword {
+                    range,
+                    node_index: Default::default(),
+                    arg: Some(py::Identifier::new(rest.as_str(), range)),
+                    value: packed,
+                });
+            } else {
+                args.push(packed);
+            }
+            c.arguments.args = args.into_boxed_slice();
+        }
+        if let Some(kw) = &v.kw {
+            self.keywords(c, &v, kw, range);
+        }
+    }
+}
+
+impl Rewriter<'_> {
+    /// The keywords of a call to a function whose `**kw` is a dict: the
+    /// ones that name a parameter stay, the rest are the dict.
+    fn keywords(&self, c: &mut py::ExprCall, v: &Variadic, kw: &str, range: TextRange) {
+        let mut kept: Vec<py::Keyword> = Vec::new();
+        let mut items: Vec<py::DictItem> = Vec::new();
+        let mut put = |name: String, value: py::Expr, kept: &mut Vec<py::Keyword>| {
+            if v.named.contains(&name) {
+                kept.push(py::Keyword {
+                    range,
+                    node_index: Default::default(),
+                    arg: Some(py::Identifier::new(name.as_str(), range)),
+                    value,
+                });
+            } else {
+                items.push(py::DictItem {
+                    key: Some(crate::spreads::key(&name, range)),
+                    value,
+                });
             }
         };
-        if args.len() < fixed {
-            // The parameters before the tuple are given by keyword.
-            c.arguments.keywords.push(py::Keyword {
-                range,
-                node_index: Default::default(),
-                arg: Some(py::Identifier::new(v.name.as_str(), range)),
-                value: packed,
-            });
-        } else {
-            args.push(packed);
+        let mut spread: Vec<py::DictItem> = Vec::new();
+        for k in std::mem::take(&mut c.arguments.keywords) {
+            match k.arg {
+                Some(arg) => put(arg.to_string(), k.value, &mut kept),
+                None => match k.value {
+                    // `**{"a": 1}` is the keyword `a=1`.
+                    py::Expr::Dict(d)
+                        if d.items
+                            .iter()
+                            .all(|i| matches!(&i.key, Some(py::Expr::StringLiteral(_)))) =>
+                    {
+                        for item in d.items {
+                            let Some(py::Expr::StringLiteral(s)) = item.key else {
+                                continue;
+                            };
+                            put(s.value.to_str().to_string(), item.value, &mut kept);
+                        }
+                    }
+                    other => spread.push(py::DictItem {
+                        key: None,
+                        value: other,
+                    }),
+                },
+            }
         }
-        c.arguments.args = args.into_boxed_slice();
+        items.extend(spread);
+        kept.push(py::Keyword {
+            range,
+            node_index: Default::default(),
+            arg: Some(py::Identifier::new(kw, range)),
+            value: py::Expr::Dict(py::ExprDict {
+                node_index: Default::default(),
+                range,
+                items,
+            }),
+        });
+        c.arguments.keywords = kept.into_iter().collect();
     }
 }
