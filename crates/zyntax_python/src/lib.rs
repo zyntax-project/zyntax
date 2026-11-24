@@ -31,6 +31,7 @@ mod bytes;
 mod class_attrs;
 mod classes;
 mod dataclass;
+mod decorators;
 mod format;
 mod host;
 mod infer_deps;
@@ -505,6 +506,7 @@ fn parse_program_once(
     // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
     patterns::rewrite(&mut statements, &mut origins)?;
+    decorators::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);
     spreads::rewrite(&mut statements, &mut origins);
     varargs::rewrite(&mut statements)?;

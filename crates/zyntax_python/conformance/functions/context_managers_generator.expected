@@ -1,0 +1,14 @@
+<b>
+in b
+</b>
+<outer>
+<inner>
+outerinner
+</inner>
+</outer>
+open file
+size 4
+close file
+open conn
+close conn
+caught boom
