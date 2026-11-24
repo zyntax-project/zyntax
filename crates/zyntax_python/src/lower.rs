@@ -13662,8 +13662,34 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    /// `isinstance(v, T)` for a type name or a class.
+    /// `isinstance(v, T)` for a type name or a class, or a tuple of
+    /// them, which holds when any member does.
     fn isinstance(&mut self, v: Val, ty_expr: &py::Expr, span: Span) -> Result<Val> {
+        if let py::Expr::Tuple(t) = ty_expr {
+            let mut pre = Vec::new();
+            let held = self.hold(v, &mut pre, span);
+            self.hoisted.extend(pre);
+            let mut any: Option<Node> = None;
+            for member in &t.elts {
+                let again = Val {
+                    node: held.node.clone(),
+                    ty: held.ty,
+                };
+                let test = self.isinstance(again, member, span)?.node;
+                any = Some(match any {
+                    Some(prev) => binary(BinaryOp::Or, prev, test, Ty::Bool, span),
+                    None => test,
+                });
+            }
+            let node = any.unwrap_or_else(|| {
+                node(
+                    TypedExpression::Literal(TypedLiteral::Bool(false)),
+                    Ty::Bool,
+                    span,
+                )
+            });
+            return Ok(Val { node, ty: Ty::Bool });
+        }
         let py::Expr::Name(n) = ty_expr else {
             return unsupported("isinstance() with anything but a type name", ty_expr);
         };
