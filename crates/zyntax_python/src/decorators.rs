@@ -12,6 +12,19 @@ use crate::{Error, Result};
 use ruff_python_ast as py;
 use ruff_text_size::Ranged;
 
+/// The names the program imports for what this pass rewrites.
+const IMPORTED: &[(&str, &[&str])] = &[
+    ("functools", &["lru_cache", "cache"]),
+    ("contextlib", &["contextmanager"]),
+    ("abc", &["ABC", "ABCMeta", "abstractmethod"]),
+];
+
+fn is_imported(module: &str, name: &str) -> bool {
+    IMPORTED
+        .iter()
+        .any(|(m, names)| *m == module && names.contains(&name))
+}
+
 enum Kind {
     Cache,
     ContextManager,
@@ -45,9 +58,21 @@ fn kind(f: &py::StmtFunctionDef) -> Option<Kind> {
 
 /// Rewrite every decorated function of `body`.
 pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) -> Result<()> {
-    if !body
-        .iter()
-        .any(|s| matches!(s, py::Stmt::FunctionDef(f) if kind(f).is_some()))
+    // A body of `...` is a body of `pass`.
+    crate::walk::expand_module(body, origins, &mut |s| match s {
+        py::Stmt::Expr(e) if matches!(&*e.value, py::Expr::EllipsisLiteral(_)) => {
+            vec![py::Stmt::Pass(py::StmtPass {
+                node_index: Default::default(),
+                range: e.range,
+            })]
+        }
+        other => vec![other],
+    });
+    let abstracts = abstract_classes(body);
+    if !abstracts
+        && !body
+            .iter()
+            .any(|s| matches!(s, py::Stmt::FunctionDef(f) if kind(f).is_some()))
     {
         return Ok(());
     }
@@ -186,6 +211,150 @@ fn expand(f: py::StmtFunctionDef, k: Kind) -> Result<Vec<py::Stmt>> {
     }
 }
 
+/// Whether `e` is `name` or `abc.name`.
+fn is_abc_name(e: &py::Expr, name: &str) -> bool {
+    match e {
+        py::Expr::Name(n) => n.id.as_str() == name,
+        py::Expr::Attribute(a) => {
+            a.attr.as_str() == name
+                && matches!(&*a.value, py::Expr::Name(m) if m.id.as_str() == "abc")
+        }
+        _ => false,
+    }
+}
+
+/// What the classes seen so far need an instance to define.
+#[derive(Default)]
+struct Known {
+    abstract_methods: Vec<String>,
+    /// The class whose `__init__` an instance of this one runs.
+    init_owner: Option<String>,
+}
+
+/// Make `ABC` and `@abstractmethod` plain: a class with a method left
+/// abstract refuses to be instantiated itself, in the `__init__` its
+/// instances run. Whether any class used them.
+fn abstract_classes(body: &mut [py::Stmt]) -> bool {
+    let mut known: std::collections::HashMap<String, Known> = std::collections::HashMap::new();
+    let mut any = false;
+    // The guards each class's `__init__` gets, by that class.
+    let mut guards: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut synthesized: Vec<String> = Vec::new();
+    for s in body.iter_mut() {
+        let py::Stmt::ClassDef(c) = s else {
+            continue;
+        };
+        let name = c.name.to_string();
+        let mut own: Vec<String> = Vec::new();
+        let mut concrete: Vec<String> = Vec::new();
+        for m in c.body.iter_mut() {
+            let py::Stmt::FunctionDef(f) = m else {
+                continue;
+            };
+            let before = f.decorator_list.len();
+            f.decorator_list
+                .retain(|d| !is_abc_name(&d.expression, "abstractmethod"));
+            if f.decorator_list.len() < before {
+                own.push(f.name.to_string());
+                any = true;
+            } else {
+                concrete.push(f.name.to_string());
+            }
+        }
+        let mut inherited: Vec<String> = Vec::new();
+        let mut init_owner = None;
+        if let Some(args) = &mut c.arguments {
+            let mut kept = Vec::new();
+            for b in std::mem::take(&mut args.args).into_vec() {
+                if is_abc_name(&b, "ABC") {
+                    any = true;
+                    continue;
+                }
+                if let py::Expr::Name(n) = &b
+                    && let Some(k) = known.get(n.id.as_str())
+                {
+                    inherited.extend(k.abstract_methods.iter().cloned());
+                    init_owner = init_owner.or_else(|| k.init_owner.clone());
+                }
+                kept.push(b);
+            }
+            args.args = kept.into_boxed_slice();
+            let before = args.keywords.len();
+            args.keywords.retain(|k| {
+                !(k.arg.as_ref().is_some_and(|a| a.as_str() == "metaclass")
+                    && is_abc_name(&k.value, "ABCMeta"))
+            });
+            any |= args.keywords.len() < before;
+        }
+        if concrete.iter().any(|n| n == "__init__") {
+            init_owner = Some(name.clone());
+        }
+        let mut methods: Vec<String> = inherited
+            .into_iter()
+            .filter(|m| !concrete.contains(m))
+            .chain(own)
+            .collect();
+        methods.sort();
+        methods.dedup();
+        if !methods.is_empty() && c.decorator_list.is_empty() {
+            let owner = match &init_owner {
+                Some(o) => o.clone(),
+                None => {
+                    // No class of the chain has one: this one gets one.
+                    synthesized.push(name.clone());
+                    init_owner = Some(name.clone());
+                    name.clone()
+                }
+            };
+            guards.push((owner, name.clone(), methods.clone()));
+        }
+        known.insert(
+            name,
+            Known {
+                abstract_methods: methods,
+                init_owner,
+            },
+        );
+    }
+    for s in body.iter_mut() {
+        let py::Stmt::ClassDef(c) = s else {
+            continue;
+        };
+        let name = c.name.to_string();
+        if synthesized.contains(&name) {
+            c.body.extend(parse("def __init__(self):\n    pass\n"));
+        }
+        for (owner, class, methods) in guards.iter().rev() {
+            if *owner == name {
+                guard(c, class, methods);
+            }
+        }
+    }
+    any
+}
+
+/// Make `__init__` of `c` refuse an instance of exactly `class`.
+fn guard(c: &mut py::StmtClassDef, class: &str, methods: &[String]) {
+    let named: Vec<String> = methods.iter().map(|m| format!("'{m}'")).collect();
+    let message = format!(
+        "Can't instantiate abstract class {class} without an implementation for abstract method{} {}",
+        if methods.len() == 1 { "" } else { "s" },
+        named.join(", ")
+    );
+    let check = parse(&format!(
+        "if type(self) is {class}:\n    raise TypeError({message:?})\n"
+    ));
+    for m in c.body.iter_mut() {
+        if let py::Stmt::FunctionDef(f) = m
+            && f.name.as_str() == "__init__"
+        {
+            let old = std::mem::take(&mut f.body);
+            f.body = check.into_iter().chain(old).collect();
+            return;
+        }
+    }
+}
+
 /// Remove the imports of the decorators this pass made unnecessary.
 fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
     let mut kept = Vec::with_capacity(body.len());
@@ -198,12 +367,11 @@ fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
         if let py::Stmt::ImportFrom(i) = &mut s
             && i.level == 0
             && let Some(m) = i.module.as_ref().map(|m| m.as_str().to_string())
-            && matches!(m.as_str(), "functools" | "contextlib")
         {
             let names: Vec<py::Alias> = i
                 .names
                 .iter()
-                .filter(|a| !matches!(a.name.as_str(), "lru_cache" | "cache" | "contextmanager"))
+                .filter(|a| !is_imported(&m, a.name.as_str()))
                 .cloned()
                 .collect();
             if names.is_empty() {
@@ -215,8 +383,8 @@ fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
         // `name = __import__("contextlib")`, or one of its members.
         if let py::Stmt::Assign(a) = &s
             && let Some((module, member)) = foreign_import(&a.value)
-            && matches!(module, "functools" | "contextlib")
-            && member.is_none_or(|m| matches!(m, "lru_cache" | "cache" | "contextmanager"))
+            && IMPORTED.iter().any(|(m, _)| *m == module)
+            && member.is_none_or(|m| is_imported(module, m))
         {
             dropped.push((module.to_string(), member.is_none()));
             continue;
@@ -224,7 +392,8 @@ fn drop_imports(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
         kept.push(s);
         kept_origins.push(origin);
     }
-    // `import contextlib` is not needed once only decorators used it.
+    // `import abc` and `import contextlib` are not needed once only
+    // decorators and bases used them.
     for (module, whole) in &dropped {
         if *whole && uses_name(&kept, module) {
             // Put the binding back: the program reads the module.

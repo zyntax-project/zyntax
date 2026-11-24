@@ -393,6 +393,28 @@ pub(crate) fn is_pure_path(e: &py::Expr) -> bool {
     }
 }
 
+/// The builtin types a name may compare with `type(x)`.
+const BUILTIN_TYPES: &[&str] = &[
+    "int",
+    "float",
+    "str",
+    "bool",
+    "bytes",
+    "list",
+    "dict",
+    "tuple",
+    "set",
+    "frozenset",
+];
+
+/// Whether `e` is a call `type(x)`.
+fn is_type_call(e: &py::Expr) -> bool {
+    matches!(e, py::Expr::Call(c)
+        if is_name(&c.func, "type")
+            && c.arguments.args.len() == 1
+            && c.arguments.keywords.is_empty())
+}
+
 fn name_expr(id: &str, range: ruff_text_size::TextRange) -> py::Expr {
     py::Expr::Name(py::ExprName {
         node_index: Default::default(),
@@ -994,6 +1016,41 @@ impl Transformer for Rewriter {
 
     fn visit_expr(&self, e: &mut py::Expr) {
         match e {
+            // `type(x) is C` compares the name `type(x)` evaluates to
+            // with the name of `C`.
+            py::Expr::Compare(c)
+                if c.ops.len() == 1
+                    && matches!(
+                        c.ops[0],
+                        py::CmpOp::Is | py::CmpOp::IsNot | py::CmpOp::Eq | py::CmpOp::NotEq
+                    )
+                    && (is_type_call(&c.left) || is_type_call(&c.comparators[0])) =>
+            {
+                for side in std::iter::once(&mut *c.left).chain(c.comparators.iter_mut()) {
+                    if let py::Expr::Name(n) = side
+                        && (self.classes.contains(n.id.as_str())
+                            || BUILTIN_TYPES.contains(&n.id.as_str()))
+                    {
+                        let range = n.range;
+                        *side = py::Expr::StringLiteral(py::ExprStringLiteral {
+                            node_index: Default::default(),
+                            range,
+                            value: py::StringLiteralValue::single(py::StringLiteral {
+                                range,
+                                node_index: Default::default(),
+                                value: n.id.to_string().into_boxed_str(),
+                                flags: py::StringLiteralFlags::empty(),
+                            }),
+                        });
+                    }
+                }
+                c.ops = vec![match c.ops[0] {
+                    py::CmpOp::Is | py::CmpOp::Eq => py::CmpOp::Eq,
+                    _ => py::CmpOp::NotEq,
+                }]
+                .into_boxed_slice();
+                walk_expr(self, e);
+            }
             // `C` for `class C(list): pass` is `list`.
             py::Expr::Name(n) if n.ctx.is_load() => {
                 if let Some(builtin) = self.aliases.get(n.id.as_str()) {

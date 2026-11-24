@@ -1,0 +1,6 @@
+square 9 8
+Can't instantiate abstract class Shape without an implementation for abstract methods 'area', 'perimeter'
+Can't instantiate abstract class Flat without an implementation for abstract method 'perimeter'
+Can't instantiate abstract class Animal without an implementation for abstract method 'sound'
+woof woof
+True True

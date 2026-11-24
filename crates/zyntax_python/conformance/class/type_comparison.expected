@@ -1,0 +1,9 @@
+True False A B
+True False True True False
+True False True False
+True True True True True
+int 1
+str a
+float or list 2.5
+float or list [1]
+other None
