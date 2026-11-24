@@ -37,6 +37,7 @@ mod infer_deps;
 mod kwargs;
 mod lower;
 mod modules;
+mod patterns;
 mod prelude;
 mod rebind;
 mod records;
@@ -48,6 +49,7 @@ mod sugar;
 mod types;
 mod unpack;
 mod varargs;
+mod walk;
 
 pub use zyntax_embed::host::{
     HostClass, HostField, HostMethod, HostModule, HostResolver, HostType, NativeBinding,
@@ -502,6 +504,7 @@ fn parse_program_once(
     // becomes the class, a local rebound in straight-line code becomes
     // a fresh version.
     let mut statements: Vec<py::Stmt> = body.into_iter().collect();
+    patterns::rewrite(&mut statements, &mut origins)?;
     unpack::rewrite(&mut statements, &mut origins);
     spreads::rewrite(&mut statements, &mut origins);
     varargs::rewrite(&mut statements)?;

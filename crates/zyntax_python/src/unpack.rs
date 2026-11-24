@@ -11,85 +11,23 @@ use rustc_hash::FxHashMap as HashMap;
 /// the module each top-level statement came from.
 pub(crate) fn rewrite(body: &mut Vec<py::Stmt>, origins: &mut Vec<Option<String>>) {
     let mut count = 0;
-    let mut stmts = Vec::with_capacity(body.len());
-    let mut kept = Vec::with_capacity(body.len());
-    for (s, origin) in std::mem::take(body)
-        .into_iter()
-        .zip(std::mem::take(origins))
-    {
-        let mut one = vec![s];
-        block(&mut one, &mut count);
-        kept.extend(std::iter::repeat_n(origin, one.len()));
-        stmts.extend(one);
-    }
-    *body = stmts;
-    *origins = kept;
-}
-
-fn block<B>(body: &mut B, count: &mut usize)
-where
-    B: Default + IntoIterator<Item = py::Stmt> + FromIterator<py::Stmt>,
-{
-    let mut out = Vec::new();
-    for mut s in std::mem::take(body) {
-        nested(&mut s, count);
-        match &mut s {
-            py::Stmt::Assign(a) if a.targets.len() == 1 && starred_in(&a.targets[0]).is_some() => {
-                let target = a.targets.pop().expect("one target");
-                let value = (*a.value).clone();
-                out.extend(expand(target, value, count));
-            }
-            py::Stmt::For(f) if starred_in(&f.target).is_some() => {
-                let item = format!("__for{}", *count);
-                *count += 1;
-                let target = std::mem::replace(&mut *f.target, name(&item, py::ExprContext::Store));
-                let head = expand(target, name(&item, py::ExprContext::Load), count);
-                let old = std::mem::take(&mut f.body);
-                f.body = head.into_iter().chain(old).collect();
-                out.push(s);
-            }
-            _ => out.push(s),
+    crate::walk::expand_module(body, origins, &mut |mut s| match &mut s {
+        py::Stmt::Assign(a) if a.targets.len() == 1 && starred_in(&a.targets[0]).is_some() => {
+            let target = a.targets.pop().expect("one target");
+            let value = (*a.value).clone();
+            expand(target, value, &mut count)
         }
-    }
-    *body = out.into_iter().collect();
-}
-
-/// The statement lists inside `s`, rewritten.
-fn nested(s: &mut py::Stmt, count: &mut usize) {
-    match s {
-        py::Stmt::FunctionDef(f) => block(&mut f.body, count),
-        py::Stmt::ClassDef(c) => block(&mut c.body, count),
-        py::Stmt::If(i) => {
-            block(&mut i.body, count);
-            for clause in i.elif_else_clauses.iter_mut() {
-                block(&mut clause.body, count);
-            }
+        py::Stmt::For(f) if starred_in(&f.target).is_some() => {
+            let item = format!("__for{count}");
+            count += 1;
+            let target = std::mem::replace(&mut *f.target, name(&item, py::ExprContext::Store));
+            let head = expand(target, name(&item, py::ExprContext::Load), &mut count);
+            let old = std::mem::take(&mut f.body);
+            f.body = head.into_iter().chain(old).collect();
+            vec![s]
         }
-        py::Stmt::For(f) => {
-            block(&mut f.body, count);
-            block(&mut f.orelse, count);
-        }
-        py::Stmt::While(w) => {
-            block(&mut w.body, count);
-            block(&mut w.orelse, count);
-        }
-        py::Stmt::With(w) => block(&mut w.body, count),
-        py::Stmt::Try(t) => {
-            block(&mut t.body, count);
-            for h in t.handlers.iter_mut() {
-                let py::ExceptHandler::ExceptHandler(h) = h;
-                block(&mut h.body, count);
-            }
-            block(&mut t.orelse, count);
-            block(&mut t.finalbody, count);
-        }
-        py::Stmt::Match(m) => {
-            for case in m.cases.iter_mut() {
-                block(&mut case.body, count);
-            }
-        }
-        _ => {}
-    }
+        _ => vec![s],
+    });
 }
 
 /// The elements of a tuple or list target, when one of them is starred.

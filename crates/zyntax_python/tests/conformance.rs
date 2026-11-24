@@ -394,4 +394,5 @@ categories! {
     inference,
     array,
     json,
+    matching,
 }

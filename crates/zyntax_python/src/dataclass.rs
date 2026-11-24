@@ -28,7 +28,7 @@ struct Options {
 }
 
 /// Whether `e` names the decorator: `dataclass` or `dataclasses.dataclass`.
-fn is_dataclass_name(e: &py::Expr) -> bool {
+pub(crate) fn is_dataclass_name(e: &py::Expr) -> bool {
     match e {
         py::Expr::Name(n) => n.id.as_str() == "dataclass",
         py::Expr::Attribute(a) => {
@@ -93,7 +93,7 @@ fn field_call(e: &py::Expr) -> Option<&py::ExprCall> {
 }
 
 /// Whether the annotation is `ClassVar` or `ClassVar[...]`.
-fn is_class_var(annotation: &py::Expr) -> bool {
+pub(crate) fn is_class_var(annotation: &py::Expr) -> bool {
     match annotation {
         py::Expr::Name(n) => n.id.as_str() == "ClassVar",
         py::Expr::Subscript(s) => is_class_var(&s.value),
